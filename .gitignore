@@ -1,0 +1,33 @@
+# Bundler
+/.bundle
+/vendor/bundle
+# Local work tracking
+PLAN.md
+
+# RSpec
+.rspec_status
+
+# Third-party test cache (cloned repos, rebuilt each CI run)
+/tmp/thirdparty_cache/
+
+# General temp files from compiler output
+/tmp/*.s
+/tmp/*.o
+/tmp/*.out
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Test binaries produced during integration tests
+/spec/**/*.out
+/spec/**/*.o
+/spec/**/*.s

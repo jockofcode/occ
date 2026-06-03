@@ -1,0 +1,117 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# occ_cc — a gcc/clang-compatible frontend wrapper around occ.
+#
+# Project Makefiles often invoke the compiler with flags occ doesn't recognise
+# (-Wall, -O2, -std=c11, -fno-strict-aliasing, -lm, etc.). This wrapper
+# strips unknown flags so occ receives only what it understands, while still
+# forwarding linker library flags (-l, -L) to the clang link step.
+#
+# Usage (in a Makefile):  CC=$(path/to/bin/occ_cc) make
+# Direct:                 bin/occ_cc foo.c -o foo
+
+OCC_BIN = File.expand_path('occ', __dir__)
+
+# Flags that are meaningful to pass straight through to occ.
+PASS_THROUGH = %w[-c -o -I -D].freeze
+
+# Flags / prefixes that are silently dropped.
+DROP_PREFIXES = %w[
+  -W -w -O -g -std= -f -m -M -march= -mtune= -pipe
+  -pedantic -ansi -trigraphs -traditional
+  --param -isystem -isysroot -iframework
+  -target -arch -mmacosx-version-min
+  -coverage --coverage -pg
+  -shared -static -rdynamic -dynamiclib
+  -bundle -install_name -rpath
+  -T -Xlinker --sysroot
+].freeze
+
+DROP_EXACT = %w[
+  -v --version -dM -E -S -P
+  -undef -nostdinc -nostdlib -nodefaultlibs
+  -Wl,-rpath -pthread -no-pie -pie
+].freeze
+
+sources  = []
+occ_args = []
+skip_next = false
+
+i = 0
+argv = ARGV.dup
+while i < argv.length
+  arg = argv[i]
+
+  if skip_next
+    skip_next = false
+    i += 1
+    next
+  end
+
+  if arg == '-o'
+    occ_args << '-o' << argv[i + 1]
+    skip_next = true
+    i += 1
+    next
+  end
+
+  if arg == '-I' || arg == '-D'
+    occ_args << arg << argv[i + 1]
+    skip_next = true
+    i += 1
+    next
+  end
+
+  if arg == '-c'
+    occ_args << '-c'
+    i += 1
+    next
+  end
+
+  # Attached -I/-D (e.g. -Ifoo, -DDEBUG)
+  if arg.start_with?('-I') || arg.start_with?('-D')
+    occ_args << arg
+    i += 1
+    next
+  end
+
+  # Linker flags: silently drop (clang handles them during link)
+  if arg.start_with?('-l', '-L', '-Wl,', '-framework')
+    i += 1
+    next
+  end
+
+  # Flags to drop with a following argument value
+  if %w[-isystem -isysroot -iframework -target -arch -T -x -MF -MT -MQ].include?(arg)
+    skip_next = true
+    i += 1
+    next
+  end
+
+  # Exact drops
+  if DROP_EXACT.include?(arg)
+    i += 1
+    next
+  end
+
+  # Prefix drops
+  if DROP_PREFIXES.any? { |p| arg.start_with?(p) }
+    i += 1
+    next
+  end
+
+  # Anything else that starts with - and is not a known pass-through: drop it
+  if arg.start_with?('-')
+    i += 1
+    next
+  end
+
+  # Positional: source file
+  sources << arg
+  occ_args << arg
+  i += 1
+end
+
+cmd = ['ruby', OCC_BIN, *occ_args]
+exec(*cmd)

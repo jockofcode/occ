@@ -1,0 +1,373 @@
+# frozen_string_literal: true
+
+require 'open3'
+require 'tmpdir'
+require 'occ/error'
+require 'occ/source_location'
+require 'occ/token'
+require 'occ/lexer'
+require 'occ/ast'
+require 'occ/parser'
+require 'occ/types'
+require 'occ/symbol_table'
+require 'occ/semantic'
+require 'occ/ir'
+require 'occ/codegen/base'
+require 'occ/codegen/amd64'
+require 'occ/codegen/arm64'
+require 'occ/preprocessor'
+require 'occ/driver'
+
+RSpec.describe 'Phase 9: Language Coverage' do
+  def build_ir(src)
+    tokens  = OCC::Lexer.new(src, '<test>').tokenize
+    ast     = OCC::Parser.new(tokens).parse
+    sa      = OCC::Semantic.new
+    sa.analyze(ast)
+    builder = OCC::IR::Builder.new
+    builder.build(ast)
+  end
+
+  def all_instrs(func)
+    func.blocks.flat_map(&:instrs)
+  end
+
+  def compile_and_run(src)
+    Dir.mktmpdir do |dir|
+      src_path = File.join(dir, 'test.c')
+      exe_path = File.join(dir, 'test')
+      File.write(src_path, src)
+      options = OCC::Driver.parse_options([src_path, '-o', exe_path])
+      OCC::Driver.compile_file(src_path, options)
+      return { stdout: '', stderr: 'executable not produced', status: 1 } unless File.exist?(exe_path)
+      stdout, stderr, status = Open3.capture3(exe_path)
+      { stdout: stdout, stderr: stderr, status: status.exitstatus }
+    end
+  end
+
+  shared_context 'native tools available' do
+    before do
+      skip 'clang not available' unless system('which clang > /dev/null 2>&1')
+      skip 'as not available'    unless system('which as > /dev/null 2>&1')
+    end
+  end
+
+  # ── goto ─────────────────────────────────────────────────────────────────────
+
+  describe 'goto statement (IR)' do
+    it 'emits a Jump instruction targeting the label' do
+      src = <<~C
+        int f(void) {
+          goto done;
+          done: return 1;
+        }
+      C
+      mod  = build_ir(src)
+      func = mod.functions.find { |f| f.name == 'f' }
+      jumps = all_instrs(func).select { |i| i.is_a?(OCC::IR::Jump) }
+      expect(jumps.map(&:target)).to include('done')
+    end
+
+    it 'creates a block for the label target' do
+      src = <<~C
+        int f(void) {
+          goto done;
+          done: return 2;
+        }
+      C
+      mod    = build_ir(src)
+      func   = mod.functions.find { |f| f.name == 'f' }
+      labels = func.blocks.map(&:label)
+      expect(labels).to include('done')
+    end
+  end
+
+  describe 'goto (integration)', :slow do
+    include_context 'native tools available'
+
+    it 'jumps over unreachable code and returns correct value' do
+      src = <<~C
+        int main(void) {
+          goto skip;
+          return 99;
+          skip: return 0;
+        }
+      C
+      result = compile_and_run(src)
+      expect(result[:status]).to eq(0)
+    end
+  end
+
+  # ── switch/case ───────────────────────────────────────────────────────────────
+
+  describe 'switch/case dispatch (IR)' do
+    it 'emits Binary equality comparisons for each case value' do
+      src = <<~C
+        int f(int x) {
+          switch (x) {
+            case 1: return 10;
+            case 2: return 20;
+            default: return 0;
+          }
+        }
+      C
+      mod    = build_ir(src)
+      func   = mod.functions.find { |f| f.name == 'f' }
+      bins   = all_instrs(func).select { |i| i.is_a?(OCC::IR::Binary) && i.op == :eq }
+      expect(bins.length).to be >= 2
+    end
+
+    it 'emits CondJump instructions for case dispatch' do
+      src = <<~C
+        int f(int x) {
+          switch (x) {
+            case 5: return 1;
+            default: return 0;
+          }
+        }
+      C
+      mod  = build_ir(src)
+      func = mod.functions.find { |f| f.name == 'f' }
+      cjs  = all_instrs(func).select { |i| i.is_a?(OCC::IR::CondJump) }
+      expect(cjs).not_to be_empty
+    end
+
+    it 'creates blocks for each case and default' do
+      src = <<~C
+        int f(int x) {
+          switch (x) {
+            case 3: return 33;
+            case 7: return 77;
+            default: return 0;
+          }
+        }
+      C
+      mod    = build_ir(src)
+      func   = mod.functions.find { |f| f.name == 'f' }
+      labels = func.blocks.map(&:label)
+      expect(labels.any? { |l| l.include?('switch_case') }).to be(true)
+      expect(labels.any? { |l| l.include?('switch_default') }).to be(true)
+      expect(labels.any? { |l| l.include?('switch_end') }).to be(true)
+    end
+  end
+
+  describe 'switch/case (integration)', :slow do
+    include_context 'native tools available'
+
+    it 'dispatches to the matching case' do
+      src = <<~C
+        extern int printf(const char *fmt, ...);
+        int main(void) {
+          int x = 2;
+          switch (x) {
+            case 1: printf("one\\n");   break;
+            case 2: printf("two\\n");   break;
+            case 3: printf("three\\n"); break;
+            default: printf("other\\n"); break;
+          }
+          return 0;
+        }
+      C
+      result = compile_and_run(src)
+      expect(result[:stdout].strip).to eq('two')
+    end
+
+    it 'hits the default case when no case matches' do
+      src = <<~C
+        extern int printf(const char *fmt, ...);
+        int main(void) {
+          int x = 99;
+          switch (x) {
+            case 1: printf("one\\n"); break;
+            case 2: printf("two\\n"); break;
+            default: printf("default\\n"); break;
+          }
+          return 0;
+        }
+      C
+      result = compile_and_run(src)
+      expect(result[:stdout].strip).to eq('default')
+    end
+
+    it 'supports fall-through between cases' do
+      src = <<~C
+        extern int printf(const char *fmt, ...);
+        int main(void) {
+          int x = 1;
+          int result = 0;
+          switch (x) {
+            case 1: result = result + 1;
+            case 2: result = result + 2;
+            default: result = result + 4;
+          }
+          printf("%d\\n", result);
+          return 0;
+        }
+      C
+      result = compile_and_run(src)
+      expect(result[:stdout].strip).to eq('7')
+    end
+  end
+
+  # ── sizeof ────────────────────────────────────────────────────────────────────
+
+  describe 'sizeof(type) (IR)' do
+    it 'returns 1 for sizeof(char)' do
+      src = 'int f(void){ return sizeof(char); }'
+      mod  = build_ir(src)
+      func = mod.functions.find { |f| f.name == 'f' }
+      ret  = all_instrs(func).find { |i| i.is_a?(OCC::IR::Return) }
+      expect(ret.value).to be_a(OCC::IR::Const)
+      expect(ret.value.value).to eq(1)
+    end
+
+    it 'returns 4 for sizeof(int)' do
+      src = 'int f(void){ return sizeof(int); }'
+      mod  = build_ir(src)
+      func = mod.functions.find { |f| f.name == 'f' }
+      ret  = all_instrs(func).find { |i| i.is_a?(OCC::IR::Return) }
+      expect(ret.value).to be_a(OCC::IR::Const)
+      expect(ret.value.value).to eq(4)
+    end
+
+    it 'returns 8 for sizeof(long)' do
+      src = 'int f(void){ return sizeof(long); }'
+      mod  = build_ir(src)
+      func = mod.functions.find { |f| f.name == 'f' }
+      ret  = all_instrs(func).find { |i| i.is_a?(OCC::IR::Return) }
+      expect(ret.value).to be_a(OCC::IR::Const)
+      expect(ret.value.value).to eq(8)
+    end
+
+    it 'returns 2 for sizeof(short)' do
+      src = 'int f(void){ return sizeof(short); }'
+      mod  = build_ir(src)
+      func = mod.functions.find { |f| f.name == 'f' }
+      ret  = all_instrs(func).find { |i| i.is_a?(OCC::IR::Return) }
+      expect(ret.value).to be_a(OCC::IR::Const)
+      expect(ret.value.value).to eq(2)
+    end
+  end
+
+  describe 'sizeof (integration)', :slow do
+    include_context 'native tools available'
+
+    it 'sizeof(char) == 1 at runtime' do
+      src = <<~C
+        extern int printf(const char *fmt, ...);
+        int main(void) {
+          printf("%d\\n", (int)sizeof(char));
+          return 0;
+        }
+      C
+      result = compile_and_run(src)
+      expect(result[:stdout].strip).to eq('1')
+    end
+
+    it 'sizeof(int) == 4 at runtime' do
+      src = <<~C
+        extern int printf(const char *fmt, ...);
+        int main(void) {
+          printf("%d\\n", (int)sizeof(int));
+          return 0;
+        }
+      C
+      result = compile_and_run(src)
+      expect(result[:stdout].strip).to eq('4')
+    end
+
+    it 'sizeof(long) == 8 at runtime' do
+      src = <<~C
+        extern int printf(const char *fmt, ...);
+        int main(void) {
+          printf("%d\\n", (int)sizeof(long));
+          return 0;
+        }
+      C
+      result = compile_and_run(src)
+      expect(result[:stdout].strip).to eq('8')
+    end
+  end
+
+  # ── global variable initialization ───────────────────────────────────────────
+
+  describe 'global variable initialization (IR)' do
+    it 'stores the init value in the module globals table' do
+      src = 'int g = 42;'
+      mod = build_ir(src)
+      expect(mod.globals['g']).not_to be_nil
+      expect(mod.globals['g'][:init]).to eq(42)
+    end
+
+    it 'stores nil init for uninitialized globals' do
+      src = 'int g;'
+      mod = build_ir(src)
+      expect(mod.globals['g'][:init]).to be_nil
+    end
+  end
+
+  describe 'global variable initialization (assembly)' do
+    it 'emits a .data section for an initialized global' do
+      src = 'int counter = 7;'
+      asm = OCC::Driver.compile_source(src, '<test>', {})
+      expect(asm).to include('.quad 7').or include('.long 7')
+    end
+
+    it 'does not emit .data for uninitialized global' do
+      src = 'int counter;'
+      asm = OCC::Driver.compile_source(src, '<test>', {})
+      expect(asm).to include('.comm')
+    end
+  end
+
+  describe 'global variable initialization (integration)', :slow do
+    include_context 'native tools available'
+
+    it 'global initializes to the declared value' do
+      src = <<~C
+        extern int printf(const char *fmt, ...);
+        int answer = 42;
+        int main(void) {
+          printf("%d\\n", answer);
+          return 0;
+        }
+      C
+      result = compile_and_run(src)
+      expect(result[:stdout].strip).to eq('42')
+    end
+
+    it 'global can be assigned and read back' do
+      src = <<~C
+        extern int printf(const char *fmt, ...);
+        int counter = 0;
+        int main(void) {
+          counter = 5;
+          printf("%d\\n", counter);
+          return 0;
+        }
+      C
+      result = compile_and_run(src)
+      expect(result[:stdout].strip).to eq('5')
+    end
+  end
+
+  # ── cast ──────────────────────────────────────────────────────────────────────
+
+  describe 'cast expression (IR)' do
+    it 'emits a Cast instruction' do
+      src = 'int f(long x){ return (int)x; }'
+      mod   = build_ir(src)
+      func  = mod.functions.find { |f| f.name == 'f' }
+      casts = all_instrs(func).select { |i| i.is_a?(OCC::IR::Cast) }
+      expect(casts).not_to be_empty
+    end
+
+    it 'stores the target type name on the Cast instruction' do
+      src = 'int f(long x){ return (int)x; }'
+      mod   = build_ir(src)
+      func  = mod.functions.find { |f| f.name == 'f' }
+      cast  = all_instrs(func).find { |i| i.is_a?(OCC::IR::Cast) }
+      expect(cast.to_type).to include('int')
+    end
+  end
+end
