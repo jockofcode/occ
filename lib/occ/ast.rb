@@ -176,12 +176,12 @@ module OCC
     end
 
     class SizeofExpr < Node
-      attr_accessor :operand
+      attr_accessor :operand, :sizeof_val
       def initialize(operand:, **kw) = (super(**kw); @operand = operand)
     end
 
     class SizeofType < Node
-      attr_accessor :type_spec
+      attr_accessor :type_spec, :sizeof_val
       def initialize(type_spec:, **kw) = (super(**kw); @type_spec = type_spec)
     end
 

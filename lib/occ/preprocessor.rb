@@ -134,6 +134,13 @@ module OCC
           directive_line = stripped[1..].lstrip
           i = handle_directive(directive_line, filename, i, lines)
         elsif active?
+          # Join subsequent lines until open parentheses are balanced.
+          # This handles function-like macro calls that span multiple lines.
+          while paren_depth_outside_strings(raw) > 0 && i + 1 < lines.length
+            i  += 1
+            raw = raw + "\n" + lines[i]
+          end
+
           expanded = expand_macros(raw, filename, i + 1)
           @output  << expanded << "\n"
           i += 1
@@ -142,6 +149,74 @@ module OCC
           i += 1
         end
       end
+    end
+
+    # Count the net open-paren depth of text, skipping string/char literals
+    # and both // line comments and /* block comments */.
+    def paren_depth_outside_strings(text)
+      depth      = 0
+      in_str     = false
+      in_char    = false
+      in_block   = false   # inside /* ... */
+      escape     = false
+      chars      = text.chars
+      n          = chars.length
+      k          = 0
+      while k < n
+        c = chars[k]
+
+        if escape
+          escape = false
+          k += 1
+          next
+        end
+
+        if in_block
+          if c == '*' && chars[k + 1] == '/'
+            in_block = false
+            k += 2
+          else
+            k += 1
+          end
+          next
+        end
+
+        if in_str
+          case c
+          when '\\' then escape = true
+          when '"'  then in_str = false
+          end
+          k += 1
+          next
+        end
+
+        if in_char
+          case c
+          when '\\' then escape = true
+          when "'"  then in_char = false
+          end
+          k += 1
+          next
+        end
+
+        # Outside any literal or comment
+        if c == '/' && chars[k + 1] == '*'
+          in_block = true
+          k += 2
+          next
+        elsif c == '/' && chars[k + 1] == '/'
+          break   # rest of line is a // comment
+        end
+
+        case c
+        when '"'  then in_str  = true
+        when "'"  then in_char = true
+        when '('  then depth  += 1
+        when ')'  then depth  -= 1
+        end
+        k += 1
+      end
+      depth
     end
 
     # Returns the new value of i after processing the directive.
@@ -311,14 +386,20 @@ module OCC
     # the # stringification and ## token-paste operators.
 
     def expand_macros(text, filename, lineno)
-      # Replace __FILE__ and __LINE__ specially (not stored in @macros for
-      # efficiency, but handled here so they reflect current context).
-      text = text.gsub('__FILE__', %("#{filename}"))
-                 .gsub('__LINE__', lineno.to_s)
+      # Replace __FILE__ and __LINE__ in the initial text AND after each
+      # expansion pass (they may appear inside macro bodies like `fail()`).
+      file_replacement = %("#{filename}")
+
+      replace_builtins = ->(t) {
+        t.gsub('__FILE__', file_replacement)
+         .gsub('__LINE__', lineno.to_s)
+      }
+
+      text = replace_builtins.call(text)
 
       # Iterative expansion (max 32 passes to prevent infinite loops)
       32.times do
-        expanded = expand_pass(text)
+        expanded = replace_builtins.call(expand_pass(text))
         break if expanded == text
         text = expanded
       end
@@ -409,14 +490,15 @@ module OCC
       # # stringification and parameter substitution
       macro[:params].each_with_index do |param, idx|
         arg = args[idx] || ''
-        body.gsub!(/\#\s*#{Regexp.escape(param)}/, arg.inspect.gsub('\\\\', '\\'))
-        body.gsub!(/\b#{Regexp.escape(param)}\b/, arg)
+        # Use block form to avoid gsub interpreting \ in arg as replacement escapes
+        body.gsub!(/\#\s*#{Regexp.escape(param)}/) { arg.inspect.gsub('\\\\', '\\') }
+        body.gsub!(/\b#{Regexp.escape(param)}\b/) { arg }
       end
 
       # Variadic __VA_ARGS__
       if macro[:variadic]
         va_args = args[macro[:params].length..].join(', ')
-        body.gsub!('__VA_ARGS__', va_args)
+        body.gsub!('__VA_ARGS__') { va_args }
       end
 
       body

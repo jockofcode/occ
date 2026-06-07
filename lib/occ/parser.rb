@@ -261,7 +261,7 @@ module OCC
         outer_postfixes, outer_params = parse_declarator_postfixes
         outer_fn = build_postfix_fn(outer_postfixes)
 
-        combined_fn = ->(base) { inner_fn.call(ptr_fn.call(outer_fn.call(base))) }
+        combined_fn = ->(base) { inner_fn.call(outer_fn.call(ptr_fn.call(base))) }
         [inner_name, combined_fn, inner_params || outer_params]
       else
         name = nil
@@ -274,7 +274,7 @@ module OCC
         postfixes, params = parse_declarator_postfixes
         postfix_fn = build_postfix_fn(postfixes)
 
-        combined_fn = ->(base) { ptr_fn.call(postfix_fn.call(base)) }
+        combined_fn = ->(base) { postfix_fn.call(ptr_fn.call(base)) }
         [name, combined_fn, params]
       end
     end

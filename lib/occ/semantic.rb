@@ -101,6 +101,35 @@ module OCC
       end
     end
 
+    # ── sizeof helpers ────────────────────────────────────────────────────────
+
+    def sizeof_of_ctype(ct)
+      return 8 unless ct
+      u = ct.respond_to?(:unqualified) ? ct.unqualified : ct
+      case u
+      when Types::ArrayType
+        return 8 if u.count.nil?  # unsized array — treat as pointer
+        sizeof_of_ctype(u.element) * u.count
+      when Types::PointerType, Types::FunctionType then 8
+      else
+        u.respond_to?(:size) ? u.size : 8
+      end
+    rescue StandardError
+      8
+    end
+
+    def resolve_sizeof_type(spec)
+      spec = spec[:specs] if spec.is_a?(Hash) && spec[:specs]
+      type_fn = spec.is_a?(Hash) ? spec[:type_fn] : nil
+      spec = spec[:specs] if spec.is_a?(Hash)
+      base = build_base_type(spec) rescue Types::INT
+      ct = type_fn ? (type_fn.call(base) rescue base) : base
+      ct = convert_hash_type(ct) if ct.is_a?(Hash)
+      sizeof_of_ctype(ct)
+    rescue StandardError
+      8
+    end
+
     # ── Type resolution ───────────────────────────────────────────────────────
 
     def resolve_type(spec, type_fn)
@@ -333,7 +362,14 @@ module OCC
               when AST::CallExpr      then type_of_call(node)
               when AST::IndexExpr     then type_of_index(node)
               when AST::MemberExpr    then type_of_member(node)
-              when AST::SizeofExpr, AST::SizeofType, AST::AlignofType then Types::ULONG
+              when AST::SizeofType
+                node.sizeof_val = resolve_sizeof_type(node.type_spec)
+                Types::ULONG
+              when AST::SizeofExpr
+                ot = analyze_expr(node.operand) rescue Types::INT
+                node.sizeof_val = sizeof_of_ctype(ot)
+                Types::ULONG
+              when AST::AlignofType then Types::ULONG
               when AST::CommaExpr
                 node.exprs.map { |e| analyze_expr(e) }.last
               else
@@ -493,6 +529,9 @@ module OCC
       return if lt.is_a?(Types::PointerType) && rt.is_a?(Types::PointerType)
       return if lt.is_a?(Types::PointerType) && rt == Types::INT   # null pointer constant
       return if lt.integer? && rt.is_a?(Types::PointerType)
+      # void* is compatible with any pointer type (C standard)
+      return if lt.is_a?(Types::PointerType) && rt.is_a?(Types::VoidType)
+      return if lt.is_a?(Types::VoidType) && rt.is_a?(Types::PointerType)
 
       err("incompatible types in assignment: #{lt} and #{rt}", loc)
     end

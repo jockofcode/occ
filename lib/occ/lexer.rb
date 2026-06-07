@@ -322,6 +322,18 @@ module OCC
         end
         raise LexError.new('empty hex escape sequence', loc) if hex.empty?
         hex.to_i(16).chr(Encoding::UTF_8) rescue hex.to_i(16).chr
+      when 'u'
+        advance
+        hex = +''
+        4.times { hex << advance if !at_end? && cur =~ /[0-9a-fA-F]/ }
+        raise LexError.new('invalid \\u escape sequence', loc) if hex.length != 4
+        [hex.to_i(16)].pack('U')
+      when 'U'
+        advance
+        hex = +''
+        8.times { hex << advance if !at_end? && cur =~ /[0-9a-fA-F]/ }
+        raise LexError.new('invalid \\U escape sequence', loc) if hex.length != 8
+        [hex.to_i(16)].pack('U')
       when /[0-7]/
         oct = +''
         3.times { oct << advance if !at_end? && cur =~ /[0-7]/ }

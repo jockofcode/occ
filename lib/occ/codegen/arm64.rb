@@ -67,17 +67,22 @@ module OCC
       def emit_function(func)
         @func          = func
         @slot_map      = {}
-        @slot_next     = 0    # positive offset from sp (frame laid out below fp)
+        @slot_next     = 0    # bytes used so far for locals (x29+16 is first slot)
         @alloca_slots  = Set.new  # temp IDs that are direct alloca stack slots
+        @alloca_sizes  = {}       # temp_id => actual byte size (for arrays/structs)
         @fp_alloca_slots = Set.new # alloca slots holding fp values
         @fp_temps      = Set.new  # temp IDs that hold fp (double/float) values
         @float_pool    = []   # [{label:, value:}] for literal-pool fp constants
 
-        # Pre-scan: collect alloca temps and mark FP allocas
+        # Pre-scan: collect alloca temps, their sizes, and mark FP allocas
+        alloca_extra = 0  # extra bytes beyond 8 for oversized alloca temps
         func.blocks.each do |bb|
           bb.instrs.each do |i|
             next unless i.is_a?(IR::Alloca)
             @alloca_slots << i.dst.id
+            sz = ctype_stack_size(i.ctype)
+            @alloca_sizes[i.dst.id] = sz
+            alloca_extra += [sz - 8, 0].max
             @fp_alloca_slots << i.dst.id if fp_ctype?(i.ctype)
           end
         end
@@ -85,18 +90,26 @@ module OCC
         # Type-propagation pass to identify FP-valued temps
         compute_fp_temps(func)
 
-        # Pre-scan to allocate all slots
+        # Compute frame size accounting for oversized alloca slots (arrays, structs)
         all_temps_count = collect_temp_count(func)
-        frame_sz = align16(all_temps_count * 8 + 16)   # +16 for fp/lr pair
+        @frame_sz = align16(all_temps_count * 8 + alloca_extra + 16)   # +16 for fp/lr pair
+        frame_sz = @frame_sz
 
         name = sym(func.name)
         emit ".globl #{name}"
         emit '.p2align 2'
         emit "#{name}:"
 
-        # Prologue: save fp and lr, set up frame pointer
-        emit "  stp x29, x30, [sp, #-#{frame_sz}]!"
-        emit '  mov x29, sp'
+        # Prologue: save fp and lr, set up frame pointer.
+        # stp pre-index immediate is limited to [-512, 504]; use sub+stp for large frames.
+        if frame_sz <= 504
+          emit "  stp x29, x30, [sp, #-#{frame_sz}]!"
+          emit '  mov x29, sp'
+        else
+          emit "  sub sp, sp, ##{frame_sz}"
+          emit '  stp x29, x30, [sp]'
+          emit '  mov x29, sp'
+        end
 
         # Save incoming parameters — integer args in x0-x7, FP args in d0-d7
         int_idx = 0
@@ -242,11 +255,12 @@ module OCC
             end
           else
             load_operand(instr.ptr, 'x9')
+            signed = instr.type.is_a?(OCC::Types::IntegerType) && instr.type.signed?
             case instr.elem_size
-            when 1 then emit '  ldrb w10, [x9]'   # zero-extend byte
-            when 2 then emit '  ldrh w10, [x9]'   # zero-extend halfword
-            when 4 then emit '  ldr w10, [x9]'    # zero-extend word
-            else        emit '  ldr x10, [x9]'    # 64-bit
+            when 1 then emit(signed ? '  ldrsb x10, [x9]' : '  ldrb w10, [x9]')
+            when 2 then emit(signed ? '  ldrsh x10, [x9]' : '  ldrh w10, [x9]')
+            when 4 then emit(signed ? '  ldrsw x10, [x9]' : '  ldr w10, [x9]')
+            else        emit '  ldr x10, [x9]'
             end
             store_temp(instr.dst, 'x10')
           end
@@ -298,8 +312,16 @@ module OCC
         when IR::Gep
           load_operand(instr.ptr,   'x9')
           load_operand(instr.index, 'x10')
-          shift = { 1 => 0, 2 => 1, 4 => 2, 8 => 3 }[instr.elem_size] || 3
-          emit "  lsl x10, x10, ##{shift}" if shift > 0
+          esz = instr.elem_size
+          if esz > 1
+            log2 = Math.log2(esz)
+            if log2 == log2.floor
+              emit "  lsl x10, x10, ##{log2.to_i}"
+            else
+              emit "  mov x11, ##{esz}"
+              emit "  mul x10, x10, x11"
+            end
+          end
           emit '  add x9, x9, x10'
           store_temp(instr.dst, 'x9')
 
@@ -343,8 +365,13 @@ module OCC
             end
           end
           # Epilogue
-          frame_sz = align16(collect_temp_count(@func) * 8 + 16)
-          emit "  ldp x29, x30, [sp], ##{frame_sz}"
+          frame_sz = @frame_sz
+          if frame_sz <= 504
+            emit "  ldp x29, x30, [sp], ##{frame_sz}"
+          else
+            emit '  ldp x29, x30, [sp]'
+            emit "  add sp, sp, ##{frame_sz}"
+          end
           emit '  ret'
 
         when IR::Cast
@@ -466,8 +493,7 @@ module OCC
 
         # ── Compiler intrinsic: address of first variadic arg on stack ──────
         if func_ref.is_a?(IR::GlobalRef) && func_ref.name == '__occ_va_first_arg'
-          frame_sz = align16(collect_temp_count(@func) * 8 + 16)
-          emit "  add x9, x29, ##{frame_sz}"
+          emit "  add x9, x29, ##{@frame_sz}"
           store_temp(instr.dst, 'x9')
           return
         end
@@ -529,15 +555,38 @@ module OCC
 
       # ── Stack / slot management ───────────────────────────────────────────────
       # Slots are positive offsets from x29 (frame pointer).
-      # Layout: [fp, lr] at [sp, sp+8]; locals start at [fp + 16].
+      # Layout: saved [x29,x30] at [sp,sp+8]; locals start at [fp+16].
+      # Alloca temps for arrays/structs may occupy more than 8 bytes.
 
       def alloc_slot_for(temp)
         id = temp.id
         return @slot_map[id] if @slot_map.key?(id)
-        @slot_next += 8
-        offset = @slot_next + 8   # +8 so first slot is at fp+16
+        sz = @alloca_sizes&.[](id) || 8
+        # Keep 8-byte alignment
+        @slot_next = ((@slot_next + 7) / 8 * 8)
+        offset = @slot_next + 16   # +16 so first slot is at fp+16
+        @slot_next += sz
         @slot_map[id] = offset
         offset
+      end
+
+      # Return the byte size a given ctype needs on the stack.
+      # Used to properly allocate space for array and struct local variables.
+      def ctype_stack_size(ctype)
+        case ctype
+        when OCC::Types::ArrayType
+          return 8 if ctype.count.nil?  # unsized array — treat as pointer-sized
+          sz = ctype.size rescue nil
+          sz && sz > 0 ? sz : 8
+        when OCC::Types::StructType
+          sz = ctype.size rescue nil
+          sz && sz > 0 ? sz : 8
+        when OCC::Types::CType
+          sz = ctype.size rescue nil
+          sz && sz > 0 ? sz : 8
+        else
+          8
+        end
       end
 
       def slot_of(temp) = alloc_slot_for(temp)
@@ -565,7 +614,13 @@ module OCC
           emit "  ldr #{reg}, [x29, ##{slot}]"
         when IR::GlobalRef
           emit "  adrp #{reg}, #{sym(op.name)}@PAGE"
-          emit "  ldr  #{reg}, [#{reg}, #{sym(op.name)}@PAGEOFF]"
+          if @mod.func_names.include?(op.name)
+            # Function reference: load the address (pointer to function)
+            emit "  add  #{reg}, #{reg}, #{sym(op.name)}@PAGEOFF"
+          else
+            # Data reference: load the value stored at the address
+            emit "  ldr  #{reg}, [#{reg}, #{sym(op.name)}@PAGEOFF]"
+          end
         when IR::StringRef
           emit "  adrp #{reg}, l_str_#{op.id}@PAGE"
           emit "  add  #{reg}, #{reg}, l_str_#{op.id}@PAGEOFF"

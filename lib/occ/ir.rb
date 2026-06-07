@@ -170,21 +170,26 @@ module OCC
     # ── Module ────────────────────────────────────────────────────────────────
 
     class Mod
-      attr_reader :functions, :globals, :strings, :variadic_funcs, :fp_funcs
+      attr_reader :functions, :globals, :strings, :variadic_funcs, :fp_funcs, :func_names
 
       def initialize
         @functions     = []
-        @globals       = {}   # name => {type:, init:}
-        @strings       = []   # StringRef values
-        @variadic_funcs = {}   # name => named_param_count
-        @fp_funcs       = Set.new  # names of functions returning float/double
+        @globals       = {}         # name => {type:, init:}
+        @strings       = []         # StringRef values
+        @variadic_funcs = {}        # name => named_param_count
+        @fp_funcs       = Set.new   # names of functions returning float/double
+        @func_names     = Set.new   # all known function names (defined or declared extern)
       end
 
-      def add_function(f) = @functions << f
+      def add_function(f)
+        @functions << f
+        @func_names << f.name
+      end
       def add_global(name, type, init = nil) = (@globals[name] = { type: type, init: init })
       def add_string(value) = StringRef.new(@strings.tap { @strings << value }.length - 1)
       def mark_variadic(name, named_count = 0) = (@variadic_funcs[name] = named_count)
       def mark_fp_func(name)  = @fp_funcs << name
+      def mark_func(name)     = @func_names << name
 
       def to_s
         parts = []
@@ -201,14 +206,15 @@ module OCC
 
     class Builder
       def initialize
-        @mod          = Mod.new
-        @func         = nil     # current Function
-        @block        = nil     # current BasicBlock
-        @temp_counter = 0
-        @label_counter= 0
-        @locals       = {}      # name => Alloca temp
-        @break_target = nil
-        @cont_target  = nil
+        @mod             = Mod.new
+        @func            = nil     # current Function
+        @block           = nil     # current BasicBlock
+        @temp_counter    = 0
+        @label_counter   = 0
+        @locals          = {}      # name => Alloca temp
+        @break_target    = nil
+        @cont_target     = nil
+        @enum_constants  = {}      # name => Integer (compile-time enum values)
       end
 
       def build(tu)
@@ -309,6 +315,20 @@ module OCC
       end
 
       def build_global_decl(decl)
+        # Collect enum constants from inline enum definitions.
+        tag_decl = decl.specifiers.tag_decl
+        if tag_decl.is_a?(AST::EnumSpec) && tag_decl.enumerators
+          val = 0
+          tag_decl.enumerators.each do |e|
+            if e.value
+              ev = eval_const_init(e.value)
+              val = ev if ev
+            end
+            @enum_constants[e.name] = val
+            val += 1
+          end
+        end
+
         # Register variadic and FP-returning extern declarations before skipping them.
         if decl.specifiers.storage == :extern
           base = begin
@@ -329,6 +349,7 @@ module OCC
 
             ret = full_type[:return]
             @mod.mark_fp_func(d[:name]) if ret.is_a?(OCC::Types::FloatingType)
+            @mod.mark_func(d[:name])
           end
           return
         end
@@ -372,10 +393,15 @@ module OCC
           r = eval_const_init(expr.right)
           return nil unless l && r
           case expr.op
-          when :plus  then l + r
-          when :minus then l - r
-          when :star  then l * r
-          when :slash then r != 0 ? l / r : nil
+          when :plus   then l + r
+          when :minus  then l - r
+          when :star   then l * r
+          when :slash  then r != 0 ? l / r : nil
+          when :lshift then l << r
+          when :rshift then l >> r
+          when :amp    then l & r
+          when :pipe   then l | r
+          when :caret  then l ^ r
           end
         else nil
         end
@@ -411,6 +437,20 @@ module OCC
       end
 
       def build_local_decl(decl)
+        # Collect enum constants from inline enum definitions (may appear locally).
+        tag_decl = decl.specifiers.tag_decl
+        if tag_decl.is_a?(AST::EnumSpec) && tag_decl.enumerators
+          val = 0
+          tag_decl.enumerators.each do |e|
+            if e.value
+              ev = eval_const_init(e.value)
+              val = ev if ev
+            end
+            @enum_constants[e.name] = val
+            val += 1
+          end
+        end
+
         decl.declarators.each do |d|
           next unless d[:name]
           ctype = d[:resolved_type]
@@ -600,16 +640,26 @@ module OCC
 
         items = node.body.is_a?(AST::CompoundStmt) ? node.body.items : [node.body]
 
-        # First pass: collect case values and create blocks for each case/default
+        # First pass: collect case values and create blocks for each case/default.
+        # Fall-through cases (case A: case B: body) are nested CaseStmts in our AST;
+        # all values in a chain share one block so the dispatch works correctly.
         case_map      = {}   # integer_value => BasicBlock
         default_block = nil
 
         items.each do |item|
           case item
           when AST::CaseStmt
-            val = eval_case_value(item.value)
-            next if val.nil? || case_map.key?(val)
-            case_map[val] = new_block(new_label('switch_case'))
+            # Walk the nested CaseStmt chain, collecting all case values.
+            chain_vals = []
+            s = item
+            while s.is_a?(AST::CaseStmt)
+              v = eval_case_value(s.value)
+              chain_vals << v if v && !case_map.key?(v)
+              s = s.stmt
+            end
+            # All values in this chain share one block.
+            blk = new_block(new_label('switch_case'))
+            chain_vals.each { |v| case_map[v] = blk }
           when AST::DefaultStmt
             default_block ||= new_block(new_label('switch_default'))
           end
@@ -705,6 +755,9 @@ module OCC
       end
 
       def build_ident(node)
+        # Enum constants are compile-time integer values, not addressable storage.
+        return Const.new(@enum_constants[node.name]) if @enum_constants.key?(node.name)
+
         slot = @locals[node.name]
         if slot
           # Arrays decay to a pointer to their first element.
@@ -749,15 +802,23 @@ module OCC
             else
               emit(AddrOf.new(dst, GlobalRef.new(node.operand.name)))
             end
+          when AST::IndexExpr
+            arr = build_expr(node.operand.array)
+            idx = build_expr(node.operand.index)
+            esz = elem_size_for(node.operand.array.ctype)
+            emit(Gep.new(dst, arr, idx, esz))
+          when AST::MemberExpr
+            return build_member_addr(node.operand)
           else
             emit(Copy.new(dst, build_expr(node.operand)))
           end
           dst
         when :deref
           ptr = build_expr(node.operand)
+          pointed_ct = node.operand.ctype.is_a?(OCC::Types::PointerType) ? node.operand.ctype.base : nil
           elem_sz = elem_size_for(node.operand.ctype)
           dst = new_temp
-          emit(Load.new(dst, ptr, nil, elem_sz))
+          emit(Load.new(dst, ptr, pointed_ct, elem_sz))
           dst
         when :unary_minus
           operand = build_expr(node.operand)
@@ -778,45 +839,61 @@ module OCC
           slot = @locals[node.operand.name] if node.operand.is_a?(AST::Identifier)
           if slot
             old = new_temp; emit(Load.new(old, slot))
-            one = Const.new(1)
-            new_val = new_temp; emit(Binary.new(new_val, :plus, old, one))
+            new_val = new_temp; emit(Binary.new(new_val, :plus, old, Const.new(1)))
             emit(Store.new(slot, new_val))
             new_val
           else
-            build_expr(node.operand)
+            addr = lvalue_addr(node.operand)
+            sz = node.operand.ctype ? (node.operand.ctype.size rescue 8) : 8
+            old = new_temp; emit(Load.new(old, addr, node.operand.ctype, sz))
+            new_val = new_temp; emit(Binary.new(new_val, :plus, old, Const.new(1)))
+            emit(Store.new(addr, new_val, nil, sz))
+            new_val
           end
         when :post_inc
           slot = @locals[node.operand.name] if node.operand.is_a?(AST::Identifier)
           if slot
             old = new_temp; emit(Load.new(old, slot))
-            one = Const.new(1)
-            new_val = new_temp; emit(Binary.new(new_val, :plus, old, one))
+            new_val = new_temp; emit(Binary.new(new_val, :plus, old, Const.new(1)))
             emit(Store.new(slot, new_val))
-            old   # return old value
+            old
           else
-            build_expr(node.operand)
+            addr = lvalue_addr(node.operand)
+            sz = node.operand.ctype ? (node.operand.ctype.size rescue 8) : 8
+            old = new_temp; emit(Load.new(old, addr, node.operand.ctype, sz))
+            new_val = new_temp; emit(Binary.new(new_val, :plus, old, Const.new(1)))
+            emit(Store.new(addr, new_val, nil, sz))
+            old
           end
         when :pre_dec
           slot = @locals[node.operand.name] if node.operand.is_a?(AST::Identifier)
           if slot
             old = new_temp; emit(Load.new(old, slot))
-            one = Const.new(1)
-            new_val = new_temp; emit(Binary.new(new_val, :minus, old, one))
+            new_val = new_temp; emit(Binary.new(new_val, :minus, old, Const.new(1)))
             emit(Store.new(slot, new_val))
             new_val
           else
-            build_expr(node.operand)
+            addr = lvalue_addr(node.operand)
+            sz = node.operand.ctype ? (node.operand.ctype.size rescue 8) : 8
+            old = new_temp; emit(Load.new(old, addr, node.operand.ctype, sz))
+            new_val = new_temp; emit(Binary.new(new_val, :minus, old, Const.new(1)))
+            emit(Store.new(addr, new_val, nil, sz))
+            new_val
           end
         when :post_dec
           slot = @locals[node.operand.name] if node.operand.is_a?(AST::Identifier)
           if slot
             old = new_temp; emit(Load.new(old, slot))
-            one = Const.new(1)
-            new_val = new_temp; emit(Binary.new(new_val, :minus, old, one))
+            new_val = new_temp; emit(Binary.new(new_val, :minus, old, Const.new(1)))
             emit(Store.new(slot, new_val))
             old
           else
-            build_expr(node.operand)
+            addr = lvalue_addr(node.operand)
+            sz = node.operand.ctype ? (node.operand.ctype.size rescue 8) : 8
+            old = new_temp; emit(Load.new(old, addr, node.operand.ctype, sz))
+            new_val = new_temp; emit(Binary.new(new_val, :minus, old, Const.new(1)))
+            emit(Store.new(addr, new_val, nil, sz))
+            old
           end
         else
           build_expr(node.operand)
@@ -889,7 +966,14 @@ module OCC
         args = node.args.map { |a| build_expr(a) }
         dst  = new_temp
         func_ref = case node.callee
-                   when AST::Identifier then GlobalRef.new(node.callee.name)
+                   when AST::Identifier
+                     # If the callee name resolves to a local (function pointer), load it.
+                     # Otherwise treat it as a direct global function reference.
+                     if @locals.key?(node.callee.name)
+                       build_ident(node.callee)
+                     else
+                       GlobalRef.new(node.callee.name)
+                     end
                    else build_expr(node.callee)
                    end
         emit(Call.new(dst, func_ref, args, node.ctype))
@@ -898,9 +982,9 @@ module OCC
 
       def build_ternary(node)
         cond_val    = build_expr(node.cond)
-        then_block  = new_block('tern_then')
-        else_block  = new_block('tern_else')
-        merge_block = new_block('tern_merge')
+        then_block  = new_block(new_label('tern_then'))
+        else_block  = new_block(new_label('tern_else'))
+        merge_block = new_block(new_label('tern_merge'))
         result_slot = new_temp
         emit(Alloca.new(result_slot, 'int'))
         emit(CondJump.new(cond_val, then_block.label, else_block.label))
@@ -928,7 +1012,7 @@ module OCC
         ptr     = new_temp
         emit(Gep.new(ptr, arr, idx, elem_sz))
         dst = new_temp
-        emit(Load.new(dst, ptr, nil, elem_sz))
+        emit(Load.new(dst, ptr, node.ctype, elem_sz))
         dst
       end
 
@@ -981,7 +1065,7 @@ module OCC
           field_ptr = build_member_addr(node)
           elem_sz   = member_field_size(node)
           dst       = new_temp
-          emit(Load.new(dst, field_ptr, nil, elem_sz))
+          emit(Load.new(dst, field_ptr, node.ctype, elem_sz))
           dst
         end
       end
@@ -1075,14 +1159,20 @@ module OCC
       end
 
       def build_sizeof_type(node)
+        # sizeof_val is pre-computed by the semantic analyzer.
+        return Const.new(node.sizeof_val) if node.sizeof_val
+        # Fallback for cases the semantic analyzer didn't annotate.
         spec  = node.type_spec.is_a?(Hash) ? node.type_spec[:specs] : node.type_spec
         ctype = OCC::Types.from_specifiers(spec)
         Const.new(ctype.size)
-      rescue
+      rescue StandardError
         Const.new(8)
       end
 
       def build_sizeof_expr(node)
+        # sizeof_val is pre-computed by the semantic analyzer.
+        return Const.new(node.sizeof_val) if node.sizeof_val
+        # Fallback for literal-only cases.
         case node.operand
         when AST::CharLiteral   then Const.new(1)
         when AST::IntLiteral    then Const.new(4)
