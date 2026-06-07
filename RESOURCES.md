@@ -16,6 +16,7 @@ Sourced from the [kefir C project](https://git.sr.ht/~jprotopopov/kefir), the pr
 - [POSIX c99 specification](https://pubs.opengroup.org/onlinepubs/9699919799/)
 - [System-V AMD64 ABI](https://gitlab.com/x86-psABIs/x86-64-ABI)
 - [AMD64 instruction set reference](https://www.amd.com/system/files/TechDocs/24594.pdf)
+- [ARM Architecture Reference Manual (A-profile)](https://developer.arm.com/documentation/ddi0487/latest)
 
 ## Useful Tools
 

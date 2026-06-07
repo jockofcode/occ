@@ -45,11 +45,10 @@ RSpec.describe 'Phase 11: Third-party compilation', :thirdparty do
     JSMN_COMMIT = '25647e692c7906b96ffd2b05ca54c097948e879c'
 
     it 'compiles jsmn_test.c and passes all tests' do
-      pending 'requires full <stdio.h>/<string.h> support (Phase 9 headers)'
-
       repo = git_clone(JSMN_URL, JSMN_COMMIT, 'jsmn')
       in_build_copy(repo, 'jsmn') do |dir|
-        test_src = File.join(dir, 'jsmn_test.c')
+        # The test file is at test/tests.c; it includes jsmn.h from the root.
+        test_src = File.join(dir, 'test', 'tests.c')
 
         result = occ_compile(test_src, output: './jsmn_test',
                                        flags: ["-I#{dir}"])

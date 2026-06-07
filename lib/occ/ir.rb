@@ -783,10 +783,66 @@ module OCC
       end
 
       def build_binop(node)
+        # && and || require short-circuit evaluation.
+        return build_logical_and(node) if node.op == :logical_and
+        return build_logical_or(node)  if node.op == :logical_or
+
         left  = build_expr(node.left)
         right = build_expr(node.right)
         dst   = new_temp
         emit(Binary.new(dst, node.op, left, right, node.ctype))
+        dst
+      end
+
+      # Compile `a && b` with short-circuit: if a is false, result = 0 without evaluating b.
+      def build_logical_and(node)
+        slot = new_temp
+        emit(Alloca.new(slot, nil))
+        emit(Store.new(slot, Const.new(0)))  # default: false
+
+        lhs       = build_expr(node.left)
+        rhs_block = new_block(new_label('land_rhs'))
+        end_block = new_block(new_label('land_end'))
+
+        emit(CondJump.new(lhs, rhs_block.label, end_block.label))
+        switch_to(rhs_block)
+
+        rhs        = build_expr(node.right)
+        true_block = new_block(new_label('land_true'))
+        emit(CondJump.new(rhs, true_block.label, end_block.label))
+        switch_to(true_block)
+        emit(Store.new(slot, Const.new(1)))
+        emit(Jump.new(end_block.label))
+
+        switch_to(end_block)
+        dst = new_temp
+        emit(Load.new(dst, slot))
+        dst
+      end
+
+      # Compile `a || b` with short-circuit: if a is true, result = 1 without evaluating b.
+      def build_logical_or(node)
+        slot = new_temp
+        emit(Alloca.new(slot, nil))
+        emit(Store.new(slot, Const.new(1)))  # default: true
+
+        lhs       = build_expr(node.left)
+        rhs_block = new_block(new_label('lor_rhs'))
+        end_block = new_block(new_label('lor_end'))
+
+        emit(CondJump.new(lhs, end_block.label, rhs_block.label))
+        switch_to(rhs_block)
+
+        rhs         = build_expr(node.right)
+        false_block = new_block(new_label('lor_false'))
+        emit(CondJump.new(rhs, end_block.label, false_block.label))
+        switch_to(false_block)
+        emit(Store.new(slot, Const.new(0)))
+        emit(Jump.new(end_block.label))
+
+        switch_to(end_block)
+        dst = new_temp
+        emit(Load.new(dst, slot))
         dst
       end
 
