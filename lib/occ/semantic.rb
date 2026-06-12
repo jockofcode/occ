@@ -42,7 +42,7 @@ module OCC
       when AST::Declaration
         analyze_declaration(node, global: true)
       when AST::StaticAssert
-        # evaluated at compile time – skip for now
+        check_static_assert(node)
       end
     end
 
@@ -83,6 +83,18 @@ module OCC
 
       decl.declarators.each do |d|
         base_type = resolve_type(decl.specifiers, d[:type_fn])
+
+        # Infer array count from initializer list or string literal for unsized arrays
+        if base_type.is_a?(Types::ArrayType) && base_type.count.nil?
+          if d[:init].is_a?(Hash) && d[:init][:kind] == :initializer_list
+            count = (d[:init][:items] || []).length
+            base_type = Types::ArrayType.new(base_type.element, count) if count > 0
+          elsif d[:init].is_a?(AST::StringLiteral)
+            count = d[:init].value.length + 1
+            base_type = Types::ArrayType.new(base_type.element, count)
+          end
+        end
+
         # Annotate the declarator hash so the IR builder can use the resolved type.
         d[:resolved_type] = base_type
 
@@ -99,6 +111,117 @@ module OCC
 
         @symbols.define(d[:name], type: base_type, kind: :var, location: decl.location)
       end
+    end
+
+    # ── _Generic selection ─────────────────────────────────────────────────────
+
+    # Resolve a _Generic(controlling, T1: e1, T2: e2, default: ed) node.
+    # Annotates node[:selected_expr] and returns its type.
+    def resolve_generic(node)
+      ct = analyze_expr(node[:controlling])
+      ct_bare = ct.respond_to?(:unqualified) ? ct.unqualified : ct
+
+      selected = nil
+      default_assoc = nil
+
+      node[:associations].each do |a|
+        if a[:type] == :default
+          default_assoc = a
+          next
+        end
+        assoc_ct = begin
+          spec = a[:type].is_a?(Hash) ? (a[:type][:specs] || a[:type]) : a[:type]
+          base = build_base_type(spec) rescue nil
+          next unless base
+          type_fn = a[:type].is_a?(Hash) ? a[:type][:type_fn] : nil
+          type_fn ? (type_fn.call(base) rescue base) : base
+        rescue StandardError
+          nil
+        end
+        next unless assoc_ct
+        assoc_bare = assoc_ct.respond_to?(:unqualified) ? assoc_ct.unqualified : assoc_ct
+        if ct_bare == assoc_bare
+          selected = a
+          break
+        end
+      end
+
+      selected ||= default_assoc
+      if selected
+        node[:selected_expr] = selected[:expr]
+        analyze_expr(selected[:expr])
+      else
+        Types::INT
+      end
+    rescue StandardError
+      Types::INT
+    end
+
+    # ── _Static_assert ─────────────────────────────────────────────────────────
+
+    def check_static_assert(node)
+      val = eval_const_expr(node.expr)
+      return if val.nil? || val != 0  # unknown or true — pass
+      msg = node.message.is_a?(AST::StringLiteral) ? node.message.value : node.message.to_s
+      loc = node.respond_to?(:location) ? node.location : nil
+      raise SemanticError.new("static assertion failed: #{msg}", loc)
+    end
+
+    # Fold a constant expression to an integer, or nil if not foldable.
+    def eval_const_expr(node)
+      return nil unless node
+      case node
+      when AST::IntLiteral   then node.integer_value
+      when AST::CharLiteral  then node.value.ord
+      when AST::Identifier
+        # enum constants are in the symbol table with kind: :enum_const
+        sym = @symbols.lookup(node.name)
+        sym && sym[:kind] == :enum_const ? sym[:value] : nil
+      when AST::UnaryOp
+        v = eval_const_expr(node.operand)
+        return nil unless v
+        case node.op
+        when :unary_minus then -v
+        when :logical_not then v == 0 ? 1 : 0
+        when :bit_not     then ~v
+        else nil
+        end
+      when AST::BinaryOp
+        l = eval_const_expr(node.left)
+        r = eval_const_expr(node.right)
+        return nil unless l && r
+        case node.op
+        when :plus        then l + r
+        when :minus       then l - r
+        when :star        then l * r
+        when :slash       then r != 0 ? l / r : nil
+        when :percent     then r != 0 ? l % r : nil
+        when :lshift      then l << r
+        when :rshift      then l >> r
+        when :amp         then l & r
+        when :pipe        then l | r
+        when :caret       then l ^ r
+        when :eq          then l == r ? 1 : 0
+        when :neq         then l != r ? 1 : 0
+        when :lt          then l < r  ? 1 : 0
+        when :leq         then l <= r ? 1 : 0
+        when :gt          then l > r  ? 1 : 0
+        when :geq         then l >= r ? 1 : 0
+        when :logical_and then (l != 0 && r != 0) ? 1 : 0
+        when :logical_or  then (l != 0 || r != 0) ? 1 : 0
+        end
+      when AST::TernaryOp
+        c = eval_const_expr(node.cond)
+        return nil if c.nil?
+        c != 0 ? eval_const_expr(node.then_expr) : eval_const_expr(node.else_expr)
+      when AST::SizeofType
+        node.sizeof_val || resolve_sizeof_type(node.type_spec)
+      when AST::SizeofExpr
+        node.sizeof_val
+      else nil
+      end
+    rescue StandardError
+      nil
     end
 
     # ── sizeof helpers ────────────────────────────────────────────────────────
@@ -119,9 +242,9 @@ module OCC
     end
 
     def resolve_sizeof_type(spec)
-      spec = spec[:specs] if spec.is_a?(Hash) && spec[:specs]
       type_fn = spec.is_a?(Hash) ? spec[:type_fn] : nil
-      spec = spec[:specs] if spec.is_a?(Hash)
+      spec = spec[:specs] if spec.is_a?(Hash) && spec[:specs]
+      spec = spec[:specs] if spec.is_a?(Hash) && spec[:specs]
       base = build_base_type(spec) rescue Types::INT
       ct = type_fn ? (type_fn.call(base) rescue base) : base
       ct = convert_hash_type(ct) if ct.is_a?(Hash)
@@ -183,6 +306,9 @@ module OCC
         t = resolve_type(p[:specs], p[:type_fn])
         # Array params decay to pointers
         t = Types::PointerType.new(t.element) if t.is_a?(Types::ArrayType)
+        # Annotate the original param hash so the IR builder can use the
+        # resolved type without re-running declarator resolution.
+        p[:resolved_type] = t if p.is_a?(Hash)
         { name: p[:name], type: t }
       end
 
@@ -203,62 +329,82 @@ module OCC
         unit_size  = 0      # byte size of the current storage unit (0 = not in a bitfield run)
 
         fields = spec.fields.flat_map do |field_decl|
-          field_decl.declarators.filter_map do |d|
-            ft = resolve_type(field_decl.specifiers, d[:type_fn]) rescue Types::INT
+          if field_decl.declarators.empty?
+            # ── Anonymous struct/union member (C11 §6.7.2.1 para 13) ────────
+            ft = (resolve_type(field_decl.specifiers, nil) rescue nil)
+            next [] unless ft.is_a?(Types::StructType) && ft.complete?
+            # Flush any open bitfield storage unit
+            if kind == :kw_struct && unit_size > 0
+              offset += unit_size if bit_offset > 0
+              bit_offset = 0
+              unit_size  = 0
+            end
+            base_off = kind == :kw_struct ? align_up(offset, ft.align) : 0
+            inlined = ft.fields.map do |f|
+              { name: f[:name], type: f[:type],
+                offset: base_off + f[:offset],
+                bit_offset: f[:bit_offset], bit_width: f[:bit_width], unit_size: f[:unit_size] }
+            end
+            offset = base_off + ft.size if kind == :kw_struct
+            inlined
+          else
+            field_decl.declarators.filter_map do |d|
+              ft = resolve_type(field_decl.specifiers, d[:type_fn]) rescue Types::INT
 
-            if d[:bitwidth]
-              # ── Bitfield member ─────────────────────────────────────────────
-              width = case d[:bitwidth]
-                      when AST::IntLiteral then d[:bitwidth].integer_value
-                      else 1
-                      end
-              ft_size = (ft.size rescue 4).clamp(1, 8)
+              if d[:bitwidth]
+                # ── Bitfield member ─────────────────────────────────────────────
+                width = case d[:bitwidth]
+                        when AST::IntLiteral then d[:bitwidth].integer_value
+                        else 1
+                        end
+                ft_size = (ft.size rescue 4).clamp(1, 8)
 
-              # width == 0: anonymous zero-width field forces alignment
-              if width == 0
-                if kind == :kw_struct && bit_offset > 0
-                  offset   += unit_size
+                # width == 0: anonymous zero-width field forces alignment
+                if width == 0
+                  if kind == :kw_struct && bit_offset > 0
+                    offset   += unit_size
+                    bit_offset = 0
+                    unit_size  = 0
+                  end
+                  next nil
+                end
+
+                # Start a new storage unit if needed
+                if unit_size == 0 || bit_offset + width > unit_size * 8
+                  if kind == :kw_struct && unit_size > 0 && bit_offset > 0
+                    offset += unit_size
+                  end
+                  if kind == :kw_struct
+                    offset    = align_up(offset, ft_size)
+                  end
+                  bit_offset = 0
+                  unit_size  = ft_size
+                end
+
+                f = d[:name] ? {
+                  name:       d[:name],
+                  type:       ft,
+                  offset:     offset,
+                  bit_offset: bit_offset,
+                  bit_width:  width,
+                  unit_size:  unit_size
+                } : nil
+                bit_offset += width
+                f
+              else
+                # ── Regular member ───────────────────────────────────────────────
+                # Flush any open bitfield storage unit
+                if kind == :kw_struct && unit_size > 0
+                  offset    += unit_size if bit_offset > 0
                   bit_offset = 0
                   unit_size  = 0
                 end
-                next nil
+                offset = align_up(offset, ft.align) if kind == :kw_struct
+                f = d[:name] ? { name: d[:name], type: ft, offset: offset,
+                                 bit_offset: nil, bit_width: nil, unit_size: nil } : nil
+                offset += (ft.size rescue 4) if kind == :kw_struct
+                f
               end
-
-              # Start a new storage unit if needed
-              if unit_size == 0 || bit_offset + width > unit_size * 8
-                if kind == :kw_struct && unit_size > 0 && bit_offset > 0
-                  offset += unit_size
-                end
-                if kind == :kw_struct
-                  offset    = align_up(offset, ft_size)
-                end
-                bit_offset = 0
-                unit_size  = ft_size
-              end
-
-              f = d[:name] ? {
-                name:       d[:name],
-                type:       ft,
-                offset:     offset,
-                bit_offset: bit_offset,
-                bit_width:  width,
-                unit_size:  unit_size
-              } : nil
-              bit_offset += width
-              f
-            else
-              # ── Regular member ───────────────────────────────────────────────
-              # Flush any open bitfield storage unit
-              if kind == :kw_struct && unit_size > 0
-                offset    += unit_size if bit_offset > 0
-                bit_offset = 0
-                unit_size  = 0
-              end
-              offset = align_up(offset, ft.align) if kind == :kw_struct
-              f = d[:name] ? { name: d[:name], type: ft, offset: offset,
-                               bit_offset: nil, bit_width: nil, unit_size: nil } : nil
-              offset += (ft.size rescue 4) if kind == :kw_struct
-              f
             end
           end
         end
@@ -325,8 +471,10 @@ module OCC
         analyze_stmt(node.stmt)
       when AST::LabelStmt
         analyze_stmt(node.stmt)
-      when AST::BreakStmt, AST::ContinueStmt, AST::GotoStmt, AST::StaticAssert
-        # no-op for now
+      when AST::BreakStmt, AST::ContinueStmt, AST::GotoStmt
+        nil  # no-op
+      when AST::StaticAssert
+        check_static_assert(node)
       else
         # silently ignore unknown statement types
       end
@@ -335,7 +483,7 @@ module OCC
     def analyze_block_item(item)
       case item
       when AST::Declaration then analyze_declaration(item)
-      when AST::StaticAssert then nil
+      when AST::StaticAssert then check_static_assert(item)
       else analyze_stmt(item)
       end
     end
@@ -345,8 +493,11 @@ module OCC
 
     def analyze_expr(node)
       return Types::INT unless node
-      # Hash nodes (initializer lists, compound literals' inner lists) are not AST nodes.
-      return Types::INT if node.is_a?(Hash)
+      # Hash nodes — only _Generic selections are meaningful here.
+      if node.is_a?(Hash)
+        return resolve_generic(node) if node[:kind] == :generic
+        return Types::INT
+      end
 
       ctype = case node
               when AST::IntLiteral    then type_of_int_literal(node)
@@ -366,8 +517,12 @@ module OCC
                 node.sizeof_val = resolve_sizeof_type(node.type_spec)
                 Types::ULONG
               when AST::SizeofExpr
-                ot = analyze_expr(node.operand) rescue Types::INT
-                node.sizeof_val = sizeof_of_ctype(ot)
+                node.sizeof_val = if node.operand.is_a?(AST::StringLiteral)
+                                    node.operand.value.length + 1
+                                  else
+                                    ot = analyze_expr(node.operand) rescue Types::INT
+                                    sizeof_of_ctype(ot)
+                                  end
                 Types::ULONG
               when AST::AlignofType then Types::ULONG
               when AST::CommaExpr
@@ -456,7 +611,15 @@ module OCC
     def type_of_assign(node)
       lt = analyze_expr(node.target)
       rt = analyze_expr(node.value)
-      check_assignment_compat(lt, rt, node.location)
+      # For compound pointer arithmetic (p += n, p -= n), the rhs is an integer
+      # being added to/subtracted from a pointer — the result type is the pointer
+      # type so no assignment-compat check is needed.
+      lt_inner = lt.respond_to?(:unqualified) ? lt.unqualified : lt
+      rt_inner = rt.respond_to?(:unqualified) ? rt.unqualified : rt
+      pointer_arith = lt_inner.is_a?(Types::PointerType) &&
+                      rt_inner.respond_to?(:integer?) && rt_inner.integer? &&
+                      %i[plus_assign minus_assign].include?(node.op)
+      check_assignment_compat(lt, rt, node.location) unless pointer_arith
       lt
     end
 
@@ -532,6 +695,14 @@ module OCC
       # void* is compatible with any pointer type (C standard)
       return if lt.is_a?(Types::PointerType) && rt.is_a?(Types::VoidType)
       return if lt.is_a?(Types::VoidType) && rt.is_a?(Types::PointerType)
+      # function designator decays to function pointer; allow assigning to any pointer
+      return if lt.is_a?(Types::PointerType) && rt.is_a?(Types::FunctionType)
+      # array decays to pointer in assignment context
+      return if lt.is_a?(Types::PointerType) && rt.is_a?(Types::ArrayType)
+      # char array initialized from string literal (char[] = "...")
+      return if lt.is_a?(Types::ArrayType) && rt.is_a?(Types::PointerType)
+      # array-to-array (struct copy of same-type arrays)
+      return if lt.is_a?(Types::ArrayType) && rt.is_a?(Types::ArrayType)
 
       err("incompatible types in assignment: #{lt} and #{rt}", loc)
     end

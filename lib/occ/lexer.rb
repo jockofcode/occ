@@ -321,7 +321,7 @@ module OCC
           hex << advance
         end
         raise LexError.new('empty hex escape sequence', loc) if hex.empty?
-        hex.to_i(16).chr(Encoding::UTF_8) rescue hex.to_i(16).chr
+        [hex.to_i(16)].pack('C')  # raw byte, not UTF-8 codepoint
       when 'u'
         advance
         hex = +''
@@ -337,7 +337,7 @@ module OCC
       when /[0-7]/
         oct = +''
         3.times { oct << advance if !at_end? && cur =~ /[0-7]/ }
-        oct.to_i(8).chr
+        [oct.to_i(8)].pack('C')  # raw byte
       else
         ch = advance
         raise LexError.new("unknown escape sequence '\\#{ch}'", loc)

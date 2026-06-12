@@ -69,6 +69,7 @@ module OCC
       define_object_macro('__GNUC_MINOR__',      '2')
       define_object_macro('__GNUC_PATCHLEVEL__', '1')
       define_object_macro('__builtin_va_list',   'char*')
+      define_object_macro('__thread',            '_Thread_local')
       # Function-like extension macros
       @macros['__attribute__']         = { kind: :function, params: ['x'], variadic: false, body: '' }
       @macros['__attribute']           = { kind: :function, params: ['x'], variadic: false, body: '' }
@@ -77,6 +78,19 @@ module OCC
       @macros['__builtin_unreachable'] = { kind: :function, params: [], variadic: true,  body: '' }
       @macros['__builtin_offsetof']    = { kind: :function, params: ['type', 'member'], variadic: false, body: '0' }
       @macros['__typeof__']            = { kind: :function, params: ['x'], variadic: false, body: 'int' }
+      # GCC atomic builtins — provide non-atomic fallback for single-threaded use
+      @macros['__sync_bool_compare_and_swap'] = { kind: :function, params: ['ptr', 'old', 'new_val'], variadic: false,
+                                                   body: '(*((ptr)) == (old) ? ((*((ptr)) = (new_val)), 1) : 0)' }
+      @macros['__sync_val_compare_and_swap']  = { kind: :function, params: ['ptr', 'old', 'new_val'], variadic: false,
+                                                   body: '(*((ptr)) == (old) ? ((*((ptr)) = (new_val)), (old)) : *((ptr)))' }
+      @macros['__sync_fetch_and_add']  = { kind: :function, params: ['ptr', 'val'], variadic: false,
+                                            body: '((*((ptr))) += (val))' }
+      @macros['__sync_fetch_and_sub']  = { kind: :function, params: ['ptr', 'val'], variadic: false,
+                                            body: '((*((ptr))) -= (val))' }
+      @macros['__sync_lock_test_and_set'] = { kind: :function, params: ['ptr', 'val'], variadic: false,
+                                               body: '((*((ptr))) = (val))' }
+      @macros['__sync_lock_release']   = { kind: :function, params: ['ptr'], variadic: false,
+                                            body: '((*((ptr))) = 0)' }
       @macros['__typeof']              = { kind: :function, params: ['x'], variadic: false, body: 'int' }
       @macros['__asm__']               = { kind: :function, params: [], variadic: true, body: '' }
       @macros['__asm']                 = { kind: :function, params: [], variadic: true, body: '' }
@@ -114,7 +128,7 @@ module OCC
 
     def process_source(source, filename)
       @output  ||= +''
-      lines = source.split("\n", -1)
+      lines = strip_comments(source).split("\n", -1)
       i     = 0
 
       while i < lines.length
@@ -136,9 +150,25 @@ module OCC
         elsif active?
           # Join subsequent lines until open parentheses are balanced.
           # This handles function-like macro calls that span multiple lines.
+          # When a directive line appears mid-join, emit the current
+          # accumulation, reset raw to empty, and point i back at the
+          # directive so the outer loop processes it normally.
           while paren_depth_outside_strings(raw) > 0 && i + 1 < lines.length
-            i  += 1
-            raw = raw + "\n" + lines[i]
+            next_stripped = lines[i + 1].lstrip
+            if next_stripped.start_with?('#')
+              # Emit what we have so far; the lexer treats the whole output
+              # as one token stream, so an unbalanced partial line is fine.
+              expanded = expand_macros(raw, filename, i + 1)
+              @output  << expanded << "\n"
+              raw = ''
+              # Leave i pointing at the current line; the outer i+=1 below
+              # will advance to the directive line, which the outer loop
+              # will then handle normally on the next iteration.
+              break
+            else
+              i  += 1
+              raw = raw + "\n" + lines[i]
+            end
           end
 
           expanded = expand_macros(raw, filename, i + 1)
@@ -217,6 +247,86 @@ module OCC
         k += 1
       end
       depth
+    end
+
+    # Strip C and C++ style comments from the source before directive
+    # processing and macro expansion.  Block comments are replaced with a
+    # single space (preserving any newlines inside, so line numbers stay
+    # aligned).  Line comments are stripped to end of line.  String and
+    # character literals are left untouched.
+    def strip_comments(text)
+      out      = +''
+      in_str   = false
+      in_char  = false
+      in_block = false
+      escape   = false
+      i        = 0
+      n        = text.length
+      while i < n
+        c  = text[i]
+        c2 = text[i + 1]
+
+        if escape
+          out << c
+          escape = false
+          i += 1
+          next
+        end
+
+        if in_block
+          if c == '*' && c2 == '/'
+            out << ' '
+            i += 2
+            in_block = false
+          else
+            out << c if c == "\n"
+            i += 1
+          end
+          next
+        end
+
+        if in_str
+          out << c
+          if c == '\\'
+            escape = true
+          elsif c == '"'
+            in_str = false
+          end
+          i += 1
+          next
+        end
+
+        if in_char
+          out << c
+          if c == '\\'
+            escape = true
+          elsif c == "'"
+            in_char = false
+          end
+          i += 1
+          next
+        end
+
+        if c == '/' && c2 == '*'
+          in_block = true
+          out << ' '
+          i += 2
+          next
+        elsif c == '/' && c2 == '/'
+          # consume to end of line (do not consume the newline)
+          i += 2
+          i += 1 while i < n && text[i] != "\n"
+          next
+        end
+
+        out << c
+        case c
+        when '"'  then in_str  = true
+        when "'"  then in_char = true
+        end
+        i += 1
+      end
+      out
     end
 
     # Returns the new value of i after processing the directive.
@@ -407,11 +517,62 @@ module OCC
     end
 
     def expand_pass(text)
-      result = +''
-      i = 0
+      result  = +''
+      i       = 0
+      in_str  = false
+      in_char = false
+      escape  = false
+
       while i < text.length
+        ch = text[i]
+
+        # Handle escape sequences inside string/char literals.
+        if escape
+          result << ch
+          escape = false
+          i += 1
+          next
+        end
+
+        if in_str
+          result << ch
+          if ch == '\\'
+            escape = true
+          elsif ch == '"'
+            in_str = false
+          end
+          i += 1
+          next
+        end
+
+        if in_char
+          result << ch
+          if ch == '\\'
+            escape = true
+          elsif ch == "'"
+            in_char = false
+          end
+          i += 1
+          next
+        end
+
+        # Enter string or char literals without expanding inside them.
+        if ch == '"'
+          result << ch
+          in_str = true
+          i += 1
+          next
+        end
+
+        if ch == "'"
+          result << ch
+          in_char = true
+          i += 1
+          next
+        end
+
         # Try to match an identifier at position i
-        if text[i] =~ /[a-zA-Z_]/
+        if ch =~ /[a-zA-Z_]/
           j = i
           j += 1 while j < text.length && text[j] =~ /\w/
           name = text[i...j]
@@ -436,23 +597,57 @@ module OCC
             i = j
           end
         else
-          result << text[i]
+          result << ch
           i += 1
         end
       end
       result
     end
 
-    # Consume comma-separated macro arguments, respecting nested parens.
+    # Consume comma-separated macro arguments, respecting nested parens and
+    # string/char literals (so a comma inside "," is not treated as a separator).
     # Returns [args_array, index_after_closing_paren].
     def consume_arguments(text, start)
-      args  = []
-      depth = 1
+      args    = []
+      depth   = 1
       current = +''
-      i = start
+      i       = start
+      in_str  = false
+      in_char = false
+      escape  = false
 
       while i < text.length
         ch = text[i]
+
+        if escape
+          escape = false
+          current << ch
+          i += 1
+          next
+        end
+
+        if in_str
+          current << ch
+          if ch == '\\'
+            escape = true
+          elsif ch == '"'
+            in_str = false
+          end
+          i += 1
+          next
+        end
+
+        if in_char
+          current << ch
+          if ch == '\\'
+            escape = true
+          elsif ch == "'"
+            in_char = false
+          end
+          i += 1
+          next
+        end
+
         case ch
         when '('
           depth += 1
@@ -472,6 +667,12 @@ module OCC
           else
             current << ch
           end
+        when '"'
+          in_str = true
+          current << ch
+        when "'"
+          in_char = true
+          current << ch
         else
           current << ch
         end
@@ -483,15 +684,26 @@ module OCC
 
     def expand_function_macro(macro, args, name)
       body = macro[:body].dup
+      param_map = macro[:params].each_with_index.to_h { |p, i| [p, args[i] || ''] }
 
-      # ## token paste
+      # ## token paste: substitute both sides before concatenating.
+      # Loop because a##b##c requires two passes (a##b → ab, then ab##c → abc).
+      loop do
+        prev = body.dup
+        body.gsub!(/([a-zA-Z_]\w*|[0-9]+)\s*##\s*([a-zA-Z_]\w*|[0-9]+)/) do
+          (param_map[$1] || $1) + (param_map[$2] || $2)
+        end
+        break if body == prev
+      end
+      # Remove any remaining ## (e.g., empty-argument paste or ##__VA_ARGS__).
       body.gsub!(/\s*##\s*/, '')
 
       # # stringification and parameter substitution
       macro[:params].each_with_index do |param, idx|
         arg = args[idx] || ''
-        # Use block form to avoid gsub interpreting \ in arg as replacement escapes
-        body.gsub!(/\#\s*#{Regexp.escape(param)}/) { arg.inspect.gsub('\\\\', '\\') }
+        # Use block form to avoid gsub interpreting \ in arg as replacement escapes.
+        # arg.inspect wraps in "..." and escapes " → \" and \ → \\ — correct C stringify.
+        body.gsub!(/\#\s*#{Regexp.escape(param)}/) { arg.inspect }
         body.gsub!(/\b#{Regexp.escape(param)}\b/) { arg }
       end
 
@@ -533,7 +745,7 @@ module OCC
 
     # Safe integer arithmetic evaluator (no Kernel.eval).
     def eval_expr(expr)
-      tokens = expr.scan(/\d+|[()!&|<>=+\-*\/]|&&|\|\||==|!=|<=|>=|<<|>>/)
+      tokens = expr.scan(/&&|\|\||==|!=|<=|>=|<<|>>|\d+|[()!&|<>=+\-*\/]/)
       parser = ConstExprParser.new(tokens)
       parser.parse
     end

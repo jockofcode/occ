@@ -17,9 +17,26 @@ module OCC
           warn "occ: error: #{file}: No such file or directory"
           exit 1
         end
-
-        compile_file(file, options)
       end
+
+      # Multiple sources + link: compile each to a temp .o, then link together.
+      if !options[:compile_only] && options[:output] && options[:files].length > 1
+        Dir.mktmpdir do |tmp|
+          obj_paths = options[:files].map.with_index do |file, i|
+            source   = File.read(file)
+            asm      = compile_source(source, file, options)
+            asm_path = File.join(tmp, "out#{i}.s")
+            obj_path = File.join(tmp, "out#{i}.o")
+            File.write(asm_path, asm)
+            assemble_to_obj(asm_path, obj_path, options[:target])
+            obj_path
+          end
+          link(obj_paths, options[:output], options[:target])
+        end
+        return
+      end
+
+      options[:files].each { |file| compile_file(file, options) }
     end
 
     # Compile a single source file according to options.
@@ -116,12 +133,13 @@ module OCC
       end
     end
 
-    def self.link(obj_path, exe_path, target)
+    def self.link(obj_paths, exe_path, target)
+      objs = Array(obj_paths).join(' ')
       case target
       when :arm64_macos, :amd64_macos
-        cmd = "clang -o #{exe_path} #{obj_path} 2>&1"
+        cmd = "clang -o #{exe_path} #{objs} 2>&1"
       else
-        cmd = "cc -o #{exe_path} #{obj_path} 2>&1"
+        cmd = "cc -o #{exe_path} #{objs} 2>&1"
       end
       out = `#{cmd}`
       unless $?.success?

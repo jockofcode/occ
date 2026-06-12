@@ -34,24 +34,186 @@ module OCC
       end
 
       def emit_string_constant(id, value)
-        emit '.section __TEXT,__cstring,cstring_literals'
+        if value.include?("\0")
+          emit '.section __TEXT,__const'
+        else
+          emit '.section __TEXT,__cstring,cstring_literals'
+        end
         emit "l_str_#{id}:"
-        emit "  .asciz #{value.inspect}"
+        emit "  .asciz #{asm_string(value)}"
         emit '.section __TEXT,__text,regular,pure_instructions'
         emit_blank
       end
 
       def emit_global(name, g)
-        if g[:init]
-          emit '.section __DATA,__data'
-          emit ".globl #{sym(name)}"
-          emit '.p2align 3'
-          emit "#{sym(name)}:"
-          emit "  .quad #{g[:init]}"
+        init = g[:init]
+        if init
+          if init.is_a?(Hash) && init[:kind] == :initializer_list
+            emit_compound_global(name, g, init)
+          elsif init.is_a?(Hash) && init[:kind] == :string
+            # String pointer: emit the string in __cstring then a pointer in __data
+            str_lbl = "l_gstr_#{name}"
+            emit '.section __TEXT,__cstring,cstring_literals'
+            emit "#{str_lbl}:"
+            emit "  .asciz #{asm_string(init[:value])}"
+            emit '.section __DATA,__data'
+            emit ".globl #{sym(name)}"
+            emit '.p2align 3'
+            emit "#{sym(name)}:"
+            emit "  .quad #{str_lbl}"
+          elsif init.is_a?(Float)
+            sz = type_byte_size(g[:type])
+            emit '.section __DATA,__data'
+            emit ".globl #{sym(name)}"
+            emit ".p2align #{sz == 4 ? 2 : 3}"
+            emit "#{sym(name)}:"
+            emit(sz == 4 ? "  .float #{init}" : "  .double #{init}")
+          elsif init.is_a?(Hash) && init[:kind] == :ref
+            emit '.section __DATA,__data'
+            emit ".globl #{sym(name)}"
+            emit '.p2align 3'
+            emit "#{sym(name)}:"
+            emit "  .quad #{sym(init[:name])}"
+          else
+            # Integer scalar: always emit as .quad so GlobalRef 8-byte loads work correctly.
+            emit '.section __DATA,__data'
+            emit ".globl #{sym(name)}"
+            emit '.p2align 3'
+            emit "#{sym(name)}:"
+            emit "  .quad #{init}"
+          end
           emit '.section __TEXT,__text,regular,pure_instructions'
         else
           size = type_byte_size(g[:type])
           emit ".comm #{sym(name)},#{size},3"
+        end
+      end
+
+      # Emit a compound (struct/array) global initializer into __DATA/__data.
+      # Strings embedded in the initializer are placed in __TEXT/__cstring first.
+      def emit_compound_global(name, g, init)
+        type = g[:type]
+        @cstring_counter ||= 0
+
+        # First pass: collect all string literals and assign labels
+        strings = collect_compound_strings(init, name)
+
+        # Emit all strings into __cstring
+        unless strings.empty?
+          emit '.section __TEXT,__cstring,cstring_literals'
+          strings.each do |lbl, val|
+            emit "#{lbl}:"
+            emit "  .asciz #{asm_string(val)}"
+          end
+        end
+
+        # Emit the data
+        emit '.section __DATA,__data'
+        emit ".globl #{sym(name)}"
+        emit '.p2align 3'
+        emit "#{sym(name)}:"
+
+        emit_compound_init_data(type, init[:items], strings)
+      end
+
+      # Recursively assign labels to string items in a compound initializer (mutates items).
+      def collect_compound_strings(init_node, prefix)
+        result = {}
+        return result unless init_node.is_a?(Hash) && init_node[:kind] == :initializer_list
+        (init_node[:items] || []).each_with_index do |item, i|
+          next unless item.is_a?(Hash)
+          if item[:kind] == :string
+            lbl = "l_cstr_#{prefix}_#{@cstring_counter += 1}"
+            result[lbl] = item[:value]
+            item[:_label] = lbl
+          elsif item[:kind] == :initializer_list
+            result.merge!(collect_compound_strings(item, "#{prefix}_#{i}"))
+          end
+        end
+        result
+      end
+
+      # Emit raw bytes for a compound initializer matched against `type`.
+      def emit_compound_init_data(type, items, strings)
+        if type.is_a?(OCC::Types::ArrayType)
+          elem_type = type.element
+          items.each do |item|
+            if item.is_a?(Hash) && item[:kind] == :initializer_list
+              emit_compound_init_data(elem_type, item[:items], strings)
+            else
+              emit_compound_field_value(item, elem_type, strings)
+            end
+          end
+          # Zero-fill to declared array size
+          if type.count && type.count > items.length
+            remaining = (type.count - items.length) * type_byte_size(elem_type)
+            emit "  .zero #{remaining}" if remaining > 0
+          end
+        elsif type.is_a?(OCC::Types::StructType)
+          emit_struct_init_data(type, items, strings)
+        else
+          # Scalar fallback — emit each item as one element of `type` size
+          items.each { |item| emit_compound_field_value(item, type, strings) }
+        end
+      end
+
+      def emit_struct_init_data(struct_type, items, strings)
+        cur_off = 0
+        struct_type.fields.each_with_index do |field, fi|
+          field_off = field[:offset]
+          ft = field[:type]
+          fsz = type_byte_size(ft)
+
+          if field_off > cur_off
+            emit "  .zero #{field_off - cur_off}"
+            cur_off = field_off
+          end
+
+          item = items[fi]
+          if item.nil?
+            emit "  .zero #{fsz}"
+          elsif item.is_a?(Hash) && item[:kind] == :initializer_list
+            emit_compound_init_data(ft, item[:items], strings)
+          else
+            emit_compound_field_value(item, ft, strings)
+          end
+          cur_off = field_off + fsz
+        end
+        if struct_type.size > cur_off
+          emit "  .zero #{struct_type.size - cur_off}"
+        end
+      end
+
+      def emit_compound_field_value(val, field_type, _strings)
+        fsz = type_byte_size(field_type)
+        case val
+        when nil
+          emit "  .zero #{fsz}"
+        when Integer
+          case fsz
+          when 1 then emit "  .byte #{val & 0xFF}"
+          when 2 then emit "  .short #{val & 0xFFFF}"
+          when 4 then emit "  .long #{val & 0xFFFFFFFF}"
+          else        emit "  .quad #{val}"
+          end
+        when Float
+          if fsz == 4
+            emit "  .float #{val}"
+          else
+            emit "  .double #{val}"
+          end
+        when Hash
+          case val[:kind]
+          when :string
+            lbl = val[:_label]
+            emit "  .quad #{lbl}"
+          when :ref
+            emit "  .quad #{sym(val[:name])}"
+          else
+            emit "  .zero #{fsz}"
+          end
+        else
+          emit "  .zero #{fsz}"
         end
       end
 
@@ -70,6 +232,7 @@ module OCC
         @slot_next     = 0    # bytes used so far for locals (x29+16 is first slot)
         @alloca_slots  = Set.new  # temp IDs that are direct alloca stack slots
         @alloca_sizes  = {}       # temp_id => actual byte size (for arrays/structs)
+        @alloca_ctypes = {}       # temp_id => ctype (for correct-width loads)
         @fp_alloca_slots = Set.new # alloca slots holding fp values
         @fp_temps      = Set.new  # temp IDs that hold fp (double/float) values
         @float_pool    = []   # [{label:, value:}] for literal-pool fp constants
@@ -82,6 +245,7 @@ module OCC
             @alloca_slots << i.dst.id
             sz = ctype_stack_size(i.ctype)
             @alloca_sizes[i.dst.id] = sz
+            @alloca_ctypes[i.dst.id] = i.ctype
             alloca_extra += [sz - 8, 0].max
             @fp_alloca_slots << i.dst.id if fp_ctype?(i.ctype)
           end
@@ -96,7 +260,7 @@ module OCC
         frame_sz = @frame_sz
 
         name = sym(func.name)
-        emit ".globl #{name}"
+        emit ".globl #{name}" unless func.static
         emit '.p2align 2'
         emit "#{name}:"
 
@@ -106,16 +270,17 @@ module OCC
           emit "  stp x29, x30, [sp, #-#{frame_sz}]!"
           emit '  mov x29, sp'
         else
-          emit "  sub sp, sp, ##{frame_sz}"
+          emit_sp_sub(frame_sz)
           emit '  stp x29, x30, [sp]'
           emit '  mov x29, sp'
         end
 
-        # Save incoming parameters — integer args in x0-x7, FP args in d0-d7
+        # Save incoming parameters — integer args in x0-x7, FP args in d0-d7.
+        # Placeholder entries (name=nil) still consume a register slot so that
+        # multi-register struct params land at the right positions.
         int_idx = 0
         fp_idx  = 0
         func.params.each_with_index do |p, idx|
-          next unless p[:name]
           slot = alloc_slot_for(IR::Temp.new(idx))
           if fp_ctype?(p[:type])
             emit "  str d#{fp_idx}, [x29, ##{slot}]"
@@ -167,6 +332,11 @@ module OCC
 
       # Build the FP-temp set via dataflow over all blocks.
       def compute_fp_temps(func)
+        # Seed FP params — their temps are Temp(0), Temp(1), ... in param order.
+        func.params.each_with_index do |p, idx|
+          @fp_temps << idx if p[:type] && fp_ctype?(p[:type])
+        end
+
         changed = true
         while changed
           changed = false
@@ -183,11 +353,15 @@ module OCC
                      (i.ptr.is_a?(IR::Temp) && @fp_alloca_slots.include?(i.ptr.id)) ||
                        fp_ctype?(i.type)
                    when IR::Binary
-                     fp_operand?(i.left) || fp_operand?(i.right) ||
-                       fp_ctype?(i.type)
+                     # Comparison results are always int (0/1), never FP
+                     fp_cmp_ops = %i[eq neq lt gt leq geq ult ugt uleq ugeq]
+                     !fp_cmp_ops.include?(i.op) &&
+                       (fp_operand?(i.left) || fp_operand?(i.right) || fp_ctype?(i.type))
                    when IR::Call
                      name = i.func.is_a?(IR::GlobalRef) ? i.func.name : nil
                      (name && @mod.fp_funcs.include?(name)) || fp_ctype?(i.type)
+                   when IR::Unary
+                     fp_operand?(i.src)
                    when IR::Cast
                      fp_ctype?(i.type) ||
                        (i.to_type.is_a?(String) && i.to_type =~ /float|double/)
@@ -214,7 +388,13 @@ module OCC
           emit "  ldr #{dreg}, #{label}"
         when IR::Temp
           slot = slot_of(op)
-          emit "  ldr #{dreg}, [x29, ##{slot}]"
+          if @fp_temps.include?(op.id)
+            emit "  ldr #{dreg}, [x29, ##{slot}]"
+          else
+            # Integer temp used in FP context — convert
+            emit "  ldr x9, [x29, ##{slot}]"
+            emit "  scvtf #{dreg}, x9"
+          end
         when IR::GlobalRef
           emit "  adrp x9, #{sym(op.name)}@PAGE"
           emit "  ldr  #{dreg}, [x9, #{sym(op.name)}@PAGEOFF]"
@@ -250,19 +430,36 @@ module OCC
               emit "  ldr d10, [x29, ##{slot_of(instr.ptr)}]"
               store_fp_temp(instr.dst, 'd10')
             else
-              emit "  ldr x10, [x29, ##{slot_of(instr.ptr)}]"
+              # Use a width-appropriate load to avoid reading garbage in upper bytes
+              # when a smaller type (int=4, short=2, char=1) was stored via a pointer.
+              alloca_ct = @alloca_ctypes[instr.ptr.id]
+              alloca_sz = @alloca_sizes[instr.ptr.id] || 8
+              if alloca_sz < 8 && alloca_ct.is_a?(OCC::Types::IntegerType)
+                signed = alloca_ct.signed?
+                emit_alloca_load(slot_of(instr.ptr), alloca_sz, signed)
+              else
+                emit "  ldr x10, [x29, ##{slot_of(instr.ptr)}]"
+              end
               store_temp(instr.dst, 'x10')
             end
           else
             load_operand(instr.ptr, 'x9')
-            signed = instr.type.is_a?(OCC::Types::IntegerType) && instr.type.signed?
-            case instr.elem_size
-            when 1 then emit(signed ? '  ldrsb x10, [x9]' : '  ldrb w10, [x9]')
-            when 2 then emit(signed ? '  ldrsh x10, [x9]' : '  ldrh w10, [x9]')
-            when 4 then emit(signed ? '  ldrsw x10, [x9]' : '  ldr w10, [x9]')
-            else        emit '  ldr x10, [x9]'
+            if fp_ctype?(instr.type)
+              case instr.elem_size
+              when 4 then emit '  ldr s10, [x9]'; emit '  fcvt d10, s10'
+              else        emit '  ldr d10, [x9]'
+              end
+              store_fp_temp(instr.dst, 'd10')
+            else
+              signed = instr.type.is_a?(OCC::Types::IntegerType) && instr.type.signed?
+              case instr.elem_size
+              when 1 then emit(signed ? '  ldrsb x10, [x9]' : '  ldrb w10, [x9]')
+              when 2 then emit(signed ? '  ldrsh x10, [x9]' : '  ldrh w10, [x9]')
+              when 4 then emit(signed ? '  ldrsw x10, [x9]' : '  ldr w10, [x9]')
+              else        emit '  ldr x10, [x9]'
+              end
+              store_temp(instr.dst, 'x10')
             end
-            store_temp(instr.dst, 'x10')
           end
 
         when IR::Store
@@ -271,30 +468,53 @@ module OCC
               load_fp_operand(instr.value, 'd9')
               emit "  str d9, [x29, ##{slot_of(instr.ptr)}]"
               @fp_alloca_slots << instr.ptr.id  # mark slot as FP once we store FP into it
+            elsif instr.elem_size > 8
+              # Large struct copy into local slot: x9 = source addr, x10 = dest addr
+              load_operand(instr.value, 'x9')
+              emit_addr_from_fp('x10', slot_of(instr.ptr))
+              emit_struct_copy('x9', 'x10', instr.elem_size)
             else
               load_operand(instr.value, 'x9')
               emit "  str x9, [x29, ##{slot_of(instr.ptr)}]"
             end
           else
-            load_operand(instr.value, 'x9')
+            fp_field = fp_ctype?(instr.type) if instr.type
+            fp_val = fp_field || fp_operand?(instr.value)
+            if fp_val
+              load_fp_operand(instr.value, 'd9')
+            else
+              load_operand(instr.value, 'x9')
+            end
             case instr.ptr
             when IR::Temp
               ptr_slot = slot_of(instr.ptr)
               emit "  ldr x10, [x29, ##{ptr_slot}]"
-              case instr.elem_size
-              when 1 then emit '  strb w9, [x10]'
-              when 2 then emit '  strh w9, [x10]'
-              when 4 then emit '  str w9, [x10]'
-              else        emit '  str x9, [x10]'
+              if fp_val
+                emit '  str d9, [x10]'
+              elsif instr.elem_size > 8
+                emit_struct_copy('x9', 'x10', instr.elem_size)
+              else
+                case instr.elem_size
+                when 1 then emit '  strb w9, [x10]'
+                when 2 then emit '  strh w9, [x10]'
+                when 4 then emit '  str w9, [x10]'
+                else        emit '  str x9, [x10]'
+                end
               end
             when IR::GlobalRef
               emit "  adrp x10, #{sym(instr.ptr.name)}@PAGE"
               emit "  add  x10, x10, #{sym(instr.ptr.name)}@PAGEOFF"
-              case instr.elem_size
-              when 1 then emit '  strb w9, [x10]'
-              when 2 then emit '  strh w9, [x10]'
-              when 4 then emit '  str w9, [x10]'
-              else        emit '  str x9, [x10]'
+              if fp_val
+                emit '  str d9, [x10]'
+              elsif instr.elem_size > 8
+                emit_struct_copy('x9', 'x10', instr.elem_size)
+              else
+                case instr.elem_size
+                when 1 then emit '  strb w9, [x10]'
+                when 2 then emit '  strh w9, [x10]'
+                when 4 then emit '  str w9, [x10]'
+                else        emit '  str x9, [x10]'
+                end
               end
             end
           end
@@ -302,7 +522,7 @@ module OCC
         when IR::AddrOf
           case instr.src
           when IR::Temp
-            emit "  add x9, x29, ##{slot_of(instr.src)}"
+            emit_addr_from_fp('x9', slot_of(instr.src))
           when IR::GlobalRef
             emit "  adrp x9, #{sym(instr.src.name)}@PAGE"
             emit "  add  x9, x9, #{sym(instr.src.name)}@PAGEOFF"
@@ -326,17 +546,23 @@ module OCC
           store_temp(instr.dst, 'x9')
 
         when IR::Unary
-          load_operand(instr.src, 'x9')
-          case instr.op
-          when :neg
-            emit '  neg x9, x9'
-          when :not
-            emit '  cmp x9, #0'
-            emit '  cset x9, eq'
-          when :bitnot
-            emit '  mvn x9, x9'
+          if instr.op == :neg && fp_operand?(instr.src)
+            load_fp_operand(instr.src, 'd9')
+            emit '  fneg d9, d9'
+            store_fp_temp(instr.dst, 'd9')
+          else
+            load_operand(instr.src, 'x9')
+            case instr.op
+            when :neg
+              emit '  neg x9, x9'
+            when :not
+              emit '  cmp x9, #0'
+              emit '  cset x9, eq'
+            when :bitnot
+              emit '  mvn x9, x9'
+            end
+            store_temp(instr.dst, 'x9')
           end
-          store_temp(instr.dst, 'x9')
 
         when IR::Binary
           if fp_operand?(instr.left) || fp_operand?(instr.right) || fp_ctype?(instr.type)
@@ -358,7 +584,8 @@ module OCC
 
         when IR::Return
           if instr.value
-            if fp_operand?(instr.value)
+            func_is_fp = @mod.fp_funcs.include?(@func.name)
+            if fp_operand?(instr.value) || func_is_fp
               load_fp_operand(instr.value, 'd0')
             else
               load_operand(instr.value, 'x0')
@@ -370,7 +597,7 @@ module OCC
             emit "  ldp x29, x30, [sp], ##{frame_sz}"
           else
             emit '  ldp x29, x30, [sp]'
-            emit "  add sp, sp, ##{frame_sz}"
+            emit_sp_add(frame_sz)
           end
           emit '  ret'
 
@@ -386,7 +613,19 @@ module OCC
             emit '  scvtf d9, x9'
             store_fp_temp(instr.dst, 'd9')
           else
+            # int → int: truncate/extend to target width
             load_operand(instr.src, 'x9')
+            ct = instr.type
+            if ct.is_a?(OCC::Types::IntegerType)
+              case ct.size
+              when 1
+                emit(ct.signed? ? '  sxtb x9, w9' : '  and x9, x9, #0xff')
+              when 2
+                emit(ct.signed? ? '  sxth x9, w9' : '  and x9, x9, #0xffff')
+              when 4
+                emit(ct.signed? ? '  sxtw x9, w9' : '  ubfx x9, x9, #0, #32')
+              end
+            end
             store_temp(instr.dst, 'x9')
           end
         end
@@ -405,8 +644,13 @@ module OCC
           emit '  mul x9, x9, x10'
         when :slash
           emit '  sdiv x9, x9, x10'
+        when :udiv
+          emit '  udiv x9, x9, x10'
         when :percent
           emit '  sdiv x11, x9, x10'
+          emit '  msub x9, x11, x10, x9'
+        when :umod
+          emit '  udiv x11, x9, x10'
           emit '  msub x9, x11, x10, x9'
         when :amp
           emit '  and x9, x9, x10'
@@ -418,6 +662,8 @@ module OCC
           emit '  lsl x9, x9, x10'
         when :rshift
           emit '  asr x9, x9, x10'
+        when :urshift
+          emit '  lsr x9, x9, x10'
         when :eq
           emit '  cmp x9, x10'
           emit '  cset x9, eq'
@@ -436,6 +682,18 @@ module OCC
         when :geq
           emit '  cmp x9, x10'
           emit '  cset x9, ge'
+        when :ult
+          emit '  cmp x9, x10'
+          emit '  cset x9, lo'
+        when :ugt
+          emit '  cmp x9, x10'
+          emit '  cset x9, hi'
+        when :uleq
+          emit '  cmp x9, x10'
+          emit '  cset x9, ls'
+        when :ugeq
+          emit '  cmp x9, x10'
+          emit '  cset x9, hs'
         when :logical_and
           emit '  cmp x9, #0'
           emit '  cset x9, ne'
@@ -468,16 +726,16 @@ module OCC
         when :neq
           emit '  fcmp d9, d10'; emit '  cset x9, ne'
           store_temp(instr.dst, 'x9'); return
-        when :lt
+        when :lt, :ult
           emit '  fcmp d9, d10'; emit '  cset x9, mi'
           store_temp(instr.dst, 'x9'); return
-        when :leq
+        when :leq, :uleq
           emit '  fcmp d9, d10'; emit '  cset x9, ls'
           store_temp(instr.dst, 'x9'); return
-        when :gt
+        when :gt, :ugt
           emit '  fcmp d9, d10'; emit '  cset x9, gt'
           store_temp(instr.dst, 'x9'); return
-        when :geq
+        when :geq, :ugeq
           emit '  fcmp d9, d10'; emit '  cset x9, ge'
           store_temp(instr.dst, 'x9'); return
         else
@@ -493,7 +751,7 @@ module OCC
 
         # ── Compiler intrinsic: address of first variadic arg on stack ──────
         if func_ref.is_a?(IR::GlobalRef) && func_ref.name == '__occ_va_first_arg'
-          emit "  add x9, x29, ##{@frame_sz}"
+          emit_addr_from_fp('x9', @frame_sz)
           store_temp(instr.dst, 'x9')
           return
         end
@@ -514,14 +772,14 @@ module OCC
           end
           if var_args.any?
             stack_sz = align16(var_args.length * 8)
-            emit "  sub sp, sp, ##{stack_sz}"
+            emit_sp_sub(stack_sz)
             var_args.each_with_index do |a, i|
               load_operand(a, 'x9')
               emit "  str x9, [sp, ##{i * 8}]"
             end
           end
           emit "  bl #{sym(func_ref.name)}"
-          emit "  add sp, sp, ##{stack_sz}" if var_args.any?
+          emit_sp_add(stack_sz) if var_args.any?
         else
           # Non-variadic: integer args in x0-x7, FP args in d0-d7
           int_idx = 0
@@ -537,7 +795,12 @@ module OCC
           end
           case func_ref
           when IR::GlobalRef
-            emit "  bl #{sym(func_ref.name)}"
+            if @mod.func_names.include?(func_ref.name) || !@mod.globals.key?(func_ref.name)
+              emit "  bl #{sym(func_ref.name)}"
+            else
+              load_operand(func_ref, 'x9')
+              emit '  blr x9'
+            end
           when IR::Temp
             load_operand(func_ref, 'x9')
             emit '  blr x9'
@@ -591,6 +854,35 @@ module OCC
 
       def slot_of(temp) = alloc_slot_for(temp)
 
+      # Emit `reg = x29 + offset`, handling offsets > 4095 (ARM64 add-imm limit).
+      def emit_addr_from_fp(reg, offset)
+        if offset <= 4095
+          emit "  add #{reg}, x29, ##{offset}"
+        else
+          emit "  mov #{reg}, #0x#{(offset & 0xFFFF).to_s(16)}"
+          emit "  movk #{reg}, #0x#{((offset >> 16) & 0xFFFF).to_s(16)}, lsl #16" unless (offset >> 16).zero?
+          emit "  add #{reg}, x29, #{reg}"
+        end
+      end
+
+      # Width-appropriate load from a stack slot into x10.
+      # Uses x28 as scratch when the slot exceeds the instruction's immediate limit.
+      def emit_alloca_load(slot, sz, signed)
+        max_imm = 4095 * [sz, 8].min
+        if slot <= max_imm
+          base = "[x29, ##{slot}]"
+        else
+          emit_addr_from_fp('x28', slot)
+          base = '[x28]'
+        end
+        case sz
+        when 1 then emit(signed ? "  ldrsb x10, #{base}" : "  ldrb w10, #{base}")
+        when 2 then emit(signed ? "  ldrsh x10, #{base}" : "  ldrh w10, #{base}")
+        when 4 then emit(signed ? "  ldrsw x10, #{base}" : "  ldr w10, #{base}")
+        else        emit "  ldr x10, #{base}"
+        end
+      end
+
       def load_operand(op, reg)
         case op
         when IR::Const
@@ -613,13 +905,25 @@ module OCC
           slot = slot_of(op)
           emit "  ldr #{reg}, [x29, ##{slot}]"
         when IR::GlobalRef
-          emit "  adrp #{reg}, #{sym(op.name)}@PAGE"
           if @mod.func_names.include?(op.name)
-            # Function reference: load the address (pointer to function)
-            emit "  add  #{reg}, #{reg}, #{sym(op.name)}@PAGEOFF"
-          else
-            # Data reference: load the value stored at the address
+            if @mod.defined_funcs.include?(op.name)
+              # Locally-defined function: direct PC-relative address
+              emit "  adrp #{reg}, #{sym(op.name)}@PAGE"
+              emit "  add  #{reg}, #{reg}, #{sym(op.name)}@PAGEOFF"
+            else
+              # External/dylib function: GOT indirection gives function address
+              emit "  adrp #{reg}, #{sym(op.name)}@GOTPAGE"
+              emit "  ldr  #{reg}, [#{reg}, #{sym(op.name)}@GOTPAGEOFF]"
+            end
+          elsif @mod.globals.key?(op.name)
+            # Locally-defined data global: direct page-relative load
+            emit "  adrp #{reg}, #{sym(op.name)}@PAGE"
             emit "  ldr  #{reg}, [#{reg}, #{sym(op.name)}@PAGEOFF]"
+          else
+            # Extern/dylib data global: GOT gives address of variable, then load value
+            emit "  adrp #{reg}, #{sym(op.name)}@GOTPAGE"
+            emit "  ldr  #{reg}, [#{reg}, #{sym(op.name)}@GOTPAGEOFF]"
+            emit "  ldr  #{reg}, [#{reg}]"
           end
         when IR::StringRef
           emit "  adrp #{reg}, l_str_#{op.id}@PAGE"
@@ -630,6 +934,34 @@ module OCC
       def store_temp(temp, reg)
         slot = alloc_slot_for(temp)
         emit "  str #{reg}, [x29, ##{slot}]"
+      end
+
+      def emit_struct_copy(src, dst, size)
+        offset = 0
+        while offset + 16 <= size
+          emit "  ldp x11, x12, [#{src}, ##{offset}]"
+          emit "  stp x11, x12, [#{dst}, ##{offset}]"
+          offset += 16
+        end
+        if offset + 8 <= size
+          emit "  ldr x11, [#{src}, ##{offset}]"
+          emit "  str x11, [#{dst}, ##{offset}]"
+          offset += 8
+        end
+        if offset + 4 <= size
+          emit "  ldr w11, [#{src}, ##{offset}]"
+          emit "  str w11, [#{dst}, ##{offset}]"
+          offset += 4
+        end
+        if offset + 2 <= size
+          emit "  ldrh w11, [#{src}, ##{offset}]"
+          emit "  strh w11, [#{dst}, ##{offset}]"
+          offset += 2
+        end
+        if offset < size
+          emit "  ldrb w11, [#{src}, ##{offset}]"
+          emit "  strb w11, [#{dst}, ##{offset}]"
+        end
       end
 
       def collect_temp_count(func)
@@ -647,6 +979,41 @@ module OCC
       end
 
       def align16(n) = (n + 15) / 16 * 16
+
+      # Emit `sub sp, sp, #n` or `add sp, sp, #n` handling n > 4095 via x16.
+      def emit_sp_sub(n)
+        if n <= 4095
+          emit "  sub sp, sp, ##{n}"
+        else
+          emit_mov_x16(n)
+          emit '  sub sp, sp, x16'
+        end
+      end
+
+      def emit_sp_add(n)
+        if n <= 4095
+          emit "  add sp, sp, ##{n}"
+        else
+          emit_mov_x16(n)
+          emit '  add sp, sp, x16'
+        end
+      end
+
+      # Load a 64-bit immediate into x16 using movz/movk.
+      def emit_mov_x16(val)
+        chunks = [val & 0xFFFF, (val >> 16) & 0xFFFF, (val >> 32) & 0xFFFF, (val >> 48) & 0xFFFF]
+        first = true
+        chunks.each_with_index do |c, i|
+          next if c.zero? && !first
+          if first
+            emit "  movz x16, ##{c}#{i > 0 ? ", lsl ##{i * 16}" : ''}"
+            first = false
+          else
+            emit "  movk x16, ##{c}, lsl ##{i * 16}"
+          end
+        end
+        emit '  movz x16, #0' if first  # val == 0 edge case
+      end
     end
   end
 end

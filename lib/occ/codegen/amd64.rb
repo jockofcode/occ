@@ -41,12 +41,16 @@ module OCC
 
       def emit_string_constant(id, value)
         if @macos
-          emit '.section __TEXT,__cstring,cstring_literals'
+          if value.include?("\0")
+            emit '.section __TEXT,__const'
+          else
+            emit '.section __TEXT,__cstring,cstring_literals'
+          end
         else
           emit '.section .rodata'
         end
         emit "L_str_#{id}:"
-        emit "  .asciz #{value.inspect}"
+        emit "  .asciz #{asm_string(value)}"
         if @macos
           emit '.section __TEXT,__text,regular,pure_instructions'
         else
@@ -56,20 +60,87 @@ module OCC
       end
 
       def emit_global(name, g)
-        if g[:init]
-          if @macos
+        init = g[:init]
+        if init
+          sz  = type_byte_size(g[:type])
+          dir = case sz
+                when 1 then '.byte'
+                when 2 then '.short'
+                when 4 then '.long'
+                else        '.quad'
+                end
+
+          if init.is_a?(Hash) && init[:kind] == :string
+            str_lbl = "#{@macos ? 'l' : '.L'}gstr_#{name}"
+            if @macos
+              emit '.section __TEXT,__cstring,cstring_literals'
+              emit "#{str_lbl}:"
+              emit "  .asciz #{asm_string(init[:value])}"
+              emit '.section __DATA,__data'
+              emit ".globl #{sym(name)}"
+              emit '.p2align 3'
+              emit "#{sym(name)}:"
+              emit "  .quad #{str_lbl}"
+              emit '.section __TEXT,__text,regular,pure_instructions'
+            else
+              emit '.section .rodata'
+              emit "#{str_lbl}:"
+              emit "  .asciz #{asm_string(init[:value])}"
+              emit '.section .data'
+              emit ".globl #{name}"
+              emit '.align 8'
+              emit "#{name}:"
+              emit "  .quad #{str_lbl}"
+              emit '.section .text'
+            end
+          elsif init.is_a?(Float)
+            fp_dir = sz == 4 ? '.float' : '.double'
+            al     = sz == 4 ? 4 : 8
+            if @macos
+              emit '.section __DATA,__data'
+              emit ".globl #{sym(name)}"
+              emit ".p2align #{Math.log2(al).to_i}"
+              emit "#{sym(name)}:"
+              emit "  #{fp_dir} #{init}"
+              emit '.section __TEXT,__text,regular,pure_instructions'
+            else
+              emit '.section .data'
+              emit ".globl #{name}"
+              emit ".align #{al}"
+              emit "#{name}:"
+              emit "  #{fp_dir} #{init}"
+              emit '.section .text'
+            end
+          elsif init.is_a?(Hash) && init[:kind] == :ref
+            if @macos
+              emit '.section __DATA,__data'
+              emit ".globl #{sym(name)}"
+              emit '.p2align 3'
+              emit "#{sym(name)}:"
+              emit "  .quad #{sym(init[:name])}"
+              emit '.section __TEXT,__text,regular,pure_instructions'
+            else
+              emit '.section .data'
+              emit ".globl #{name}"
+              emit '.align 8'
+              emit "#{name}:"
+              emit "  .quad #{init[:name]}"
+              emit '.section .text'
+            end
+          elsif @macos
+            # Integer scalar: emit as .quad so GlobalRef 8-byte loads work correctly.
             emit '.section __DATA,__data'
             emit ".globl #{sym(name)}"
             emit '.p2align 3'
             emit "#{sym(name)}:"
-            emit "  .quad #{g[:init]}"
+            emit "  .quad #{init}"
             emit '.section __TEXT,__text,regular,pure_instructions'
           else
             emit '.section .data'
             emit ".globl #{name}"
             emit '.align 8'
             emit "#{name}:"
-            emit "  .quad #{g[:init]}"
+            emit "  .quad #{init}"
             emit '.section .text'
           end
         elsif @macos
@@ -117,7 +188,7 @@ module OCC
         frame_sz  = align16(all_temps.length * 8 + 8)
 
         name = sym(func.name)
-        emit ".globl #{name}"
+        emit ".globl #{name}" unless func.static
         emit "#{name}:"
 
         # Prologue
@@ -305,6 +376,10 @@ module OCC
               load_fp_operand(instr.value, '%xmm8')
               emit "  movsd %xmm8, #{slot_of(instr.ptr)}(%rbp)"
               @fp_alloca_slots << instr.ptr.id
+            elsif instr.elem_size > 8
+              load_operand(instr.value, '%rsi')
+              emit "  leaq #{slot_of(instr.ptr)}(%rbp), %rdi"
+              emit_struct_copy('%rsi', '%rdi', instr.elem_size)
             else
               load_operand(instr.value, '%rax')
               emit "  movq %rax, #{slot_of(instr.ptr)}(%rbp)"
@@ -315,18 +390,27 @@ module OCC
             when IR::Temp
               ptr_slot = slot_of(instr.ptr)
               emit "  movq #{ptr_slot}(%rbp), %rcx"
-              case instr.elem_size
-              when 1 then emit '  movb %al, (%rcx)'
-              when 2 then emit '  movw %ax, (%rcx)'
-              when 4 then emit '  movl %eax, (%rcx)'
-              else        emit '  movq %rax, (%rcx)'
+              if instr.elem_size > 8
+                emit_struct_copy('%rax', '%rcx', instr.elem_size)
+              else
+                case instr.elem_size
+                when 1 then emit '  movb %al, (%rcx)'
+                when 2 then emit '  movw %ax, (%rcx)'
+                when 4 then emit '  movl %eax, (%rcx)'
+                else        emit '  movq %rax, (%rcx)'
+                end
               end
             when IR::GlobalRef
-              case instr.elem_size
-              when 1 then emit "  movb %al, #{sym(instr.ptr.name)}(%rip)"
-              when 2 then emit "  movw %ax, #{sym(instr.ptr.name)}(%rip)"
-              when 4 then emit "  movl %eax, #{sym(instr.ptr.name)}(%rip)"
-              else        emit "  movq %rax, #{sym(instr.ptr.name)}(%rip)"
+              if instr.elem_size > 8
+                emit "  leaq #{sym(instr.ptr.name)}(%rip), %rcx"
+                emit_struct_copy('%rax', '%rcx', instr.elem_size)
+              else
+                case instr.elem_size
+                when 1 then emit "  movb %al, #{sym(instr.ptr.name)}(%rip)"
+                when 2 then emit "  movw %ax, #{sym(instr.ptr.name)}(%rip)"
+                when 4 then emit "  movl %eax, #{sym(instr.ptr.name)}(%rip)"
+                else        emit "  movq %rax, #{sym(instr.ptr.name)}(%rip)"
+                end
               end
             end
           end
@@ -399,7 +483,19 @@ module OCC
             emit '  cvtsi2sd %rax, %xmm8'
             store_fp_temp(instr.dst, '%xmm8')
           else
+            # int → int: truncate/extend to target width
             load_operand(instr.src, '%rax')
+            ct = instr.type
+            if ct.is_a?(OCC::Types::IntegerType)
+              case ct.size
+              when 1
+                emit(ct.signed? ? '  movsbq %al, %rax' : '  movzbq %al, %rax')
+              when 2
+                emit(ct.signed? ? '  movswq %ax, %rax' : '  movzwq %ax, %rax')
+              when 4
+                emit(ct.signed? ? '  movslq %eax, %rax' : '  movl %eax, %eax')
+              end
+            end
             store_temp(instr.dst, '%rax')
           end
         end
@@ -568,7 +664,13 @@ module OCC
         emit '  andq $-16, %rsp'
 
         target = case func_ref
-                 when IR::GlobalRef then sym(func_ref.name).to_s
+                 when IR::GlobalRef
+                   if @mod.func_names.include?(func_ref.name) || !@mod.globals.key?(func_ref.name)
+                     sym(func_ref.name).to_s
+                   else
+                     load_operand(func_ref, '%r11')
+                     '*%r11'
+                   end
                  when IR::Temp
                    load_operand(func_ref, '%r11')
                    '*%r11'
@@ -619,6 +721,29 @@ module OCC
       def store_temp(temp, reg)
         slot = alloc_slot_for(temp)
         emit "  movq #{reg}, #{slot}(%rbp)"
+      end
+
+      def emit_struct_copy(src, dst, size)
+        offset = 0
+        while offset + 8 <= size
+          emit "  movq #{offset}(#{src}), %r10"
+          emit "  movq %r10, #{offset}(#{dst})"
+          offset += 8
+        end
+        if offset + 4 <= size
+          emit "  movl #{offset}(#{src}), %r10d"
+          emit "  movl %r10d, #{offset}(#{dst})"
+          offset += 4
+        end
+        if offset + 2 <= size
+          emit "  movw #{offset}(#{src}), %r10w"
+          emit "  movw %r10w, #{offset}(#{dst})"
+          offset += 2
+        end
+        if offset < size
+          emit "  movb #{offset}(#{src}), %r10b"
+          emit "  movb %r10b, #{offset}(#{dst})"
+        end
       end
 
       # ── Helpers ───────────────────────────────────────────────────────────────

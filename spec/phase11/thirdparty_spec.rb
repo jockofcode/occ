@@ -67,8 +67,6 @@ RSpec.describe 'Phase 11: Third-party compilation', :thirdparty do
     TINYEXPR_COMMIT = '4a7456e2eab88b4c76053c1c4157639ccb930e2b'
 
     it 'compiles tinyexpr and passes the smoke tests' do
-      pending 'requires <math.h>/<ctype.h> support and NaN/INFINITY constants (Phase 9 headers)'
-
       repo = git_clone(TINYEXPR_URL, TINYEXPR_COMMIT, 'tinyexpr')
       in_build_copy(repo, 'tinyexpr') do |dir|
         srcs = [File.join(dir, 'tinyexpr.c'), File.join(dir, 'smoke.c')]
@@ -90,13 +88,11 @@ RSpec.describe 'Phase 11: Third-party compilation', :thirdparty do
     TINYREGEXC_COMMIT = 'f2632c6d9ed25272987471cdb8b70395c2460bdb'
 
     it 'compiles the regex library and passes its tests' do
-      pending 'requires <assert.h> and function pointer typedef support (Phase 9)'
-
       repo = git_clone(TINYREGEXC_URL, TINYREGEXC_COMMIT, 'tinyregexc')
       in_build_copy(repo, 'tinyregexc') do |dir|
-        test_src = Dir["#{dir}/t{est,ests}.c"].first
         re_src   = File.join(dir, 're.c')
-        skip 'unexpected project layout' unless test_src && File.exist?(re_src)
+        test_src = File.join(dir, 'tests', 'test1.c')
+        skip 'unexpected project layout' unless File.exist?(re_src) && File.exist?(test_src)
 
         result = occ_compile(re_src, test_src, output: './retest',
                                                 flags: ["-I#{dir}"])
@@ -115,16 +111,14 @@ RSpec.describe 'Phase 11: Third-party compilation', :thirdparty do
     MUNIT_COMMIT = 'fbbdf1467eb0d04a6ee465def2e529e4c87f2118'
 
     it 'compiles munit and the example suite and runs without failures' do
-      pending 'requires <setjmp.h>, <signal.h>, stdint.h, and va_list support (Phase 9)'
-
       repo = git_clone(MUNIT_URL, MUNIT_COMMIT, 'munit')
       in_build_copy(repo, 'munit') do |dir|
-        munit_c   = File.join(dir, 'munit', 'munit.c')
-        example_c = File.join(dir, 'example', 'example.c')
-        munit_h   = File.join(dir, 'munit')
+        munit_c   = File.join(dir, 'munit.c')
+        example_c = File.join(dir, 'example.c')
+        skip 'unexpected project layout' unless File.exist?(munit_c) && File.exist?(example_c)
 
         result = occ_compile(munit_c, example_c, output: './munit_example',
-                                                  flags: ["-I#{munit_h}"])
+                                                  flags: ["-I#{dir}"])
         expect_compiled(result)
         expect_ran_ok shell('./munit_example')
       end
@@ -140,15 +134,13 @@ RSpec.describe 'Phase 11: Third-party compilation', :thirdparty do
     PARSON_COMMIT = 'ba29f4eda9ea7703a9f6a9cf2b0532a2605723c3'
 
     it 'compiles parson and passes its tests' do
-      pending 'requires <float.h>, NaN handling, and complex designated initialiser support (Phase 9)'
-
       repo = git_clone(PARSON_URL, PARSON_COMMIT, 'parson')
       in_build_copy(repo, 'parson') do |dir|
         test_src  = Dir["#{dir}/tests*.c"].first || File.join(dir, 'tests.c')
         parson_c  = File.join(dir, 'parson.c')
 
         result = occ_compile(parson_c, test_src, output: './parson_tests',
-                                                  flags: ["-I#{dir}"])
+                                                  flags: ["-I#{dir}", '-DTESTS_MAIN'])
         expect_compiled(result)
         run = shell('./parson_tests')
         expect_ran_ok(run)
@@ -169,8 +161,6 @@ RSpec.describe 'Phase 11: Third-party compilation', :thirdparty do
     SMAZ_COMMIT = '2f625846a775501fb69456567409a8b12f10ea25'
 
     it 'compiles smaz and passes its tests' do
-      pending 'requires <string.h> strlen/memcpy and verified struct-literal support (Phase 9)'
-
       repo = git_clone(SMAZ_URL, SMAZ_COMMIT, 'smaz')
       in_build_copy(repo, 'smaz') do |dir|
         smaz_c = File.join(dir, 'smaz.c')
@@ -192,15 +182,12 @@ RSpec.describe 'Phase 11: Third-party compilation', :thirdparty do
     SDS_COMMIT = '5347739b1581fcba74fd5cab1fc21d2aef321571'
 
     it 'compiles sds-test and passes all assertions' do
-      pending 'requires va_list support in sdscatprintf (Phase 9)'
-
       repo = git_clone(SDS_URL, SDS_COMMIT, 'sds')
       in_build_copy(repo, 'sds') do |dir|
-        sds_c     = File.join(dir, 'sds.c')
-        sdstest_c = File.join(dir, 'sdstest.c')
+        sds_c = File.join(dir, 'sds.c')
 
-        result = occ_compile(sds_c, sdstest_c, output: './sds_test',
-                                                flags: ["-I#{dir}"])
+        result = occ_compile(sds_c, output: './sds_test',
+                                    flags: ["-I#{dir}", '-DSDS_TEST_MAIN'])
         expect_compiled(result)
         expect_ran_ok shell('./sds_test')
       end

@@ -162,8 +162,13 @@ module OCC
 
       def size
         return raise TypeError, "incomplete #{@keyword} #{@tag}" unless complete?
-        @keyword == :kw_union ? @fields.map { |f| f[:type].size }.max
-                               : @fields.last ? @fields.last[:offset] + @fields.last[:type].size : 0
+        if @keyword == :kw_union
+          @fields.map { |f| f[:type].size rescue 0 }.max || 0
+        else
+          # Flexible array members (unsized arrays) contribute 0 to struct size — exclude them.
+          sized = @fields.reject { |f| f[:type].is_a?(ArrayType) && f[:type].count.nil? }
+          sized.last ? sized.last[:offset] + sized.last[:type].size : 0
+        end
       end
 
       def align

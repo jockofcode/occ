@@ -22,6 +22,25 @@ module OCC
       def emit(line) = @out << line
       def emit_blank  = @out << ''
 
+      # Produce an assembler-quoted string literal from a Ruby string.
+      # Uses octal escapes for non-printable / non-ASCII bytes so that GNU as
+      # (and the macOS assembler) never sees unsupported \uXXXX sequences.
+      def asm_string(s)
+        result = +'"'
+        s.each_byte do |b|
+          result << case b
+                    when 0x22 then '\\"'
+                    when 0x5C then '\\\\'
+                    when 0x0A then '\\n'
+                    when 0x0D then '\\r'
+                    when 0x09 then '\\t'
+                    when 0x20..0x7E then b.chr
+                    else format('\\%03o', b)
+                    end
+        end
+        result << '"'
+      end
+
       # Subclasses implement these:
       def emit_preamble         = nil
       def emit_string_constant(id, value) = nil

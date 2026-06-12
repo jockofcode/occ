@@ -1,7 +1,12 @@
 #ifndef _OCC_ERRNO_H
 #define _OCC_ERRNO_H
 
+#if defined(__APPLE__)
+extern int * __error(void);
+#define errno (*__error())
+#else
 extern int errno;
+#endif
 
 #define EPERM    1
 #define ENOENT   2

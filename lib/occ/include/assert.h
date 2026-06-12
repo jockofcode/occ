@@ -4,13 +4,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-extern void __occ_assert_fail(const char *expr, const char *file, int line);
-
 #ifdef NDEBUG
 #  define assert(e) ((void)0)
 #else
 #  define assert(e) \
-     ((e) ? (void)0 : (__occ_assert_fail(#e, __FILE__, __LINE__), (void)0))
+     ((e) ? (void)0 : (fprintf(stderr, "%s:%d: Assertion `%s' failed.\n", \
+                                __FILE__, __LINE__, #e), abort(), (void)0))
 #endif
 
 #define static_assert _Static_assert

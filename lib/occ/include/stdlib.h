@@ -61,6 +61,8 @@ extern void *bsearch(const void *key, const void *base,
 /* Random numbers */
 extern int   rand(void);
 extern void  srand(unsigned int seed);
+extern long  random(void);
+extern void  srandom(unsigned int seed);
 
 /* Multibyte / wide char (stubs) */
 extern int   mblen(const char *s, size_t n);

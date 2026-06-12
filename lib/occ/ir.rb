@@ -148,13 +148,14 @@ module OCC
 
     class Function
       attr_reader :name, :params, :blocks, :return_type
-      attr_accessor :variadic
+      attr_accessor :variadic, :static
 
-      def initialize(name, params, return_type, variadic: false)
+      def initialize(name, params, return_type, variadic: false, static: false)
         @name        = name
         @params      = params   # [{name:, type:}]
         @return_type = return_type
         @variadic    = variadic
+        @static      = static
         @blocks      = []
       end
 
@@ -170,7 +171,8 @@ module OCC
     # ── Module ────────────────────────────────────────────────────────────────
 
     class Mod
-      attr_reader :functions, :globals, :strings, :variadic_funcs, :fp_funcs, :func_names
+      attr_reader :functions, :globals, :strings, :variadic_funcs, :fp_funcs, :func_names,
+                  :defined_funcs
 
       def initialize
         @functions     = []
@@ -179,11 +181,13 @@ module OCC
         @variadic_funcs = {}        # name => named_param_count
         @fp_funcs       = Set.new   # names of functions returning float/double
         @func_names     = Set.new   # all known function names (defined or declared extern)
+        @defined_funcs  = Set.new   # functions with a body in this translation unit
       end
 
       def add_function(f)
         @functions << f
         @func_names << f.name
+        @defined_funcs << f.name
       end
       def add_global(name, type, init = nil) = (@globals[name] = { type: type, init: init })
       def add_string(value) = StringRef.new(@strings.tap { @strings << value }.length - 1)
@@ -212,6 +216,8 @@ module OCC
         @temp_counter    = 0
         @label_counter   = 0
         @locals          = {}      # name => Alloca temp
+        @local_ctypes    = {}      # name => CType (for array decay when node.ctype is nil)
+        @static_locals   = {}      # name => mangled global name (static-storage locals)
         @break_target    = nil
         @cont_target     = nil
         @enum_constants  = {}      # name => Integer (compile-time enum values)
@@ -273,37 +279,85 @@ module OCC
         @temp_counter  = 0
         @label_counter = 0
         @locals        = {}
+        @local_ctypes  = {}
+        @static_locals = {}
 
         ret_type = fn.specifiers.type_keywords.first&.to_s || 'int'
-        params   = (fn.params || { params: [] })[:params].map do |p|
-          { name: p[:name], type: p[:specs]&.type_keywords&.first&.to_s || 'int' }
-        end
-        variadic = (fn.params || { variadic: false })[:variadic]
 
-        @func = Function.new(fn.name, params, ret_type, variadic: variadic)
+        # Build logical parameter list with resolved CTypes (annotated by the
+        # semantic analyser) so struct-by-value params can be sized correctly.
+        ast_params = (fn.params || { params: [] })[:params]
+        variadic   = (fn.params || { variadic: false })[:variadic]
+        logical    = ast_params.map do |p|
+          ct       = p[:resolved_type]
+          type_str = p[:specs]&.type_keywords&.first&.to_s || 'int'
+          { name: p[:name], ctype: ct, type: type_str, nregs: param_reg_slots(ct) }
+        end
+
+        # Flat parameter list — one entry per incoming register slot. Multi-slot
+        # struct params get placeholder entries for their additional registers so
+        # the codegen prologue saves each one.
+        flat_params = []
+        logical.each do |lp|
+          lp[:nregs].times do |i|
+            flat_params << if i.zero?
+                             { name: lp[:name], type: lp[:type] }
+                           else
+                             { name: nil, type: 'long' }
+                           end
+          end
+        end
+
+        is_static = fn.specifiers.storage == :static
+        @func = Function.new(fn.name, flat_params, ret_type, variadic: variadic, static: is_static)
         @mod.add_function(@func)
-        @mod.mark_variadic(fn.name, params.length) if variadic
+        @mod.mark_variadic(fn.name, flat_params.length) if variadic
+        @mod.mark_fp_func(fn.name) if ret_type =~ /\A(float|double|long double)\z/
 
         entry = new_block('entry')
         switch_to(entry)
 
-        # Create alloca slots for each parameter.
         # Phase 1: capture all incoming register values into copy temps FIRST so
         # that later alloca/store work does not overwrite a register slot before
         # all registers have been read.
-        param_copy_temps = params.each_with_index.filter_map do |p, idx|
-          next unless p[:name]
-          ct = new_temp
-          emit(Copy.new(ct, Temp.new(idx)))
-          [p, ct]
-        end
+        reg_idx = 0
+        param_copies = logical.map do |lp|
+          unless lp[:name]
+            reg_idx += lp[:nregs]
+            next nil
+          end
+          cts = (0...lp[:nregs]).map do
+            ct = new_temp
+            emit(Copy.new(ct, Temp.new(reg_idx)))
+            reg_idx += 1
+            ct
+          end
+          [lp, cts]
+        end.compact
 
-        # Phase 2: alloca + store for each parameter
-        param_copy_temps.each do |(p, ct)|
+        # Phase 2: alloca + store for each parameter. Multi-register struct
+        # params store consecutive 8-byte halves into a single struct-sized slot.
+        param_copies.each do |(lp, cts)|
           slot = new_temp
-          emit(Alloca.new(slot, p[:type]))
-          emit(Store.new(slot, ct))
-          @locals[p[:name]] = slot
+          alloca_ct = lp[:ctype] || lp[:type]
+          emit(Alloca.new(slot, alloca_ct))
+          if cts.length == 1
+            emit(Store.new(slot, cts.first))
+          else
+            base_addr = new_temp
+            emit(AddrOf.new(base_addr, slot))
+            cts.each_with_index do |ct, i|
+              if i.zero?
+                emit(Store.new(slot, ct))
+              else
+                gep = new_temp
+                emit(Gep.new(gep, base_addr, Const.new(i), 8))
+                emit(Store.new(gep, ct))
+              end
+            end
+          end
+          @locals[lp[:name]] = slot
+          @local_ctypes[lp[:name]] = lp[:ctype] if lp[:ctype]
         end
 
         build_stmt(fn.body)
@@ -312,6 +366,15 @@ module OCC
         emit(Return.new) unless @block.terminated?
 
         @func = nil
+      end
+
+      # Number of incoming integer registers a parameter of the given ctype
+      # consumes under the AArch64 procedure call standard. Composite types up
+      # to 16 bytes pack into 2 consecutive registers; everything else uses one.
+      def param_reg_slots(ctype)
+        return 1 unless ctype.is_a?(OCC::Types::StructType) && ctype.complete?
+        sz = (ctype.size rescue 0)
+        sz > 8 && sz <= 16 ? 2 : 1
       end
 
       def build_global_decl(decl)
@@ -365,7 +428,8 @@ module OCC
           type_sample = d[:type_fn]&.call(:base)
           next if type_sample.is_a?(Hash) && type_sample[:kind] == :function
 
-          actual_type = begin
+          # Prefer the type resolved by the semantic analyser (handles typedefs, etc.)
+          actual_type = d[:resolved_type] || begin
             d[:type_fn]&.call(base_type) || base_type
           rescue StandardError
             'int'
@@ -373,25 +437,46 @@ module OCC
           # Discard function-type results (shouldn't happen here, but be safe)
           actual_type = 'int' if actual_type.is_a?(Hash)
 
-          init_val = d[:init] ? eval_const_init(d[:init]) : nil
+          init_val = d[:init] ? eval_const_init(d[:init], allow_ref: true) : nil
           @mod.add_global(d[:name], actual_type, init_val)
         end
       end
 
-      # Evaluate a simple constant initializer to an integer, or nil.
-      def eval_const_init(expr)
+      # Evaluate a simple constant initializer.
+      # Returns Integer, Float, { kind: :string, value: "..." }, { kind: :ref, name: "..." },
+      # or { kind: :initializer_list, items: [...] } for compound initializers.
+      # Sign-extend a char literal byte value, matching signed-char platforms.
+      def char_lit_int(str)
+        v = str.ord
+        v > 127 ? v - 256 : v
+      end
+
+      def eval_const_init(expr, allow_ref: false)
         case expr
-        when AST::IntLiteral  then expr.integer_value
-        when AST::CharLiteral then expr.value.ord
+        when AST::IntLiteral   then expr.integer_value
+        when AST::CharLiteral  then char_lit_int(expr.value)
+        when AST::FloatLiteral then expr.raw.to_f
+        when AST::StringLiteral
+          { kind: :string, value: expr.value }
+        when AST::Identifier
+          if @enum_constants.key?(expr.name)
+            @enum_constants[expr.name]
+          elsif allow_ref
+            { kind: :ref, name: expr.name }
+          end
+        when AST::Cast
+          eval_const_init(expr.expr, allow_ref: allow_ref)
         when AST::UnaryOp
-          if expr.op == :unary_minus
-            v = eval_const_init(expr.operand)
-            v ? -v : nil
+          v = eval_const_init(expr.operand, allow_ref: allow_ref)
+          case expr.op
+          when :unary_minus then v.is_a?(Numeric) ? -v : nil
+          when :bit_not     then v.is_a?(Integer) ? ~v : nil
+          else nil
           end
         when AST::BinaryOp
-          l = eval_const_init(expr.left)
-          r = eval_const_init(expr.right)
-          return nil unless l && r
+          l = eval_const_init(expr.left, allow_ref: allow_ref)
+          r = eval_const_init(expr.right, allow_ref: allow_ref)
+          return nil unless l.is_a?(Numeric) && r.is_a?(Numeric)
           case expr.op
           when :plus   then l + r
           when :minus  then l - r
@@ -402,6 +487,11 @@ module OCC
           when :amp    then l & r
           when :pipe   then l | r
           when :caret  then l ^ r
+          end
+        when Hash
+          if expr[:kind] == :initializer_list
+            { kind: :initializer_list,
+              items: (expr[:items] || []).map { |item| eval_const_init(item[:value], allow_ref: true) } }
           end
         else nil
         end
@@ -451,12 +541,37 @@ module OCC
           end
         end
 
+        is_static = decl.specifiers.storage == :static ||
+                    decl.specifiers.storage == :_Thread_local
+        is_extern = decl.specifiers.storage == :extern
+
         decl.declarators.each do |d|
           next unless d[:name]
           ctype = d[:resolved_type]
+
+          if is_extern
+            # extern declarations introduce no storage in this TU; just record the
+            # ctype so identifier resolution can still consult it.
+            @local_ctypes[d[:name]] = ctype if ctype
+            next
+          end
+
+          if is_static
+            # Static locals have static storage duration: emit as a global with a
+            # mangled name so addresses persist across calls and there is no
+            # collision with file-scope names or static locals in other functions.
+            mangled = "__static_#{@func.name}_#{d[:name]}"
+            init_val = d[:init] ? eval_const_init(d[:init], allow_ref: true) : nil
+            @mod.add_global(mangled, ctype || 'int', init_val)
+            @static_locals[d[:name]] = mangled
+            @local_ctypes[d[:name]] = ctype if ctype
+            next
+          end
+
           slot  = new_temp
           emit(Alloca.new(slot, ctype || 'int'))
           @locals[d[:name]] = slot
+          @local_ctypes[d[:name]] = ctype if ctype
 
           if d[:init]
             if d[:init].is_a?(Hash) && d[:init][:kind] == :initializer_list
@@ -471,12 +586,31 @@ module OCC
         end
       end
 
+      # Resolve an identifier name to the actual storage name. For static locals
+      # this returns the mangled global name; otherwise it returns the name as-is.
+      def global_name_for(name)
+        @static_locals[name] || name
+      end
+
       # Emit stores for a brace-enclosed initializer list into memory starting at base_ptr.
       def build_initializer_list(base_ptr, init_list, ctype)
         items = init_list[:items] || []
-        return if items.empty?
 
         if ctype.is_a?(OCC::Types::StructType) && ctype.complete?
+          # Zero-initialize all fields first (C11 §6.7.9 ¶10: unspecified members are zero)
+          ctype.fields.each do |field|
+            next unless field[:name]
+            fptr = if field[:offset].zero?
+                     base_ptr
+                   else
+                     t = new_temp
+                     emit(Binary.new(t, :plus, base_ptr, Const.new(field[:offset])))
+                     t
+                   end
+            esz = field[:type].size rescue 8
+            emit(Store.new(fptr, Const.new(0), field[:type], esz))
+          end
+          # Then apply explicit initializers
           items.each_with_index do |item, seq_idx|
             # Resolve target field (designated or sequential)
             field = if item[:designators]&.any? { |d| d[0] == :field }
@@ -486,14 +620,19 @@ module OCC
                       ctype.fields[seq_idx]
                     end
             next unless field && item[:value]
-            val    = build_expr(item[:value])
-            esz    = field[:type].size rescue 8
-            if field[:offset].zero?
-              emit(Store.new(base_ptr, val, nil, esz))
+            fptr = if field[:offset].zero?
+                     base_ptr
+                   else
+                     t = new_temp
+                     emit(Binary.new(t, :plus, base_ptr, Const.new(field[:offset])))
+                     t
+                   end
+            if item[:value].is_a?(Hash) && item[:value][:kind] == :initializer_list
+              build_initializer_list(fptr, item[:value], field[:type])
             else
-              fptr = new_temp
-              emit(Binary.new(fptr, :plus, base_ptr, Const.new(field[:offset])))
-              emit(Store.new(fptr, val, nil, esz))
+              val = build_expr(item[:value])
+              esz = field[:type].size rescue 8
+              emit(Store.new(fptr, val, field[:type], esz))
             end
           end
         elsif ctype.is_a?(OCC::Types::ArrayType)
@@ -506,10 +645,14 @@ module OCC
                   else
                     Const.new(seq_idx)
                   end
-            val  = build_expr(item[:value])
             eptr = new_temp
             emit(Gep.new(eptr, base_ptr, idx, esz))
-            emit(Store.new(eptr, val, nil, esz))
+            if item[:value].is_a?(Hash) && item[:value][:kind] == :initializer_list
+              build_initializer_list(eptr, item[:value], elem_ct)
+            else
+              val = build_expr(item[:value])
+              emit(Store.new(eptr, val, elem_ct, esz))
+            end
           end
         else
           # Scalar or unknown: store first value directly
@@ -708,11 +851,29 @@ module OCC
       def eval_case_value(expr)
         case expr
         when AST::IntLiteral  then expr.integer_value
-        when AST::CharLiteral then expr.value.ord
+        when AST::CharLiteral then char_lit_int(expr.value)
+        when AST::Identifier  then @enum_constants[expr.name]
+        when AST::Cast        then eval_case_value(expr.expr)
         when AST::UnaryOp
-          if expr.op == :unary_minus
-            v = eval_case_value(expr.operand)
-            v ? -v : nil
+          v = eval_case_value(expr.operand)
+          case expr.op
+          when :unary_minus then v ? -v : nil
+          when :bit_not     then v.is_a?(Integer) ? ~v : nil
+          else nil
+          end
+        when AST::BinaryOp
+          l = eval_case_value(expr.left)
+          r = eval_case_value(expr.right)
+          return nil unless l && r
+          case expr.op
+          when :plus   then l + r
+          when :minus  then l - r
+          when :star   then l * r
+          when :amp    then l & r
+          when :pipe   then l | r
+          when :caret  then l ^ r
+          when :lshift then l << r
+          when :rshift then l >> r
           end
         else nil
         end
@@ -734,7 +895,7 @@ module OCC
         case node
         when AST::IntLiteral    then Const.new(node.integer_value)
         when AST::FloatLiteral  then Const.new(node.raw.to_f)
-        when AST::CharLiteral   then Const.new(node.value.ord)
+        when AST::CharLiteral   then Const.new(char_lit_int(node.value))
         when AST::StringLiteral then @mod.add_string(node.value)
         when AST::Identifier    then build_ident(node)
         when AST::BinaryOp      then build_binop(node)
@@ -749,6 +910,14 @@ module OCC
         when AST::SizeofExpr    then build_sizeof_expr(node)
         when AST::CommaExpr
           node.exprs.map { |e| build_expr(e) }.last
+        when Hash
+          # _Generic(...) — semantic analyzer annotates [:selected_expr]
+          if node[:kind] == :generic
+            sel = node[:selected_expr]
+            sel ? build_expr(sel) : Const.new(0)
+          else
+            Const.new(0)
+          end
         else
           Const.new(0)
         end
@@ -760,8 +929,13 @@ module OCC
 
         slot = @locals[node.name]
         if slot
-          # Arrays decay to a pointer to their first element.
-          if node.ctype.is_a?(OCC::Types::ArrayType)
+          # Arrays and struct values decay to a pointer to their storage when
+          # used as an expression value. When node.ctype is nil (e.g. inside a
+          # struct initializer list that semantic analysis skipped), fall back
+          # to @local_ctypes for the decay check.
+          local_ctype = node.ctype || @local_ctypes[node.name]
+          if local_ctype.is_a?(OCC::Types::ArrayType) ||
+             local_ctype.is_a?(OCC::Types::StructType)
             t = new_temp
             emit(AddrOf.new(t, slot))
             t
@@ -771,13 +945,18 @@ module OCC
             t
           end
         else
-          # Global variable. Arrays and structs used in expressions yield their address.
-          if node.ctype.is_a?(OCC::Types::ArrayType)
+          # Global variable (or static local, which is emitted as a mangled
+          # global). Arrays and structs used in expressions yield their address.
+          gname = global_name_for(node.name)
+          global_ctype = node.ctype || @local_ctypes[node.name] ||
+                         (@mod.globals[gname]&.dig(:type))
+          if global_ctype.is_a?(OCC::Types::ArrayType) ||
+             global_ctype.is_a?(OCC::Types::StructType)
             t = new_temp
-            emit(AddrOf.new(t, GlobalRef.new(node.name)))
+            emit(AddrOf.new(t, GlobalRef.new(gname)))
             t
           else
-            GlobalRef.new(node.name)
+            GlobalRef.new(gname)
           end
         end
       end
@@ -787,11 +966,85 @@ module OCC
         return build_logical_and(node) if node.op == :logical_and
         return build_logical_or(node)  if node.op == :logical_or
 
+        # Pointer arithmetic: pointer ± integer must scale by element size.
+        if node.op == :plus || node.op == :minus
+          lct = node.left.ctype
+          rct = node.right.ctype
+          if node.op == :plus
+            if pointer_ctype?(lct)
+              esz = elem_size_for(lct)
+              left  = build_expr(node.left)
+              right = build_expr(node.right)
+              dst = new_temp
+              emit(Gep.new(dst, left, right, esz))
+              return dst
+            elsif pointer_ctype?(rct)
+              esz = elem_size_for(rct)
+              left  = build_expr(node.left)
+              right = build_expr(node.right)
+              dst = new_temp
+              emit(Gep.new(dst, right, left, esz))   # pointer is base
+              return dst
+            end
+          elsif node.op == :minus && pointer_ctype?(lct) && !pointer_ctype?(rct)
+            esz = elem_size_for(lct)
+            left  = build_expr(node.left)
+            right = build_expr(node.right)
+            neg   = new_temp
+            emit(Unary.new(neg, :neg, right))
+            dst = new_temp
+            emit(Gep.new(dst, left, neg, esz))
+            return dst
+          end
+        end
+
         left  = build_expr(node.left)
         right = build_expr(node.right)
         dst   = new_temp
-        emit(Binary.new(dst, node.op, left, right, node.ctype))
+        op    = node.op
+        # For comparison/division/rshift, respect signedness of operands.
+        # Use unsigned variants when either operand is an unsigned integer type.
+        # FP types never use unsigned comparison variants (float has no signed/unsigned).
+        if %i[gt lt geq leq slash percent rshift].include?(op)
+          lct = node.left.ctype
+          rct = node.right.ctype
+          lct_inner = lct.respond_to?(:unqualified) ? lct.unqualified : lct
+          rct_inner = rct.respond_to?(:unqualified) ? rct.unqualified : rct
+          fp_compare = lct_inner.is_a?(OCC::Types::FloatingType) ||
+                       rct_inner.is_a?(OCC::Types::FloatingType)
+          unless fp_compare
+            unsigned = unsigned_ctype?(lct) || unsigned_ctype?(rct) ||
+                       (pointer_ctype?(lct) && pointer_ctype?(rct))
+            if unsigned
+              op = case op
+                   when :gt    then :ugt
+                   when :lt    then :ult
+                   when :geq   then :ugeq
+                   when :leq   then :uleq
+                   when :slash then :udiv
+                   when :percent then :umod
+                   when :rshift  then :urshift
+                   else op
+                   end
+            end
+          end
+        end
+        emit(Binary.new(dst, op, left, right, node.ctype))
         dst
+      end
+
+      # True if ctype is an unsigned integer type (not signed, not pointer).
+      def unsigned_ctype?(ct)
+        return false unless ct
+        inner = ct.respond_to?(:unqualified) ? ct.unqualified : ct
+        inner.is_a?(OCC::Types::IntegerType) && !inner.signed?
+      end
+
+      # True if ctype is a pointer or array (decays to pointer in arithmetic).
+      def pointer_ctype?(ct)
+        return false unless ct
+        inner = ct.respond_to?(:unqualified) ? ct.unqualified : ct
+        inner.is_a?(OCC::Types::PointerType) || inner.is_a?(OCC::Types::ArrayType)
       end
 
       # Compile `a && b` with short-circuit: if a is false, result = 0 without evaluating b.
@@ -856,7 +1109,7 @@ module OCC
             if slot
               emit(AddrOf.new(dst, slot))
             else
-              emit(AddrOf.new(dst, GlobalRef.new(node.operand.name)))
+              emit(AddrOf.new(dst, GlobalRef.new(global_name_for(node.operand.name))))
             end
           when AST::IndexExpr
             arr = build_expr(node.operand.array)
@@ -872,6 +1125,12 @@ module OCC
         when :deref
           ptr = build_expr(node.operand)
           pointed_ct = node.operand.ctype.is_a?(OCC::Types::PointerType) ? node.operand.ctype.base : nil
+          # Dereferencing a pointer to an array or struct yields the storage
+          # address itself; loading would only read 8 bytes of a wider value.
+          if pointed_ct.is_a?(OCC::Types::ArrayType) ||
+             pointed_ct.is_a?(OCC::Types::StructType)
+            return ptr
+          end
           elem_sz = elem_size_for(node.operand.ctype)
           dst = new_temp
           emit(Load.new(dst, ptr, pointed_ct, elem_sz))
@@ -890,64 +1149,121 @@ module OCC
           operand = build_expr(node.operand)
           dst = new_temp
           emit(Unary.new(dst, :bitnot, operand))
-          dst
+          # mvn works on 64-bit registers; truncate the result to the actual
+          # operand width so e.g. ~(uint32_t)0 == 0xFFFF_FFFF not 0xFFFF...FF.
+          ct = node.ctype
+          if ct.is_a?(OCC::Types::IntegerType) && ct.size <= 4
+            trunc = new_temp
+            emit(Cast.new(trunc, dst, ct.to_s, ct))
+            trunc
+          else
+            dst
+          end
         when :pre_inc
           slot = @locals[node.operand.name] if node.operand.is_a?(AST::Identifier)
+          ct = node.operand.ctype
+          esz = pointer_ctype?(ct) ? elem_size_for(ct) : nil
           if slot
             old = new_temp; emit(Load.new(old, slot))
-            new_val = new_temp; emit(Binary.new(new_val, :plus, old, Const.new(1)))
+            new_val = new_temp
+            if esz
+              emit(Gep.new(new_val, old, Const.new(1), esz))
+            else
+              emit(Binary.new(new_val, :plus, old, Const.new(1)))
+            end
             emit(Store.new(slot, new_val))
             new_val
           else
             addr = lvalue_addr(node.operand)
-            sz = node.operand.ctype ? (node.operand.ctype.size rescue 8) : 8
-            old = new_temp; emit(Load.new(old, addr, node.operand.ctype, sz))
-            new_val = new_temp; emit(Binary.new(new_val, :plus, old, Const.new(1)))
+            sz = ct ? (ct.size rescue 8) : 8
+            old = new_temp; emit(Load.new(old, addr, ct, sz))
+            new_val = new_temp
+            if esz
+              emit(Gep.new(new_val, old, Const.new(1), esz))
+            else
+              emit(Binary.new(new_val, :plus, old, Const.new(1)))
+            end
             emit(Store.new(addr, new_val, nil, sz))
             new_val
           end
         when :post_inc
           slot = @locals[node.operand.name] if node.operand.is_a?(AST::Identifier)
+          ct = node.operand.ctype
+          esz = pointer_ctype?(ct) ? elem_size_for(ct) : nil
           if slot
             old = new_temp; emit(Load.new(old, slot))
-            new_val = new_temp; emit(Binary.new(new_val, :plus, old, Const.new(1)))
+            new_val = new_temp
+            if esz
+              emit(Gep.new(new_val, old, Const.new(1), esz))
+            else
+              emit(Binary.new(new_val, :plus, old, Const.new(1)))
+            end
             emit(Store.new(slot, new_val))
             old
           else
             addr = lvalue_addr(node.operand)
-            sz = node.operand.ctype ? (node.operand.ctype.size rescue 8) : 8
-            old = new_temp; emit(Load.new(old, addr, node.operand.ctype, sz))
-            new_val = new_temp; emit(Binary.new(new_val, :plus, old, Const.new(1)))
+            sz = ct ? (ct.size rescue 8) : 8
+            old = new_temp; emit(Load.new(old, addr, ct, sz))
+            new_val = new_temp
+            if esz
+              emit(Gep.new(new_val, old, Const.new(1), esz))
+            else
+              emit(Binary.new(new_val, :plus, old, Const.new(1)))
+            end
             emit(Store.new(addr, new_val, nil, sz))
             old
           end
         when :pre_dec
           slot = @locals[node.operand.name] if node.operand.is_a?(AST::Identifier)
+          ct = node.operand.ctype
+          esz = pointer_ctype?(ct) ? elem_size_for(ct) : nil
           if slot
             old = new_temp; emit(Load.new(old, slot))
-            new_val = new_temp; emit(Binary.new(new_val, :minus, old, Const.new(1)))
+            new_val = new_temp
+            if esz
+              emit(Gep.new(new_val, old, Const.new(-1), esz))
+            else
+              emit(Binary.new(new_val, :minus, old, Const.new(1)))
+            end
             emit(Store.new(slot, new_val))
             new_val
           else
             addr = lvalue_addr(node.operand)
-            sz = node.operand.ctype ? (node.operand.ctype.size rescue 8) : 8
-            old = new_temp; emit(Load.new(old, addr, node.operand.ctype, sz))
-            new_val = new_temp; emit(Binary.new(new_val, :minus, old, Const.new(1)))
+            sz = ct ? (ct.size rescue 8) : 8
+            old = new_temp; emit(Load.new(old, addr, ct, sz))
+            new_val = new_temp
+            if esz
+              emit(Gep.new(new_val, old, Const.new(-1), esz))
+            else
+              emit(Binary.new(new_val, :minus, old, Const.new(1)))
+            end
             emit(Store.new(addr, new_val, nil, sz))
             new_val
           end
         when :post_dec
           slot = @locals[node.operand.name] if node.operand.is_a?(AST::Identifier)
+          ct = node.operand.ctype
+          esz = pointer_ctype?(ct) ? elem_size_for(ct) : nil
           if slot
             old = new_temp; emit(Load.new(old, slot))
-            new_val = new_temp; emit(Binary.new(new_val, :minus, old, Const.new(1)))
+            new_val = new_temp
+            if esz
+              emit(Gep.new(new_val, old, Const.new(-1), esz))
+            else
+              emit(Binary.new(new_val, :minus, old, Const.new(1)))
+            end
             emit(Store.new(slot, new_val))
             old
           else
             addr = lvalue_addr(node.operand)
-            sz = node.operand.ctype ? (node.operand.ctype.size rescue 8) : 8
-            old = new_temp; emit(Load.new(old, addr, node.operand.ctype, sz))
-            new_val = new_temp; emit(Binary.new(new_val, :minus, old, Const.new(1)))
+            sz = ct ? (ct.size rescue 8) : 8
+            old = new_temp; emit(Load.new(old, addr, ct, sz))
+            new_val = new_temp
+            if esz
+              emit(Gep.new(new_val, old, Const.new(-1), esz))
+            else
+              emit(Binary.new(new_val, :minus, old, Const.new(1)))
+            end
             emit(Store.new(addr, new_val, nil, sz))
             old
           end
@@ -964,7 +1280,26 @@ module OCC
           old = build_expr(node.target)
           op  = node.op.to_s.sub('_assign', '').to_sym
           result = new_temp
-          emit(Binary.new(result, op, old, val))
+          tct = node.target.ctype
+          if pointer_ctype?(tct) && (op == :plus || op == :minus)
+            esz = elem_size_for(tct)
+            if op == :plus
+              emit(Gep.new(result, old, val, esz))
+            else
+              neg = new_temp
+              emit(Unary.new(neg, :neg, val))
+              emit(Gep.new(result, old, neg, esz))
+            end
+          else
+            # Apply unsigned variants for div/mod/rshift when target or rhs is unsigned.
+            if %i[slash percent rshift].include?(op)
+              rct = node.value.ctype
+              if unsigned_ctype?(tct) || unsigned_ctype?(rct)
+                op = { slash: :udiv, percent: :umod, rshift: :urshift }.fetch(op, op)
+              end
+            end
+            emit(Binary.new(result, op, old, val))
+          end
           val = result
         end
 
@@ -975,7 +1310,7 @@ module OCC
           if slot
             emit(Store.new(slot, val))
           else
-            emit(Store.new(GlobalRef.new(node.target.name), val))
+            emit(Store.new(GlobalRef.new(global_name_for(node.target.name)), val))
           end
         when AST::UnaryOp
           if node.target.op == :deref
@@ -1019,7 +1354,24 @@ module OCC
       end
 
       def build_call(node)
-        args = node.args.map { |a| build_expr(a) }
+        # Collect parameter types from the callee's function type for implicit conversions.
+        callee_ft = node.callee.respond_to?(:ctype) ? node.callee.ctype : nil
+        callee_ft = callee_ft.base if callee_ft.is_a?(Types::PointerType) && callee_ft.base.is_a?(Types::FunctionType)
+        param_types = callee_ft.is_a?(Types::FunctionType) ? callee_ft.params : []
+
+        args = node.args.each_with_index.flat_map do |a, i|
+          param_ct = param_types[i]&.fetch(:type, nil) rescue nil
+          arg_ct   = a.respond_to?(:ctype) ? a.ctype : nil
+          # Emit an explicit int→float cast when the parameter expects a floating-point type.
+          if param_ct.is_a?(Types::FloatingType) && arg_ct && !arg_ct.is_a?(Types::FloatingType)
+            val = build_expr(a)
+            cast_t = new_temp
+            emit(Cast.new(cast_t, val, arg_ct, param_ct))
+            [cast_t]
+          else
+            build_call_arg(a)
+          end
+        end
         dst  = new_temp
         func_ref = case node.callee
                    when AST::Identifier
@@ -1034,6 +1386,31 @@ module OCC
                    end
         emit(Call.new(dst, func_ref, args, node.ctype))
         dst
+      end
+
+      # Lower a single call argument into one or more flat IR operands. For
+      # struct-by-value arguments up to 16 bytes, load each 8-byte half into
+      # its own temp and pass them as consecutive arguments per AAPCS64.
+      def build_call_arg(arg_node)
+        ct = arg_node.ctype
+        if ct.is_a?(OCC::Types::StructType) && ct.complete? &&
+           (sz = (ct.size rescue 0)) > 0 && sz <= 16
+          addr  = build_expr(arg_node)
+          slots = sz > 8 ? 2 : 1
+          (0...slots).map do |i|
+            t = new_temp
+            if i.zero?
+              emit(Load.new(t, addr))
+            else
+              gep = new_temp
+              emit(Gep.new(gep, addr, Const.new(i), 8))
+              emit(Load.new(t, gep))
+            end
+            t
+          end
+        else
+          [build_expr(arg_node)]
+        end
       end
 
       def build_ternary(node)
@@ -1067,6 +1444,12 @@ module OCC
         elem_sz = elem_size_for(node.array.ctype)
         ptr     = new_temp
         emit(Gep.new(ptr, arr, idx, elem_sz))
+        # If the indexed result is itself an aggregate (array or struct), do
+        # not load through the pointer — the expression decays to its address.
+        if node.ctype.is_a?(OCC::Types::ArrayType) ||
+           node.ctype.is_a?(OCC::Types::StructType)
+          return ptr
+        end
         dst = new_temp
         emit(Load.new(dst, ptr, node.ctype, elem_sz))
         dst
@@ -1119,6 +1502,11 @@ module OCC
           dst
         else
           field_ptr = build_member_addr(node)
+          # Array-type fields decay to a pointer to their first element — return
+          # the address directly instead of loading through it.
+          if node.ctype.is_a?(OCC::Types::ArrayType)
+            return field_ptr
+          end
           elem_sz   = member_field_size(node)
           dst       = new_temp
           emit(Load.new(dst, field_ptr, node.ctype, elem_sz))
@@ -1163,7 +1551,7 @@ module OCC
           if slot
             emit(AddrOf.new(dst, slot))
           else
-            emit(AddrOf.new(dst, GlobalRef.new(node.name)))
+            emit(AddrOf.new(dst, GlobalRef.new(global_name_for(node.name))))
           end
         when AST::UnaryOp
           return build_expr(node.operand) if node.op == :deref
@@ -1198,6 +1586,12 @@ module OCC
         # Compound literal: (type){ ... }
         if node.expr.is_a?(Hash) && node.expr[:kind] == :initializer_list
           ctype = node.ctype
+          # For unsized array compound literals (T[]), infer count from the
+          # initializer so that the Alloca reserves the correct amount of space.
+          if ctype.is_a?(OCC::Types::ArrayType) && ctype.count.nil?
+            items = node.expr[:items] || []
+            ctype = OCC::Types::ArrayType.new(ctype.element, items.length)
+          end
           slot  = new_temp
           emit(Alloca.new(slot, ctype || 'int'))
           addr = new_temp

@@ -7,9 +7,18 @@
 /* Opaque FILE type */
 typedef struct _occ_file FILE;
 
+#if defined(__APPLE__)
+extern FILE *__stdinp;
+extern FILE *__stdoutp;
+extern FILE *__stderrp;
+#define stdin  __stdinp
+#define stdout __stdoutp
+#define stderr __stderrp
+#else
 extern FILE *stdin;
 extern FILE *stdout;
 extern FILE *stderr;
+#endif
 
 #define EOF     (-1)
 #define SEEK_SET 0

@@ -42,5 +42,6 @@ extern char *strndup(const char *s, size_t n);
 
 /* Error string */
 extern char *strerror(int errnum);
+extern int   strerror_r(int errnum, char *buf, size_t buflen);
 
 #endif /* _OCC_STRING_H */

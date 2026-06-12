@@ -179,3 +179,29 @@ Two related bugs affected global array variables (e.g., `static jmp_buf buf`):
 **Address vs. value for array globals:** `build_ident` for global identifiers returned a bare `GlobalRef`, which `load_operand` resolved with `adrp + ldr` (loading the value). For array-type globals, the array expression should yield its *address* (pointer-to-first-element decay), not the 8-byte value stored there.
 
 **Fix:** `build_ident` checks `node.ctype.is_a?(OCC::Types::ArrayType)` for global identifiers. If true, it emits `AddrOf(t, GlobalRef(name))` (which generates `adrp + add` = the address), matching the behaviour already in place for local array variables.
+
+---
+
+## macOS Linker Splits Embedded-Null Strings in `__cstring` Section
+
+The `__TEXT,__cstring,cstring_literals` section on macOS enables **linker string merging**: the linker treats every entry as a null-terminated C string and may deduplicate or repack them. This means a string with an embedded null byte — like `"a\0b\0"` — is silently split at the first null. The linker stores only `{97, 0, 0}` (`"a"`) in the final binary; the tail `"b\0"` is discarded or relocated to a different address. Any code that reads past the first null byte gets wrong data.
+
+This was the root cause of sds test 7 ("sdscatprintf() seems working with \0 inside of result") failing. The reference string `"a\0""b\0"` was assembled correctly as `{97,0,98,0,0}` in the `.o` file, but after linking, bytes 2–3 read as `'s'=115, 'd'=100` — the start of the adjacent `"sdscpy() again"` cstring entry.
+
+**Diagnosis:** `xxd` on the binary showed no `61 00 62 00` sequence anywhere. `otool -s __TEXT __cstring` confirmed `l_str_74` contained only three bytes (`61 00 00`), with `"sdscpy..."` immediately following.
+
+**Fix:** In `emit_string_constant` (both `arm64.rb` and `amd64.rb`), check whether the string value contains a null byte. If it does, emit into `.section __TEXT,__const` (a non-merging section) instead of `__TEXT,__cstring,cstring_literals`. The `__TEXT,__const` section preserves embedded nulls intact.
+
+```ruby
+def emit_string_constant(id, value)
+  if value.include?("\0")
+    emit '.section __TEXT,__const'
+  else
+    emit '.section __TEXT,__cstring,cstring_literals'
+  end
+  emit "l_str_#{id}:"
+  emit "  .asciz #{asm_string(value)}"
+  emit '.section __TEXT,__text,regular,pure_instructions'
+  emit_blank
+end
+```

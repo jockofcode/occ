@@ -307,8 +307,8 @@ module OCC
           if cur?(:rbracket)
             advance
             postfixes << :array_unknown
-          elsif cur?(:star)
-            advance; expect(:rbracket)
+          elsif cur?(:star) && peek.type == :rbracket
+            advance; advance
             postfixes << :array_vla
           else
             size = parse_assignment_expr
@@ -371,9 +371,13 @@ module OCC
 
     def build_postfix_fn(postfixes)
       return ->(t) { t } if postfixes.empty?
+      # Postfixes appear left-to-right in source (e.g. `arr[A][B]` →
+      # [[:array, A], [:array, B]]) but C declarators read inside-out:
+      # the leftmost postfix is the OUTERMOST derived type.  Build the
+      # type by applying the rightmost (innermost) postfix first.
       ->(base) {
         type = base
-        postfixes.each do |pf|
+        postfixes.reverse_each do |pf|
           type = case pf
                  when :array_unknown then { kind: :array, element: type, size: nil }
                  when :array_vla     then { kind: :array, element: type, size: :vla }

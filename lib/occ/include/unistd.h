@@ -59,6 +59,9 @@ extern int   execv(const char *path, char *const argv[]);
 extern int   execvp(const char *file, char *const argv[]);
 extern int   execve(const char *path, char *const argv[], char *const envp[]);
 
+/* Terminal */
+extern int isatty(int fd);
+
 /* Misc */
 extern unsigned int sleep(unsigned int seconds);
 extern int  usleep(unsigned int usec);
