@@ -60,6 +60,7 @@ module OCC
                   end
 
       ret_type = func_type.return_type
+      fn.resolved_return_type = ret_type
       @symbols.define(fn.name, type: func_type, kind: :func, location: fn.location)
 
       @symbols.push_scope
@@ -288,7 +289,11 @@ module OCC
         Types::PointerType.new(base, type[:qualifiers] || [])
       when :array
         elem = convert_hash_type(type[:element])
-        count = type[:size].is_a?(AST::IntLiteral) ? type[:size].integer_value : nil
+        count = if type[:size].is_a?(AST::IntLiteral)
+                  type[:size].integer_value
+                elsif type[:size]
+                  eval_const_expr(type[:size])
+                end
         Types::ArrayType.new(elem, count)
       when :function
         ret   = convert_hash_type(type[:return])

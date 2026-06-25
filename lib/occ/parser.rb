@@ -44,7 +44,8 @@ module OCC
     def initialize(tokens)
       @tokens  = tokens.reject { |t| t.type == :eof } + [tokens.find { |t| t.type == :eof } || tokens.last]
       @pos     = 0
-      @typedefs = Set.new   # names declared via typedef
+      @typedefs    = Set.new   # names declared via typedef
+      @constructors = Set.new  # names declared with __attribute__((constructor))
     end
 
     def parse
@@ -96,13 +97,22 @@ module OCC
       # Parse the first declarator to determine if this is a function definition
       name, type_fn, params = parse_declarator(allow_abstract: false)
 
+      # __attribute__((constructor)) after a function declarator (typically on the
+      # forward declaration; the definition then inherits it via @constructors).
+      while cur?(:kw_occ_constructor)
+        @constructors << name if name
+        advance
+      end
+
       if params && cur?(:lbrace)
         # Function definition
         body = parse_compound_statement
         @typedefs << name if specs.storage == :typedef
         return AST::FunctionDef.new(
           specifiers: specs, name: name, params: params,
-          body: body, return_type_fn: type_fn, location: l
+          body: body, return_type_fn: type_fn,
+          constructor: @constructors.include?(name),
+          location: l
         )
       end
 

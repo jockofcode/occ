@@ -46,7 +46,8 @@ module OCC
     '_Imaginary'      => :kw__Imaginary,
     '_Noreturn'       => :kw__Noreturn,
     '_Static_assert'  => :kw__Static_assert,
-    '_Thread_local'   => :kw__Thread_local
+    '_Thread_local'   => :kw__Thread_local,
+    '__occ_constructor' => :kw_occ_constructor
   }.freeze
 
   # A single lexical token.

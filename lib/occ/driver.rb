@@ -19,17 +19,21 @@ module OCC
         end
       end
 
-      # Multiple sources + link: compile each to a temp .o, then link together.
+      # Multiple sources + link: compile each .c to a temp .o, pass .o/.a files directly.
       if !options[:compile_only] && options[:output] && options[:files].length > 1
         Dir.mktmpdir do |tmp|
           obj_paths = options[:files].map.with_index do |file, i|
-            source   = File.read(file)
-            asm      = compile_source(source, file, options)
-            asm_path = File.join(tmp, "out#{i}.s")
-            obj_path = File.join(tmp, "out#{i}.o")
-            File.write(asm_path, asm)
-            assemble_to_obj(asm_path, obj_path, options[:target])
-            obj_path
+            if file.end_with?('.o', '.a')
+              file
+            else
+              source   = File.binread(file).force_encoding('UTF-8')
+              asm      = compile_source(source, file, options)
+              asm_path = File.join(tmp, "out#{i}.s")
+              obj_path = File.join(tmp, "out#{i}.o")
+              File.write(asm_path, asm)
+              assemble_to_obj(asm_path, obj_path, options[:target])
+              obj_path
+            end
           end
           link(obj_paths, options[:output], options[:target])
         end
@@ -41,7 +45,7 @@ module OCC
 
     # Compile a single source file according to options.
     def self.compile_file(path, options)
-      source = File.read(path)
+      source = File.binread(path).force_encoding('UTF-8')
       asm    = compile_source(source, path, options)
 
       if options[:compile_only]

@@ -71,27 +71,44 @@ module OCC
                 end
 
           if init.is_a?(Hash) && init[:kind] == :string
-            str_lbl = "#{@macos ? 'l' : '.L'}gstr_#{name}"
-            if @macos
-              emit '.section __TEXT,__cstring,cstring_literals'
-              emit "#{str_lbl}:"
-              emit "  .asciz #{asm_string(init[:value])}"
-              emit '.section __DATA,__data'
-              emit ".globl #{sym(name)}"
-              emit '.p2align 3'
-              emit "#{sym(name)}:"
-              emit "  .quad #{str_lbl}"
-              emit '.section __TEXT,__text,regular,pure_instructions'
+            if g[:type].is_a?(OCC::Types::ArrayType)
+              # char arr[] = "str": emit string bytes inline at the global symbol.
+              if @macos
+                emit '.section __TEXT,__const'
+                emit ".globl #{sym(name)}"
+                emit "#{sym(name)}:"
+                emit "  .asciz #{asm_string(init[:value])}"
+                emit '.section __TEXT,__text,regular,pure_instructions'
+              else
+                emit '.section .rodata'
+                emit ".globl #{name}"
+                emit "#{name}:"
+                emit "  .asciz #{asm_string(init[:value])}"
+                emit '.section .text'
+              end
             else
-              emit '.section .rodata'
-              emit "#{str_lbl}:"
-              emit "  .asciz #{asm_string(init[:value])}"
-              emit '.section .data'
-              emit ".globl #{name}"
-              emit '.align 8'
-              emit "#{name}:"
-              emit "  .quad #{str_lbl}"
-              emit '.section .text'
+              str_lbl = "#{@macos ? 'l' : '.L'}gstr_#{name}"
+              if @macos
+                emit '.section __TEXT,__cstring,cstring_literals'
+                emit "#{str_lbl}:"
+                emit "  .asciz #{asm_string(init[:value])}"
+                emit '.section __DATA,__data'
+                emit ".globl #{sym(name)}"
+                emit '.p2align 3'
+                emit "#{sym(name)}:"
+                emit "  .quad #{str_lbl}"
+                emit '.section __TEXT,__text,regular,pure_instructions'
+              else
+                emit '.section .rodata'
+                emit "#{str_lbl}:"
+                emit "  .asciz #{asm_string(init[:value])}"
+                emit '.section .data'
+                emit ".globl #{name}"
+                emit '.align 8'
+                emit "#{name}:"
+                emit "  .quad #{str_lbl}"
+                emit '.section .text'
+              end
             end
           elsif init.is_a?(Float)
             fp_dir = sz == 4 ? '.float' : '.double'
@@ -380,6 +397,16 @@ module OCC
               load_operand(instr.value, '%rsi')
               emit "  leaq #{slot_of(instr.ptr)}(%rbp), %rdi"
               emit_struct_copy('%rsi', '%rdi', instr.elem_size)
+            elsif instr.type.is_a?(OCC::Types::StructType) && instr.elem_size.to_i.between?(1, 8)
+              load_operand(instr.value, '%rsi')
+              slot = slot_of(instr.ptr)
+              if instr.elem_size <= 4
+                emit '  movl (%rsi), %eax'
+                emit "  movl %eax, #{slot}(%rbp)"
+              else
+                emit '  movq (%rsi), %rax'
+                emit "  movq %rax, #{slot}(%rbp)"
+              end
             else
               load_operand(instr.value, '%rax')
               emit "  movq %rax, #{slot_of(instr.ptr)}(%rbp)"
@@ -392,6 +419,14 @@ module OCC
               emit "  movq #{ptr_slot}(%rbp), %rcx"
               if instr.elem_size > 8
                 emit_struct_copy('%rax', '%rcx', instr.elem_size)
+              elsif instr.type.is_a?(OCC::Types::StructType) && instr.elem_size.to_i.between?(1, 8)
+                if instr.elem_size <= 4
+                  emit '  movl (%rax), %edx'
+                  emit '  movl %edx, (%rcx)'
+                else
+                  emit '  movq (%rax), %rdx'
+                  emit '  movq %rdx, (%rcx)'
+                end
               else
                 case instr.elem_size
                 when 1 then emit '  movb %al, (%rcx)'
@@ -404,6 +439,15 @@ module OCC
               if instr.elem_size > 8
                 emit "  leaq #{sym(instr.ptr.name)}(%rip), %rcx"
                 emit_struct_copy('%rax', '%rcx', instr.elem_size)
+              elsif instr.type.is_a?(OCC::Types::StructType) && instr.elem_size.to_i.between?(1, 8)
+                emit "  leaq #{sym(instr.ptr.name)}(%rip), %rcx"
+                if instr.elem_size <= 4
+                  emit '  movl (%rax), %edx'
+                  emit '  movl %edx, (%rcx)'
+                else
+                  emit '  movq (%rax), %rdx'
+                  emit '  movq %rdx, (%rcx)'
+                end
               else
                 case instr.elem_size
                 when 1 then emit "  movb %al, #{sym(instr.ptr.name)}(%rip)"
@@ -472,7 +516,11 @@ module OCC
           emit '  retq'
 
         when IR::Cast
-          if fp_operand?(instr.src) && !fp_ctype?(instr.type)
+          if fp_operand?(instr.src) && fp_ctype?(instr.type)
+            # FP → FP: float→double widening or no-op
+            load_fp_operand(instr.src, '%xmm8')
+            store_fp_temp(instr.dst, '%xmm8')
+          elsif fp_operand?(instr.src) && !fp_ctype?(instr.type)
             # FP → integer truncation
             load_fp_operand(instr.src, '%xmm8')
             emit '  cvttsd2si %xmm8, %rax'

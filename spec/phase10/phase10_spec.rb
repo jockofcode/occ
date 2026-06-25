@@ -77,6 +77,18 @@ RSpec.describe 'Phase 10: Headers, Language Extensions, and FP Codegen' do
       src = 'void die(void) __attribute__((noreturn)); void f(void) { die(); }'
       expect { compile_to_asm(src) }.not_to raise_error
     end
+
+    it 'emits __mod_init_func pointer for __attribute__((constructor)) function' do
+      src = <<~C
+        static int counter = 0;
+        static void init(void) __attribute__((constructor));
+        static void init(void) { counter = 42; }
+        int get(void) { return counter; }
+      C
+      asm = compile_to_asm(src)
+      expect(asm).to include('__mod_init_func')
+      expect(asm).to include('_init')
+    end
   end
 
   describe '__extension__ keyword' do

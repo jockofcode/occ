@@ -29,14 +29,15 @@ module OCC
     end
 
     class FunctionDef < Node
-      attr_accessor :specifiers, :name, :params, :body, :return_type_fn
-      def initialize(specifiers:, name:, params:, body:, return_type_fn:, **kw)
+      attr_accessor :specifiers, :name, :params, :body, :return_type_fn, :resolved_return_type, :constructor
+      def initialize(specifiers:, name:, params:, body:, return_type_fn:, constructor: false, **kw)
         super(**kw)
         @specifiers     = specifiers
         @name           = name
         @params         = params
         @body           = body
         @return_type_fn = return_type_fn
+        @constructor    = constructor
       end
     end
 

@@ -47,4 +47,6 @@ extern int creat(const char *path, mode_t mode);
 extern int fcntl(int fd, int cmd, ...);
 extern int openat(int dirfd, const char *path, int flags, ...);
 
+#include <unistd.h>
+
 #endif /* _OCC_FCNTL_H */

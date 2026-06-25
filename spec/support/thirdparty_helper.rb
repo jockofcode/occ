@@ -51,7 +51,16 @@ module ThirdpartyHelper
       end
     end
 
-    system('git', '-C', repo_dir, 'checkout', '--quiet', commit)
+    unless system('git', '-C', repo_dir, 'checkout', '--quiet', commit)
+      # Cached repo may be corrupted — wipe and re-clone
+      FileUtils.rm_rf(repo_dir)
+      out, err, status = Open3.capture3('git', 'clone', '--quiet', '--no-tags', url, repo_dir)
+      unless status.success?
+        skip "failed to re-clone #{url}: #{err.strip}"
+      end
+      skip "failed to checkout #{commit}" unless system('git', '-C', repo_dir, 'checkout', '--quiet', commit)
+    end
+
     repo_dir
   end
 

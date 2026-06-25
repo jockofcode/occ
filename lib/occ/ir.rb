@@ -148,14 +148,15 @@ module OCC
 
     class Function
       attr_reader :name, :params, :blocks, :return_type
-      attr_accessor :variadic, :static
+      attr_accessor :variadic, :static, :constructor
 
-      def initialize(name, params, return_type, variadic: false, static: false)
+      def initialize(name, params, return_type, variadic: false, static: false, constructor: false)
         @name        = name
         @params      = params   # [{name:, type:}]
         @return_type = return_type
         @variadic    = variadic
         @static      = static
+        @constructor = constructor
         @blocks      = []
       end
 
@@ -301,7 +302,7 @@ module OCC
         logical.each do |lp|
           lp[:nregs].times do |i|
             flat_params << if i.zero?
-                             { name: lp[:name], type: lp[:type] }
+                             { name: lp[:name], type: lp[:ctype] || lp[:type] }
                            else
                              { name: nil, type: 'long' }
                            end
@@ -309,10 +310,18 @@ module OCC
         end
 
         is_static = fn.specifiers.storage == :static
-        @func = Function.new(fn.name, flat_params, ret_type, variadic: variadic, static: is_static)
+        is_ctor   = fn.respond_to?(:constructor) && fn.constructor
+        @func = Function.new(fn.name, flat_params, ret_type, variadic: variadic, static: is_static, constructor: is_ctor)
         @mod.add_function(@func)
         @mod.mark_variadic(fn.name, flat_params.length) if variadic
-        @mod.mark_fp_func(fn.name) if ret_type =~ /\A(float|double|long double)\z/
+        resolved_ret = fn.respond_to?(:resolved_return_type) && fn.resolved_return_type
+        is_fp_ret = if resolved_ret
+                      resolved_ret.is_a?(OCC::Types::FloatingType) ||
+                        (resolved_ret.respond_to?(:unqualified) && resolved_ret.unqualified.is_a?(OCC::Types::FloatingType))
+                    else
+                      ret_type =~ /\A(float|double|long double)\z/
+                    end
+        @mod.mark_fp_func(fn.name) if is_fp_ret
 
         entry = new_block('entry')
         switch_to(entry)
@@ -425,8 +434,23 @@ module OCC
 
         decl.declarators.each do |d|
           # Skip function declarations (no body — these are prototypes).
+          # But register them in func_names so the codegen emits correct function-address
+          # code (not data-load code) when these names appear in expressions.
           type_sample = d[:type_fn]&.call(:base)
-          next if type_sample.is_a?(Hash) && type_sample[:kind] == :function
+          if type_sample.is_a?(Hash) && type_sample[:kind] == :function
+            full_type = d[:type_fn]&.call(base_type) rescue nil
+            if full_type.is_a?(Hash) && full_type[:kind] == :function
+              params = full_type[:params]
+              if params.is_a?(Hash) && params[:variadic]
+                named_count = params[:params]&.length || 0
+                @mod.mark_variadic(d[:name], named_count)
+              end
+              ret = full_type[:return]
+              @mod.mark_fp_func(d[:name]) if ret.is_a?(OCC::Types::FloatingType)
+              @mod.mark_func(d[:name])
+            end
+            next
+          end
 
           # Prefer the type resolved by the semantic analyser (handles typedefs, etc.)
           actual_type = d[:resolved_type] || begin
@@ -578,6 +602,26 @@ module OCC
               addr = new_temp
               emit(AddrOf.new(addr, slot))
               build_initializer_list(addr, d[:init], ctype)
+            elsif d[:init].is_a?(AST::StringLiteral) && ctype.is_a?(OCC::Types::ArrayType)
+              # `const char arr[] = "str"` — copy bytes directly into the stack slot so
+              # AddrOf(slot) gives the correct array base address (not a pointer-to-pointer).
+              bytes = d[:init].value.bytes
+              bytes << 0 unless bytes.empty? || bytes.last == 0  # ensure null terminator
+              # Pad to multiple of 8 for aligned 8-byte stores
+              remainder = bytes.length % 8
+              bytes += Array.new((8 - remainder) % 8, 0) if remainder != 0
+              bytes.each_slice(8).with_index do |chunk, chunk_idx|
+                packed = chunk.each_with_index.reduce(0) { |acc, (b, i)| acc | (b << (i * 8)) }
+                if chunk_idx == 0
+                  emit(Store.new(slot, Const.new(packed), nil, 8))
+                else
+                  base = new_temp
+                  emit(AddrOf.new(base, slot))
+                  ptr = new_temp
+                  emit(Gep.new(ptr, base, Const.new(chunk_idx * 8), 1))
+                  emit(Store.new(ptr, Const.new(packed), nil, 8))
+                end
+              end
             else
               val = build_expr(d[:init])
               emit(Store.new(slot, val))
@@ -995,6 +1039,19 @@ module OCC
             dst = new_temp
             emit(Gep.new(dst, left, neg, esz))
             return dst
+          elsif node.op == :minus && pointer_ctype?(lct) && pointer_ctype?(rct)
+            # Pointer subtraction: (p1 - p2) in elements = byte_diff / element_size
+            esz   = elem_size_for(lct)
+            left  = build_expr(node.left)
+            right = build_expr(node.right)
+            byte_diff = new_temp
+            emit(Binary.new(byte_diff, :minus, left, right))
+            if esz > 1
+              dst = new_temp
+              emit(Binary.new(dst, :slash, byte_diff, Const.new(esz)))
+              return dst
+            end
+            return byte_diff
           end
         end
 
@@ -1045,6 +1102,12 @@ module OCC
         return false unless ct
         inner = ct.respond_to?(:unqualified) ? ct.unqualified : ct
         inner.is_a?(OCC::Types::PointerType) || inner.is_a?(OCC::Types::ArrayType)
+      end
+
+      def fp_type?(ct)
+        return false unless ct
+        inner = ct.respond_to?(:unqualified) ? ct.unqualified : ct
+        inner.is_a?(OCC::Types::FloatingType)
       end
 
       # Compile `a && b` with short-circuit: if a is false, result = 0 without evaluating b.
@@ -1125,10 +1188,13 @@ module OCC
         when :deref
           ptr = build_expr(node.operand)
           pointed_ct = node.operand.ctype.is_a?(OCC::Types::PointerType) ? node.operand.ctype.base : nil
-          # Dereferencing a pointer to an array or struct yields the storage
-          # address itself; loading would only read 8 bytes of a wider value.
+          # Dereferencing a pointer to an array, struct, or function type yields
+          # the storage/function address itself — no Load needed.
+          # For functions: *fp == fp in C; loading from a function address would
+          # read instruction bytes as data, producing a garbage function pointer.
           if pointed_ct.is_a?(OCC::Types::ArrayType) ||
-             pointed_ct.is_a?(OCC::Types::StructType)
+             pointed_ct.is_a?(OCC::Types::StructType) ||
+             pointed_ct.is_a?(OCC::Types::FunctionType)
             return ptr
           end
           elem_sz = elem_size_for(node.operand.ctype)
@@ -1275,10 +1341,25 @@ module OCC
       def build_assign(node)
         val = build_expr(node.value)
 
+        # For compound assignment to a deref target (*ptr op= val), build the
+        # pointer ONCE and reuse it for both the load and the store. Without
+        # this, operands with side effects (e.g. *w++ += x) are evaluated
+        # twice, advancing the pointer twice.
+        saved_deref_ptr = nil
+        saved_deref_esz = nil
+
         if node.op != :assign
-          # Compound assignment: load, op, store
-          old = build_expr(node.target)
           op  = node.op.to_s.sub('_assign', '').to_sym
+          # Load old value from lvalue
+          old = if node.target.is_a?(AST::UnaryOp) && node.target.op == :deref
+                  saved_deref_esz = elem_size_for(node.target.operand.ctype)
+                  saved_deref_ptr = build_expr(node.target.operand)
+                  t = new_temp
+                  emit(Load.new(t, saved_deref_ptr, node.target.ctype, saved_deref_esz))
+                  t
+                else
+                  build_expr(node.target)
+                end
           result = new_temp
           tct = node.target.ctype
           if pointer_ctype?(tct) && (op == :plus || op == :minus)
@@ -1303,20 +1384,40 @@ module OCC
           val = result
         end
 
+        # Implicit integer → float/double conversion when assigning to an FP lvalue.
+        if node.op == :assign
+          tgt_ct = node.target.ctype
+          val_ct  = node.value.ctype
+          if fp_type?(tgt_ct) && val_ct && !fp_type?(val_ct) && !pointer_ctype?(val_ct)
+            cast_t = new_temp
+            emit(Cast.new(cast_t, val, val_ct, tgt_ct))
+            val = cast_t
+          end
+        end
+
         # Store to lvalue
         case node.target
         when AST::Identifier
           slot = @locals[node.target.name]
+          tgt_ct = node.target.ctype
+          # If the target is a struct/union, pass its byte size so the codegen
+          # knows to copy the struct bytes from the source address, not store
+          # the source address itself.
+          struct_sz = if tgt_ct.is_a?(OCC::Types::StructType) && tgt_ct.complete?
+                        tgt_ct.size rescue nil
+                      end
+          esz = struct_sz || 8
           if slot
-            emit(Store.new(slot, val))
+            emit(Store.new(slot, val, tgt_ct, esz))
           else
-            emit(Store.new(GlobalRef.new(global_name_for(node.target.name)), val))
+            emit(Store.new(GlobalRef.new(global_name_for(node.target.name)), val, tgt_ct, esz))
           end
         when AST::UnaryOp
           if node.target.op == :deref
-            ptr = build_expr(node.target.operand)
-            elem_sz = elem_size_for(node.target.operand.ctype)
-            emit(Store.new(ptr, val, nil, elem_sz))
+            ptr     = saved_deref_ptr || build_expr(node.target.operand)
+            elem_sz = saved_deref_esz || elem_size_for(node.target.operand.ctype)
+            val_ct  = node.value.respond_to?(:ctype) ? node.value.ctype : nil
+            emit(Store.new(ptr, val, val_ct, elem_sz))
           end
         when AST::IndexExpr
           arr    = build_expr(node.target.array)
@@ -1324,7 +1425,8 @@ module OCC
           elem_sz = elem_size_for(node.target.array.ctype)
           ptr    = new_temp
           emit(Gep.new(ptr, arr, idx, elem_sz))
-          emit(Store.new(ptr, val, nil, elem_sz))
+          val_ct  = node.value.respond_to?(:ctype) ? node.value.ctype : nil
+          emit(Store.new(ptr, val, val_ct, elem_sz))
         when AST::MemberExpr
           bf = bitfield_info(node.target)
           if bf
@@ -1392,7 +1494,7 @@ module OCC
       # struct-by-value arguments up to 16 bytes, load each 8-byte half into
       # its own temp and pass them as consecutive arguments per AAPCS64.
       def build_call_arg(arg_node)
-        ct = arg_node.ctype
+        ct = arg_node.respond_to?(:ctype) ? arg_node.ctype : nil
         if ct.is_a?(OCC::Types::StructType) && ct.complete? &&
            (sz = (ct.size rescue 0)) > 0 && sz <= 16
           addr  = build_expr(arg_node)

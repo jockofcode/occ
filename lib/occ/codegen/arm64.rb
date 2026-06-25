@@ -51,16 +51,25 @@ module OCC
           if init.is_a?(Hash) && init[:kind] == :initializer_list
             emit_compound_global(name, g, init)
           elsif init.is_a?(Hash) && init[:kind] == :string
-            # String pointer: emit the string in __cstring then a pointer in __data
-            str_lbl = "l_gstr_#{name}"
-            emit '.section __TEXT,__cstring,cstring_literals'
-            emit "#{str_lbl}:"
-            emit "  .asciz #{asm_string(init[:value])}"
-            emit '.section __DATA,__data'
-            emit ".globl #{sym(name)}"
-            emit '.p2align 3'
-            emit "#{sym(name)}:"
-            emit "  .quad #{str_lbl}"
+            if g[:type].is_a?(OCC::Types::ArrayType)
+              # char arr[] = "str": emit string bytes inline at the global symbol.
+              # Using __TEXT,__const avoids cstring merging which breaks embedded nulls.
+              emit '.section __TEXT,__const'
+              emit ".globl #{sym(name)}"
+              emit "#{sym(name)}:"
+              emit "  .asciz #{asm_string(init[:value])}"
+            else
+              # char *ptr = "str": emit cstring then a pointer to it in __data
+              str_lbl = "l_gstr_#{name}"
+              emit '.section __TEXT,__cstring,cstring_literals'
+              emit "#{str_lbl}:"
+              emit "  .asciz #{asm_string(init[:value])}"
+              emit '.section __DATA,__data'
+              emit ".globl #{sym(name)}"
+              emit '.p2align 3'
+              emit "#{sym(name)}:"
+              emit "  .quad #{str_lbl}"
+            end
           elsif init.is_a?(Float)
             sz = type_byte_size(g[:type])
             emit '.section __DATA,__data'
@@ -163,6 +172,8 @@ module OCC
           field_off = field[:offset]
           ft = field[:type]
           fsz = type_byte_size(ft)
+
+          next if field_off < cur_off
 
           if field_off > cur_off
             emit "  .zero #{field_off - cur_off}"
@@ -283,10 +294,10 @@ module OCC
         func.params.each_with_index do |p, idx|
           slot = alloc_slot_for(IR::Temp.new(idx))
           if fp_ctype?(p[:type])
-            emit "  str d#{fp_idx}, [x29, ##{slot}]"
+            emit_fp_slot_store("d#{fp_idx}", slot)
             fp_idx += 1
           elsif int_idx < ARG_REGS.length
-            emit "  str #{ARG_REGS[int_idx]}, [x29, ##{slot}]"
+            emit_slot_store(ARG_REGS[int_idx], slot)
             int_idx += 1
           end
         end
@@ -300,6 +311,15 @@ module OCC
             emit "#{entry[:label]}:"
             emit "  .double #{entry[:value]}"
           end
+        end
+
+        # __attribute__((constructor)): register function in __mod_init_func so
+        # the dynamic linker calls it before main().
+        if func.constructor
+          emit '.section __DATA,__mod_init_func,mod_init_funcs'
+          emit '.p2align 3'
+          emit "  .quad #{name}"
+          emit '.section __TEXT,__text'
         end
 
         emit_blank
@@ -389,10 +409,10 @@ module OCC
         when IR::Temp
           slot = slot_of(op)
           if @fp_temps.include?(op.id)
-            emit "  ldr #{dreg}, [x29, ##{slot}]"
+            emit_fp_slot_load(dreg, slot)
           else
             # Integer temp used in FP context — convert
-            emit "  ldr x9, [x29, ##{slot}]"
+            emit_slot_load('x9', slot)
             emit "  scvtf #{dreg}, x9"
           end
         when IR::GlobalRef
@@ -404,7 +424,7 @@ module OCC
       # Store an FP register (dreg) to a temp's stack slot and mark it FP.
       def store_fp_temp(temp, dreg)
         slot = alloc_slot_for(temp)
-        emit "  str #{dreg}, [x29, ##{slot}]"
+        emit_fp_slot_store(dreg, slot)
         @fp_temps << temp.id
       end
 
@@ -427,7 +447,7 @@ module OCC
         when IR::Load
           if instr.ptr.is_a?(IR::Temp) && @alloca_slots.include?(instr.ptr.id)
             if @fp_alloca_slots.include?(instr.ptr.id)
-              emit "  ldr d10, [x29, ##{slot_of(instr.ptr)}]"
+              emit_fp_slot_load('d10', slot_of(instr.ptr))
               store_fp_temp(instr.dst, 'd10')
             else
               # Use a width-appropriate load to avoid reading garbage in upper bytes
@@ -438,7 +458,7 @@ module OCC
                 signed = alloca_ct.signed?
                 emit_alloca_load(slot_of(instr.ptr), alloca_sz, signed)
               else
-                emit "  ldr x10, [x29, ##{slot_of(instr.ptr)}]"
+                emit_slot_load('x10', slot_of(instr.ptr))
               end
               store_temp(instr.dst, 'x10')
             end
@@ -466,16 +486,33 @@ module OCC
           if instr.ptr.is_a?(IR::Temp) && @alloca_slots.include?(instr.ptr.id)
             if @fp_alloca_slots.include?(instr.ptr.id) || fp_operand?(instr.value)
               load_fp_operand(instr.value, 'd9')
-              emit "  str d9, [x29, ##{slot_of(instr.ptr)}]"
+              emit_fp_slot_store('d9', slot_of(instr.ptr))
               @fp_alloca_slots << instr.ptr.id  # mark slot as FP once we store FP into it
-            elsif instr.elem_size > 8
+            elsif instr.elem_size.to_i > 8
               # Large struct copy into local slot: x9 = source addr, x10 = dest addr
               load_operand(instr.value, 'x9')
               emit_addr_from_fp('x10', slot_of(instr.ptr))
               emit_struct_copy('x9', 'x10', instr.elem_size)
+            elsif instr.type.is_a?(OCC::Types::StructType) && instr.elem_size.to_i.between?(1, 8)
+              # Small struct copy (1–8 bytes): source is a struct address temp.
+              # Load the struct bytes from that address, then write to local slot.
+              load_operand(instr.value, 'x9')
+              slot = slot_of(instr.ptr)
+              if instr.elem_size <= 4
+                emit '  ldr w10, [x9]'
+                if slot <= 32_760
+                  emit "  str w10, [x29, ##{slot}]"
+                else
+                  emit_addr_from_fp('x16', slot)
+                  emit '  str w10, [x16]'
+                end
+              else
+                emit '  ldr x10, [x9]'
+                emit_slot_store('x10', slot)
+              end
             else
               load_operand(instr.value, 'x9')
-              emit "  str x9, [x29, ##{slot_of(instr.ptr)}]"
+              emit_slot_store('x9', slot_of(instr.ptr))
             end
           else
             fp_field = fp_ctype?(instr.type) if instr.type
@@ -488,11 +525,20 @@ module OCC
             case instr.ptr
             when IR::Temp
               ptr_slot = slot_of(instr.ptr)
-              emit "  ldr x10, [x29, ##{ptr_slot}]"
+              emit_slot_load('x10', ptr_slot)
               if fp_val
                 emit '  str d9, [x10]'
               elsif instr.elem_size > 8
                 emit_struct_copy('x9', 'x10', instr.elem_size)
+              elsif instr.type.is_a?(OCC::Types::StructType) && instr.elem_size.to_i.between?(1, 8)
+                # x9 = source struct address; dereference to copy struct bytes to dest
+                if instr.elem_size <= 4
+                  emit '  ldr w11, [x9]'
+                  emit '  str w11, [x10]'
+                else
+                  emit '  ldr x11, [x9]'
+                  emit '  str x11, [x10]'
+                end
               else
                 case instr.elem_size
                 when 1 then emit '  strb w9, [x10]'
@@ -508,6 +554,14 @@ module OCC
                 emit '  str d9, [x10]'
               elsif instr.elem_size > 8
                 emit_struct_copy('x9', 'x10', instr.elem_size)
+              elsif instr.type.is_a?(OCC::Types::StructType) && instr.elem_size.to_i.between?(1, 8)
+                if instr.elem_size <= 4
+                  emit '  ldr w11, [x9]'
+                  emit '  str w11, [x10]'
+                else
+                  emit '  ldr x11, [x9]'
+                  emit '  str x11, [x10]'
+                end
               else
                 case instr.elem_size
                 when 1 then emit '  strb w9, [x10]'
@@ -602,7 +656,11 @@ module OCC
           emit '  ret'
 
         when IR::Cast
-          if fp_operand?(instr.src) && !fp_ctype?(instr.type)
+          if fp_operand?(instr.src) && fp_ctype?(instr.type)
+            # FP → FP: float→double widening or no-op
+            load_fp_operand(instr.src, 'd9')
+            store_fp_temp(instr.dst, 'd9')
+          elsif fp_operand?(instr.src) && !fp_ctype?(instr.type)
             # FP → integer truncation
             load_fp_operand(instr.src, 'd9')
             emit '  fcvtzs x9, d9'
@@ -812,6 +870,16 @@ module OCC
         if @mod.fp_funcs.include?(func_name) || fp_ctype?(instr.type)
           store_fp_temp(instr.dst, 'd0')
         else
+          # Sign-extend narrow signed int returns: external C functions (libc) place int/short/char
+          # in w0/h0/b0 which zeroes x0's upper bits; occ-compiled functions use full 64-bit x0.
+          # sxtw/sxth/sxtb normalises both cases to a consistent 64-bit signed value on the stack.
+          if instr.type.is_a?(OCC::Types::IntegerType) && instr.type.signed? && instr.type.size < 8
+            case instr.type.size
+            when 4 then emit '  sxtw x0, w0'
+            when 2 then emit '  sxth x0, w0'
+            when 1 then emit '  sxtb x0, w0'
+            end
+          end
           store_temp(instr.dst, 'x0')
         end
       end
@@ -853,6 +921,44 @@ module OCC
       end
 
       def slot_of(temp) = alloc_slot_for(temp)
+
+      # ldr/str [x29, #N] encodes N as a scaled unsigned 12-bit immediate (0..32760 for 8-byte).
+      # For larger offsets, compute the address explicitly using x16 (intra-procedure scratch).
+      def emit_slot_load(reg, slot)
+        if slot <= 32_760
+          emit "  ldr #{reg}, [x29, ##{slot}]"
+        else
+          emit_addr_from_fp('x16', slot)
+          emit "  ldr #{reg}, [x16]"
+        end
+      end
+
+      def emit_slot_store(reg, slot)
+        if slot <= 32_760
+          emit "  str #{reg}, [x29, ##{slot}]"
+        else
+          emit_addr_from_fp('x16', slot)
+          emit "  str #{reg}, [x16]"
+        end
+      end
+
+      def emit_fp_slot_load(reg, slot)
+        if slot <= 32_760
+          emit "  ldr #{reg}, [x29, ##{slot}]"
+        else
+          emit_addr_from_fp('x16', slot)
+          emit "  ldr #{reg}, [x16]"
+        end
+      end
+
+      def emit_fp_slot_store(reg, slot)
+        if slot <= 32_760
+          emit "  str #{reg}, [x29, ##{slot}]"
+        else
+          emit_addr_from_fp('x16', slot)
+          emit "  str #{reg}, [x16]"
+        end
+      end
 
       # Emit `reg = x29 + offset`, handling offsets > 4095 (ARM64 add-imm limit).
       def emit_addr_from_fp(reg, offset)
@@ -903,7 +1009,7 @@ module OCC
           end
         when IR::Temp
           slot = slot_of(op)
-          emit "  ldr #{reg}, [x29, ##{slot}]"
+          emit_slot_load(reg, slot)
         when IR::GlobalRef
           if @mod.func_names.include?(op.name)
             if @mod.defined_funcs.include?(op.name)
@@ -933,7 +1039,7 @@ module OCC
 
       def store_temp(temp, reg)
         slot = alloc_slot_for(temp)
-        emit "  str #{reg}, [x29, ##{slot}]"
+        emit_slot_store(reg, slot)
       end
 
       def emit_struct_copy(src, dst, size)

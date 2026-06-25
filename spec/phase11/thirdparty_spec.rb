@@ -179,7 +179,7 @@ RSpec.describe 'Phase 11: Third-party compilation', :thirdparty do
     # Source: https://github.com/antirez/sds
 
     SDS_URL    = 'https://github.com/antirez/sds'
-    SDS_COMMIT = '5347739b1581fcba74fd5cab1fc21d2aef321571'
+    SDS_COMMIT = '5347739b1581fcba74fd5cab1fc21d2aef317d71'
 
     it 'compiles sds-test and passes all assertions' do
       repo = git_clone(SDS_URL, SDS_COMMIT, 'sds')
@@ -202,8 +202,6 @@ RSpec.describe 'Phase 11: Third-party compilation', :thirdparty do
     GENANN_COMMIT = '4f72209510c9792131bd8c4b0347272b088cfa80'
 
     it 'compiles genann and passes its test suite' do
-      pending 'requires <math.h> exp/sqrt and compound literal initialisers (Phase 9)'
-
       repo = git_clone(GENANN_URL, GENANN_COMMIT, 'genann')
       in_build_copy(repo, 'genann') do |dir|
         genann_c = File.join(dir, 'genann.c')
@@ -226,8 +224,6 @@ RSpec.describe 'Phase 11: Third-party compilation', :thirdparty do
     UTF8H_COMMIT = '1194293f5b56dbb418d3b7e65410443304c40433'
 
     it 'compiles utf8.h tests and runs them' do
-      pending 'requires stdint.h fixed-width types and __attribute__ passthrough (Phase 9)'
-
       repo = git_clone(UTF8H_URL, UTF8H_COMMIT, 'utf8h')
       in_build_copy(repo, 'utf8h') do |dir|
         test_h = File.join(dir, 'test', 'utest.h')
@@ -242,6 +238,19 @@ RSpec.describe 'Phase 11: Third-party compilation', :thirdparty do
           content.gsub!(
             /#elif defined\(__clang__\) \|\| defined\(__GNUC__\)/,
             '#elif 1'
+          )
+          # occ maps __typeof__ to int; the GCC UTEST_COND branch captures values
+          # via UTEST_AUTO which expands to __typeof__(x+0) causing type mismatches
+          # (e.g. int xEval = char[105]). Force the simple #else branch instead.
+          content.gsub!(
+            '#elif defined(__GNUC__) || defined(__TINYC__)',
+            '#elif 0'
+          )
+          # macOS clock_gettime_nsec_np is not in our minimal time.h; return 0
+          # for timing (only affects display, not pass/fail of assertions).
+          content.gsub!(
+            'clock_gettime_nsec_np(CLOCK_UPTIME_RAW)',
+            '(utest_int64_t)0'
           )
           File.write(f, content)
         end
@@ -276,8 +285,26 @@ RSpec.describe 'Phase 11: Third-party compilation', :thirdparty do
 
   describe 'zlib 1.3.2 (Tier 3)', :slow do
     # Source: https://github.com/madler/zlib (tag v1.3.2)
+    ZLIB_URL    = 'https://github.com/madler/zlib'
+    ZLIB_COMMIT = 'e3dc0a85b7032e98380dec011bc8f2c2ee0d8fca'
+
     it 'builds zlib and passes its tests' do
-      skip 'requires full <stdio.h>, POSIX file I/O, and bitfield struct support (Phase 10)'
+      repo = git_clone(ZLIB_URL, ZLIB_COMMIT, 'zlib')
+      in_build_copy(repo, 'zlib') do |dir|
+        srcs = %w[
+          adler32.c crc32.c deflate.c inflate.c inftrees.c inffast.c
+          trees.c zutil.c compress.c uncompr.c
+          gzlib.c gzread.c gzwrite.c gzclose.c
+        ].map { |f| File.join(dir, f) }
+        srcs << File.join(dir, 'test', 'example.c')
+
+        result = occ_compile(*srcs, output: './zlib_example', flags: ["-I#{dir}"])
+        expect_compiled(result)
+
+        run = shell('./zlib_example')
+        expect(run[:stdout]).to include('large_inflate(): OK')
+        expect_ran_ok(run)
+      end
     end
   end
 

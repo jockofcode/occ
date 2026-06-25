@@ -412,7 +412,7 @@ module OCC
                                SourceLocation.new(from_file, lineno, 1))
       end
 
-      content = File.read(path)
+      content = File.binread(path).force_encoding('UTF-8')
 
       # Handle #pragma once at the top of the file
       if content.lstrip.start_with?('#pragma once') ||
@@ -582,8 +582,15 @@ module OCC
               # Consume argument list
               k     = text.index('(', j)
               args, after = consume_arguments(text, k + 1)
-              replacement = expand_function_macro(macro, args, name)
-              result << replacement
+              # __attribute__((constructor)) → __occ_constructor so codegen can
+              # emit the function address in __mod_init_func.
+              if (name == '__attribute__' || name == '__attribute') &&
+                 args.first.to_s.strip.match?(/^\(\s*constructor\s*\)$/)
+                result << '__occ_constructor'
+              else
+                replacement = expand_function_macro(macro, args, name)
+                result << replacement
+              end
               i = after
             elsif macro[:kind] == :object
               result << macro[:body]
