@@ -4,6 +4,7 @@
 #include <sys/types.h>
 
 typedef void (*sighandler_t)(int);
+typedef int sig_atomic_t;
 
 /* Standard signals */
 #define SIGHUP    1

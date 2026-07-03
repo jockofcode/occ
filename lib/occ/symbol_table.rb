@@ -3,7 +3,7 @@
 module OCC
   # Scoped symbol table. Each scope is a Hash; scopes stack.
   class SymbolTable
-    Symbol = Struct.new(:name, :type, :kind, :location) # kind: :var, :func, :typedef, :enum_const
+    Symbol = Struct.new(:name, :type, :kind, :location, :value) # kind: :var, :func, :typedef, :enum_const
 
     def initialize
       @scopes = [{}]   # global scope
@@ -17,8 +17,8 @@ module OCC
       @scopes.pop
     end
 
-    def define(name, type:, kind:, location: nil)
-      @scopes.last[name] = Symbol.new(name, type, kind, location)
+    def define(name, type:, kind:, location: nil, value: nil)
+      @scopes.last[name] = Symbol.new(name, type, kind, location, value)
     end
 
     def lookup(name)

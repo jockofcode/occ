@@ -28,6 +28,11 @@ extern FILE *stderr;
 #define FILENAME_MAX 4096
 #define FOPEN_MAX    20
 
+/* setvbuf mode constants */
+#define _IOFBF  0
+#define _IOLBF  1
+#define _IONBF  2
+
 /* Formatted output */
 extern int printf(const char *fmt, ...);
 extern int fprintf(FILE *stream, const char *fmt, ...);
@@ -62,6 +67,8 @@ extern FILE *fopen(const char *path, const char *mode);
 extern FILE *freopen(const char *path, const char *mode, FILE *stream);
 extern int   fclose(FILE *stream);
 extern int   fflush(FILE *stream);
+extern int   setvbuf(FILE *stream, char *buf, int mode, size_t size);
+extern void  setbuf(FILE *stream, char *buf);
 extern size_t fread(void *ptr, size_t size, size_t nmemb, FILE *stream);
 extern size_t fwrite(const void *ptr, size_t size, size_t nmemb, FILE *stream);
 extern int   fseek(FILE *stream, long offset, int whence);

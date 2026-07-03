@@ -309,7 +309,6 @@ module OCC
       when 'b'  then advance; "\b"
       when 'f'  then advance; "\f"
       when 'v'  then advance; "\v"
-      when '0'  then advance; "\0"
       when '\\' then advance; "\\"
       when "'"  then advance; "'"
       when '"'  then advance; '"'

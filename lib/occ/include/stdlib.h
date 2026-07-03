@@ -63,6 +63,7 @@ extern int   rand(void);
 extern void  srand(unsigned int seed);
 extern long  random(void);
 extern void  srandom(unsigned int seed);
+extern void  srandomdev(void);
 
 /* Multibyte / wide char (stubs) */
 extern int   mblen(const char *s, size_t n);

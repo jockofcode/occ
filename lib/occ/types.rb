@@ -162,13 +162,16 @@ module OCC
 
       def size
         return raise TypeError, "incomplete #{@keyword} #{@tag}" unless complete?
-        if @keyword == :kw_union
+        raw = if @keyword == :kw_union
           @fields.map { |f| f[:type].size rescue 0 }.max || 0
         else
           # Flexible array members (unsized arrays) contribute 0 to struct size — exclude them.
           sized = @fields.reject { |f| f[:type].is_a?(ArrayType) && f[:type].count.nil? }
           sized.last ? sized.last[:offset] + sized.last[:type].size : 0
         end
+        # Add tail padding so sizeof(struct/union) is a multiple of its alignment (C standard).
+        al = self.align
+        al > 1 ? ((raw + al - 1) / al * al) : raw
       end
 
       def align
@@ -291,8 +294,9 @@ module OCC
       when ['long', 'unsigned'],
            ['int', 'long', 'unsigned']      then ULONG
       when ['long', 'long'], ['int', 'long', 'long'],
-           ['long', 'long', 'signed']       then LONGLONG
-      when ['long', 'long', 'unsigned']     then ULONGLONG
+           ['long', 'long', 'signed'], ['int', 'long', 'long', 'signed'] then LONGLONG
+      when ['long', 'long', 'unsigned'],
+           ['int', 'long', 'long', 'unsigned']                           then ULONGLONG
       when ['double', 'float']              then raise TypeError, 'invalid type'
       when ['float']                        then FLOAT
       when ['double']                       then DOUBLE

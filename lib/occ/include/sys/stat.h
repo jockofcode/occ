@@ -2,6 +2,7 @@
 #define _OCC_SYS_STAT_H
 
 #include <sys/types.h>
+#include <time.h>
 
 struct stat {
     dev_t     st_dev;
@@ -14,6 +15,9 @@ struct stat {
     off_t     st_size;
     blksize_t st_blksize;
     blkcnt_t  st_blocks;
+    struct timespec st_atimespec;
+    struct timespec st_mtimespec;
+    struct timespec st_ctimespec;
     long      st_atime;
     long      st_mtime;
     long      st_ctime;
@@ -51,5 +55,7 @@ extern int fstat(int fd, struct stat *buf);
 extern int lstat(const char *path, struct stat *buf);
 extern int mkdir(const char *path, mode_t mode);
 extern int chmod(const char *path, mode_t mode);
+extern int fchmod(int fd, mode_t mode);
+extern mode_t umask(mode_t mask);
 
 #endif /* _OCC_SYS_STAT_H */

@@ -270,16 +270,139 @@ RSpec.describe 'Phase 11: Third-party compilation', :thirdparty do
   # Documented here as aspirational targets.
 
   describe 'linenoise — readline replacement (Tier 3)', :slow do
-    # Source: https://github.com/antirez/linenoise (tag 2.0)
+    # Source: https://github.com/antirez/linenoise
+    LINENOISE_URL    = 'https://github.com/antirez/linenoise'
+    LINENOISE_COMMIT = 'a473823d74b93eab2ba83480df16ed37617493f2'
+
     it 'compiles and runs linenoise tests' do
-      skip 'requires POSIX termios, ioctl, and full <unistd.h> support (Phase 10)'
+      repo = git_clone(LINENOISE_URL, LINENOISE_COMMIT, 'linenoise')
+      in_build_copy(repo, 'linenoise') do |dir|
+        # Build the example binary that the test harness spawns as a child process.
+        example_result = occ_compile(
+          File.join(dir, 'linenoise.c'),
+          File.join(dir, 'example.c'),
+          output: './linenoise-example',
+          flags: ["-I#{dir}"]
+        )
+        expect_compiled(example_result)
+
+        # Build the test harness itself.
+        test_result = occ_compile(
+          File.join(dir, 'linenoise.c'),
+          File.join(dir, 'linenoise-test.c'),
+          output: './linenoise_test',
+          flags: ["-I#{dir}"]
+        )
+        expect_compiled(test_result)
+
+        run = shell('./linenoise_test')
+        expect(run[:stdout]).to include('Tests passed:')
+        expect(run[:stdout]).not_to match(/Tests failed:\s*[1-9]/)
+        expect_ran_ok(run)
+      end
     end
   end
 
   describe 'lua 5.5 (Tier 3)', :slow do
     # Source: https://lua.org/ftp/lua-5.5.0.tar.gz
+    # Cached in tmp/thirdparty_cache/lua55/src/
+
+    LUA55_SRC_DIR = File.join(ThirdpartyHelper::CACHE_DIR, 'lua55', 'src')
+
+    LUA55_SRCS = %w[
+      lapi.c lcode.c lctype.c ldebug.c ldo.c ldump.c lfunc.c lgc.c linit.c
+      llex.c lmem.c lobject.c lopcodes.c lparser.c lstate.c lstring.c ltable.c
+      ltm.c lundump.c lvm.c lzio.c
+      lauxlib.c lbaselib.c lcorolib.c ldblib.c liolib.c lmathlib.c loslib.c
+      lstrlib.c ltablib.c lutf8lib.c loadlib.c lua.c
+    ].freeze
+
     it 'builds the Lua interpreter from source' do
-      skip 'requires full C standard library, va_list, longjmp, and complex macros (Phase 10)'
+      skip 'lua55 source not cached' unless File.directory?(LUA55_SRC_DIR)
+
+      in_build_copy(LUA55_SRC_DIR, 'lua55') do |dir|
+        sources = LUA55_SRCS.map { |f| File.join(dir, f) }
+        result = occ_compile(*sources,
+                             output: './lua55',
+                             flags: ["-I#{dir}", '-D', 'LUA_USE_JUMPTABLE=0'])
+        expect_compiled(result)
+
+        # Basic sanity: print and arithmetic
+        run = shell('./lua55', '-e', 'print(1+2)')
+        expect(run[:stdout].strip).to eq('3')
+        expect_ran_ok(run)
+
+        # Closures with upvalue arithmetic (regression: freereg underflow)
+        run = shell('./lua55', '-e', <<~LUA)
+          local x = 10
+          local f = function() return x + 5 end
+          assert(f() == 15)
+          print("closures ok")
+        LUA
+        expect(run[:stdout].strip).to eq('closures ok')
+        expect_ran_ok(run)
+
+        # Metamethods __add (regression: 9-arg stack passing bug)
+        run = shell('./lua55', '-e', <<~LUA)
+          local mt = {}
+          mt.__add = function(a, b) return setmetatable({v = a.v + b.v}, mt) end
+          local a = setmetatable({v=10}, mt)
+          local b = setmetatable({v=32}, mt)
+          local c = a + b
+          assert(c.v == 42, "expected 42, got " .. tostring(c.v))
+          print("metamethods ok")
+        LUA
+        expect(run[:stdout].strip).to eq('metamethods ok')
+        expect_ran_ok(run)
+
+        # OOP with metatables
+        run = shell('./lua55', '-e', <<~LUA)
+          local Vec = {}
+          Vec.__index = Vec
+          function Vec.new(x,y) return setmetatable({x=x,y=y},Vec) end
+          function Vec:__add(o) return Vec.new(self.x+o.x, self.y+o.y) end
+          local v = Vec.new(1,2) + Vec.new(3,4)
+          assert(v.x==4 and v.y==6)
+          print("oop ok")
+        LUA
+        expect(run[:stdout].strip).to eq('oop ok')
+        expect_ran_ok(run)
+
+        # Standard library checks
+        run = shell('./lua55', '-e', <<~LUA)
+          assert(math.abs(-5) == 5)
+          assert(string.upper("hello") == "HELLO")
+          assert(table.concat({1,2,3}, ",") == "1,2,3")
+          assert(#"test" == 4)
+          print("stdlib ok")
+        LUA
+        expect(run[:stdout].strip).to eq('stdlib ok')
+        expect_ran_ok(run)
+
+        # string.pack float (regression: float alloca slots stored double bytes)
+        run = shell('./lua55', '-e', <<~LUA)
+          local s = string.pack('<f', -1.5)
+          assert(#s == 4, "wrong length: " .. #s)
+          local b1,b2,b3,b4 = string.byte(s,1,4)
+          assert(b1==0 and b2==0 and b3==0xc0 and b4==0xbf,
+            string.format("wrong bytes: %02x %02x %02x %02x", b1, b2, b3, b4))
+          local v = string.unpack('<f', s)
+          assert(math.abs(v - (-1.5)) < 1e-6, "unpack mismatch: " .. v)
+          print("string.pack float ok")
+        LUA
+        expect(run[:stdout].strip).to eq('string.pack float ok')
+        expect_ran_ok(run)
+
+        # Full tpack.lua from the official Lua 5.5 test suite
+        tpack_src = File.join(ThirdpartyHelper::CACHE_DIR, 'lua_tests', 'testes', 'tpack.lua')
+        if File.exist?(tpack_src)
+          FileUtils.cp(tpack_src, './tpack.lua')
+          run = shell('./lua55', 'tpack.lua')
+          expect(run[:stdout]).to include('OK'),
+            "tpack.lua failed:\nSTDOUT: #{run[:stdout]}\nSTDERR: #{run[:stderr]}"
+          expect_ran_ok(run)
+        end
+      end
     end
   end
 
@@ -308,10 +431,97 @@ RSpec.describe 'Phase 11: Third-party compilation', :thirdparty do
     end
   end
 
-  describe 'sqlite (Tier 3)', :slow do
-    # Source: https://github.com/sqlite/sqlite
-    it 'compiles the sqlite amalgamation' do
-      skip 'requires near-complete C11, complex macros, and va_list (Phase 10)'
+  describe 'sqlite 3.47.2 (Tier 3)', :slow do
+    # Source: https://sqlite.org/2024/sqlite-amalgamation-3470200.zip
+    # Download the amalgamation zip and extract sqlite3.c and sqlite3.h into
+    # tmp/thirdparty_cache/sqlite/ to run this test.
+
+    it 'compiles the sqlite amalgamation and passes basic SQL tests' do
+      dir = File.join(ThirdpartyHelper::CACHE_DIR, 'sqlite')
+      sqlite3_c = File.join(dir, 'sqlite3.c')
+      sqlite3_h_dir = dir
+
+      skip 'sqlite amalgamation not in tmp/thirdparty_cache/sqlite/' unless File.exist?(sqlite3_c)
+
+      Dir.mktmpdir('occ_sqlite_') do |tmp|
+        test_src = File.join(tmp, 'sqlite_test.c')
+        File.write(test_src, <<~'C')
+          #include "sqlite3.h"
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+
+          static int count_rows(void *n, int argc, char **argv, char **col) {
+            (*(int*)n)++;
+            return 0;
+          }
+
+          int main(void) {
+            sqlite3 *db;
+            char *errmsg = 0;
+            int rc, rows;
+
+            rc = sqlite3_open(":memory:", &db);
+            if (rc != SQLITE_OK) { printf("FAIL open rc=%d\n", rc); return 1; }
+
+            rc = sqlite3_exec(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, val REAL);", 0, 0, &errmsg);
+            if (rc != SQLITE_OK) { printf("FAIL create rc=%d\n", rc); return 1; }
+
+            rc = sqlite3_exec(db,
+              "INSERT INTO t VALUES (1,'alice',1.5);"
+              "INSERT INTO t VALUES (2,'bob',2.5);"
+              "INSERT INTO t VALUES (3,'carol',3.5);",
+              0, 0, &errmsg);
+            if (rc != SQLITE_OK) { printf("FAIL insert rc=%d\n", rc); return 1; }
+
+            rows = 0;
+            rc = sqlite3_exec(db, "SELECT * FROM t;", count_rows, &rows, &errmsg);
+            if (rc != SQLITE_OK || rows != 3) { printf("FAIL select all rc=%d rows=%d\n", rc, rows); return 1; }
+
+            rows = 0;
+            rc = sqlite3_exec(db, "SELECT * FROM t WHERE id > 1;", count_rows, &rows, &errmsg);
+            if (rc != SQLITE_OK || rows != 2) { printf("FAIL select where rc=%d rows=%d\n", rc, rows); return 1; }
+
+            rc = sqlite3_exec(db, "UPDATE t SET val=99.9 WHERE id=2;", 0, 0, &errmsg);
+            if (rc != SQLITE_OK) { printf("FAIL update rc=%d\n", rc); return 1; }
+
+            rc = sqlite3_exec(db, "DELETE FROM t WHERE id=3;", 0, 0, &errmsg);
+            if (rc != SQLITE_OK) { printf("FAIL delete rc=%d\n", rc); return 1; }
+
+            rc = sqlite3_exec(db, "BEGIN; INSERT INTO t VALUES (10,'x',0.0); COMMIT;", 0, 0, &errmsg);
+            if (rc != SQLITE_OK) { printf("FAIL txn commit rc=%d\n", rc); return 1; }
+
+            rc = sqlite3_exec(db, "BEGIN; INSERT INTO t VALUES (20,'y',0.0); ROLLBACK;", 0, 0, &errmsg);
+            if (rc != SQLITE_OK) { printf("FAIL txn rollback rc=%d\n", rc); return 1; }
+            rows = 0;
+            rc = sqlite3_exec(db, "SELECT * FROM t;", count_rows, &rows, &errmsg);
+            if (rc != SQLITE_OK || rows != 3) { printf("FAIL after rollback rc=%d rows=%d\n", rc, rows); return 1; }
+
+            sqlite3_stmt *stmt;
+            rc = sqlite3_prepare_v2(db, "SELECT id, name FROM t ORDER BY id;", -1, &stmt, 0);
+            if (rc != SQLITE_OK) { printf("FAIL prepare rc=%d\n", rc); return 1; }
+            int count = 0;
+            while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) count++;
+            sqlite3_finalize(stmt);
+            if (rc != SQLITE_DONE || count != 3) { printf("FAIL step rc=%d count=%d\n", rc, count); return 1; }
+
+            sqlite3_close(db);
+            printf("sqlite ok\n");
+            return 0;
+          }
+        C
+
+        output = File.join(tmp, 'sqlite_test')
+        result = occ_compile(test_src, sqlite3_c, output: output,
+                                                  flags: ["-I#{sqlite3_h_dir}",
+                                                          '-DSQLITE_THREADSAFE=0',
+                                                          '-DSQLITE_OMIT_LOAD_EXTENSION'])
+        expect_compiled(result)
+
+        run = shell(output)
+        expect(run[:stdout].strip).to eq('sqlite ok')
+        expect_ran_ok(run)
+      end
     end
   end
 end

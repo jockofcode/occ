@@ -44,4 +44,12 @@ extern char *strndup(const char *s, size_t n);
 extern char *strerror(int errnum);
 extern int   strerror_r(int errnum, char *buf, size_t buflen);
 
+/* Locale-sensitive comparison */
+extern int    strcoll(const char *s1, const char *s2);
+extern size_t strxfrm(char *dest, const char *src, size_t n);
+
+/* BSD extensions */
+extern size_t strlcpy(char *dst, const char *src, size_t size);
+extern size_t strlcat(char *dst, const char *src, size_t size);
+
 #endif /* _OCC_STRING_H */

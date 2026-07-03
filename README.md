@@ -6,9 +6,9 @@ A C compiler written from scratch in Ruby, built in homage to [kefir C](https://
 
 occ is a complete C compiler pipeline — preprocessor, lexer, parser, semantic analyzer, IR builder, and code generator — implemented in pure Ruby. It targets ARM64 (Apple Silicon macOS) and AMD64 (Linux and macOS) natively, auto-detecting the host architecture at runtime.
 
-The project is a learning exercise in compiler construction. It is not production-ready but successfully compiles and runs real C programs including loops, conditionals, multi-function programs, and printf.
+The project is a learning exercise in compiler construction. It is not production-ready but successfully compiles and runs real-world C libraries including Lua 5.5, zlib, SQLite, and more.
 
-**Status:** Phase 8 complete. 263 tests, 0 failures.
+**Status:** Phases 1–11 complete. 414 tests, 0 failures. All 13 third-party libraries pass.
 
 ## Pipeline
 
@@ -65,11 +65,17 @@ bundle exec ruby bin/occ hello.c
 bundle exec ruby bin/occ -I./include -DDEBUG=1 program.c -o program
 ```
 
+### Link multiple source files
+
+```sh
+bundle exec ruby bin/occ a.c b.c c.c -o program
+```
+
 ## Example
 
 ```c
 // hello.c
-extern int printf(const char *fmt, ...);
+#include <stdio.h>
 
 int main(void) {
     printf("Hello, world!\n");
@@ -84,7 +90,7 @@ bundle exec ruby bin/occ hello.c -o hello && ./hello
 
 ```c
 // fib.c
-extern int printf(const char *fmt, ...);
+#include <stdio.h>
 
 int fib(int n) {
     if (n <= 1) return n;
@@ -101,11 +107,7 @@ int main(void) {
 
 ```sh
 bundle exec ruby bin/occ fib.c -o fib && ./fib
-# 0
-# 1
-# 1
-# 2
-# ...
+# 0 1 1 2 3 5 8 13 21 34
 ```
 
 ## Running the Tests
@@ -120,11 +122,30 @@ A specific phase:
 bundle exec rspec spec/phase8/
 ```
 
-Via Rake:
+Third-party compilation tests (requires network, ~5–15 min first run to clone repos):
 ```sh
-bundle exec rake spec           # all phases
-bundle exec rake spec:phase8    # one phase
+THIRDPARTY=1 bundle exec rspec spec/phase11/thirdparty_spec.rb
 ```
+
+## Third-Party Libraries
+
+occ compiles and passes the test suites of the following real-world C projects:
+
+| Library | Description | Tests |
+|---|---|---|
+| [jsmn](https://github.com/zserge/jsmn) | JSON tokenizer (~300 lines) | 16/16 |
+| [tinyexpr](https://github.com/codeplea/tinyexpr) | Math expression evaluator | 4930 |
+| [tiny-regex-c](https://github.com/kokke/tiny-regex-c) | Regex engine | 76 |
+| [munit](https://github.com/nemequ/munit) | Unit test micro-framework | 11 |
+| [parson](https://github.com/kgabis/parson) | JSON library | 349 |
+| [smaz](https://github.com/antirez/smaz) | Short-string compression | all |
+| [sds](https://github.com/antirez/sds) | Simple dynamic strings | 46 |
+| [genann](https://github.com/codeplea/genann) | Minimal neural network | 1077 |
+| [utf8.h](https://github.com/sheredom/utf8.h) | Header-only UTF-8 library | 156 |
+| [linenoise](https://github.com/antirez/linenoise) | Readline replacement | all |
+| [Lua 5.5](https://lua.org) | Full scripting language interpreter | all |
+| [zlib 1.3.2](https://github.com/madler/zlib) | Compression library | all |
+| [SQLite 3.47.2](https://sqlite.org) | Embedded SQL database (~250K lines) | CRUD + txns |
 
 ## Project Structure
 
@@ -144,8 +165,13 @@ lib/occ/
     base.rb                # shared codegen helpers
     amd64.rb               # AMD64 System-V ABI backend
     arm64.rb               # ARM64 Apple ABI backend
+  include/                 # bundled system headers
 spec/
-  phase1/ … phase8/        # per-phase RSpec suites
+  phase1/ … phase11/       # per-phase RSpec suites
+  support/
+    thirdparty_helper.rb   # git_clone, occ_compile, shell helpers
+tmp/
+  thirdparty_cache/        # cached third-party repos (gitignored)
 ```
 
 ## Documentation
@@ -153,6 +179,7 @@ spec/
 - [PLAN.md](PLAN.md) — phased development plan with current status
 - [RESOURCES.md](RESOURCES.md) — specifications, ABI docs, and references
 - [NOTABLE_FINDINGS.md](NOTABLE_FINDINGS.md) — non-obvious design decisions and bugs encountered
+- [CURRENT_STATUS.md](CURRENT_STATUS.md) — detailed current state and recent fixes
 
 ## License
 

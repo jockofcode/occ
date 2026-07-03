@@ -87,8 +87,6 @@ extern int tcsetattr(int fd, int action, const struct termios *termios_p);
 extern int tcflush(int fd, int queue_selector);
 extern int tcdrain(int fd);
 
-/* ioctl */
-extern int ioctl(int fd, unsigned long request, ...);
 
 /* winsize for TIOCGWINSZ */
 struct winsize {

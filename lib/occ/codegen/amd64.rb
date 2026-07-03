@@ -62,14 +62,6 @@ module OCC
       def emit_global(name, g)
         init = g[:init]
         if init
-          sz  = type_byte_size(g[:type])
-          dir = case sz
-                when 1 then '.byte'
-                when 2 then '.short'
-                when 4 then '.long'
-                else        '.quad'
-                end
-
           if init.is_a?(Hash) && init[:kind] == :string
             if g[:type].is_a?(OCC::Types::ArrayType)
               # char arr[] = "str": emit string bytes inline at the global symbol.
@@ -134,14 +126,18 @@ module OCC
               emit ".globl #{sym(name)}"
               emit '.p2align 3'
               emit "#{sym(name)}:"
-              emit "  .quad #{sym(init[:name])}"
+              ref_target = sym(init[:name])
+              ref_target += " + #{init[:offset]}" if init[:offset] && init[:offset] != 0
+              emit "  .quad #{ref_target}"
               emit '.section __TEXT,__text,regular,pure_instructions'
             else
               emit '.section .data'
               emit ".globl #{name}"
               emit '.align 8'
               emit "#{name}:"
-              emit "  .quad #{init[:name]}"
+              ref_target = init[:name].to_s
+              ref_target += " + #{init[:offset]}" if init[:offset] && init[:offset] != 0
+              emit "  .quad #{ref_target}"
               emit '.section .text'
             end
           elsif @macos
@@ -185,6 +181,7 @@ module OCC
         @label_map       = {}    # IR label => asm label
         @alloca_slots    = Set.new   # temp IDs that are direct alloca stack slots
         @fp_alloca_slots = Set.new   # alloca slots holding fp values
+        @alloca_ctypes   = {}        # temp_id => CType for alloca instructions
         @fp_temps        = Set.new   # temp IDs that hold fp values
         @float_pool      = []        # [{label:, value:}] per-function FP literals
 
@@ -193,6 +190,7 @@ module OCC
           bb.instrs.each do |i|
             next unless i.is_a?(IR::Alloca)
             @alloca_slots << i.dst.id
+            @alloca_ctypes[i.dst.id] = i.ctype
             @fp_alloca_slots << i.dst.id if fp_ctype?(i.ctype)
           end
         end
@@ -213,9 +211,11 @@ module OCC
         emit '  movq %rsp, %rbp'
         emit "  subq $#{frame_sz}, %rsp"
 
-        # Save incoming parameters — integer args in rdi/rsi/..., FP args in xmm0-xmm7
+        # Save incoming parameters — integer args in rdi/rsi/..., FP args in xmm0-xmm7.
+        # Args beyond the 6th integer register are at [rbp+16], [rbp+24], etc. (SysV ABI).
         int_idx = 0
         xmm_idx = 0
+        stack_param_idx = 0
         func.params.each_with_index do |p, idx|
           next unless p[:name]
           slot = alloc_slot_for(IR::Temp.new(idx))
@@ -224,6 +224,13 @@ module OCC
             xmm_idx += 1
           elsif int_idx < ARG_REGS.length
             emit "  movq #{ARG_REGS[int_idx]}, #{slot}(%rbp)"
+            int_idx += 1
+          else
+            # Stack argument: caller pushed at [rbp+16+stack_param_idx*8]
+            stack_off = 16 + stack_param_idx * 8
+            emit "  movq #{stack_off}(%rbp), %rax"
+            emit "  movq %rax, #{slot}(%rbp)"
+            stack_param_idx += 1
             int_idx += 1
           end
         end
@@ -370,7 +377,15 @@ module OCC
         when IR::Load
           if instr.ptr.is_a?(IR::Temp) && @alloca_slots.include?(instr.ptr.id)
             if @fp_alloca_slots.include?(instr.ptr.id)
-              emit "  movsd #{slot_of(instr.ptr)}(%rbp), %xmm8"
+              alloca_ct = @alloca_ctypes[instr.ptr.id]
+              slot = slot_of(instr.ptr)
+              if alloca_ct.respond_to?(:size) && alloca_ct.size == 4
+                # float (4-byte) slot: load as single, expand to double
+                emit "  movss #{slot}(%rbp), %xmm8"
+                emit '  cvtss2sd %xmm8, %xmm8'
+              else
+                emit "  movsd #{slot}(%rbp), %xmm8"
+              end
               store_fp_temp(instr.dst, '%xmm8')
             else
               emit "  movq #{slot_of(instr.ptr)}(%rbp), %rax"
@@ -391,7 +406,15 @@ module OCC
           if instr.ptr.is_a?(IR::Temp) && @alloca_slots.include?(instr.ptr.id)
             if @fp_alloca_slots.include?(instr.ptr.id) || fp_operand?(instr.value)
               load_fp_operand(instr.value, '%xmm8')
-              emit "  movsd %xmm8, #{slot_of(instr.ptr)}(%rbp)"
+              alloca_ct = @alloca_ctypes[instr.ptr.id]
+              slot = slot_of(instr.ptr)
+              if alloca_ct.respond_to?(:size) && alloca_ct.size == 4
+                # float (4-byte) slot: narrow to single before storing so &f reads correct bytes
+                emit '  cvtsd2ss %xmm8, %xmm8'
+                emit "  movss %xmm8, #{slot}(%rbp)"
+              else
+                emit "  movsd %xmm8, #{slot}(%rbp)"
+              end
               @fp_alloca_slots << instr.ptr.id
             elsif instr.elem_size > 8
               load_operand(instr.value, '%rsi')

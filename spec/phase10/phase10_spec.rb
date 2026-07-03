@@ -513,12 +513,6 @@ RSpec.describe 'Phase 10: Headers, Language Extensions, and FP Codegen' do
       sa.analyze(ast)
       # Find the struct type in the typedef/tag map via the AST
       struct_spec = ast.decls.first.specifiers.tag_decl
-      st = sa.instance_variable_get(:@struct_tags)[struct_spec&.tag] ||
-           begin
-             OCC::Types::StructType.new(:kw_struct, nil).tap do |s|
-               # force re-analysis to extract the struct
-             end
-           end
       # We verify by compiling and checking member load emits a rshift/mask
       mod  = build_ir(src)
       expect(mod).not_to be_nil

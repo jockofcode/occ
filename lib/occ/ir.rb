@@ -219,9 +219,11 @@ module OCC
         @locals          = {}      # name => Alloca temp
         @local_ctypes    = {}      # name => CType (for array decay when node.ctype is nil)
         @static_locals   = {}      # name => mangled global name (static-storage locals)
-        @break_target    = nil
-        @cont_target     = nil
-        @enum_constants  = {}      # name => Integer (compile-time enum values)
+        @break_target         = nil
+        @cont_target          = nil
+        @switch_case_map      = nil  # current switch's case_map (for nested case labels)
+        @switch_default_block = nil  # current switch's default block
+        @enum_constants       = {}   # name => Integer (compile-time enum values)
       end
 
       def build(tu)
@@ -401,6 +403,9 @@ module OCC
           end
         end
 
+        # Typedef declarations define types, not variables — nothing to emit.
+        return if decl.specifiers.storage == :typedef
+
         # Register variadic and FP-returning extern declarations before skipping them.
         if decl.specifiers.storage == :extern
           base = begin
@@ -491,11 +496,23 @@ module OCC
         when AST::Cast
           eval_const_init(expr.expr, allow_ref: allow_ref)
         when AST::UnaryOp
-          v = eval_const_init(expr.operand, allow_ref: allow_ref)
-          case expr.op
-          when :unary_minus then v.is_a?(Numeric) ? -v : nil
-          when :bit_not     then v.is_a?(Integer) ? ~v : nil
-          else nil
+          if expr.op == :addr_of && allow_ref
+            operand = expr.operand
+            case operand
+            when AST::Identifier
+              { kind: :ref, name: operand.name }
+            when AST::IndexExpr
+              base = operand.array
+              idx  = eval_const_init(operand.index, allow_ref: false)
+              { kind: :ref, name: base.name, offset: idx } if base.is_a?(AST::Identifier) && idx.is_a?(Integer)
+            end
+          else
+            v = eval_const_init(expr.operand, allow_ref: allow_ref)
+            case expr.op
+            when :unary_minus then v.is_a?(Numeric) ? -v : nil
+            when :bit_not     then v.is_a?(Integer) ? ~v : nil
+            else nil
+            end
           end
         when AST::BinaryOp
           l = eval_const_init(expr.left, allow_ref: allow_ref)
@@ -537,8 +554,21 @@ module OCC
         when AST::ContinueStmt  then emit(Jump.new(@cont_target))  if @cont_target
         when AST::LabelStmt     then build_label_stmt(node)
         when AST::GotoStmt      then emit(Jump.new(node.label))
-        when AST::CaseStmt, AST::DefaultStmt
-          # handled by switch builder; just emit the nested stmt
+        when AST::CaseStmt
+          # C allows case labels nested inside compound statements within a switch.
+          # If this label was registered in the current switch's case_map (by
+          # scan_nested_cases), switch to its block; otherwise just emit the body.
+          if @switch_case_map && (val = eval_case_value(node.value)) &&
+              (blk = @switch_case_map[val]) && !@block.equal?(blk)
+            jump_to(blk) unless @block&.terminated?
+            switch_to(blk)
+          end
+          build_stmt(node.stmt) if node.stmt
+        when AST::DefaultStmt
+          if @switch_default_block && !@block.equal?(@switch_default_block)
+            jump_to(@switch_default_block) unless @block&.terminated?
+            switch_to(@switch_default_block)
+          end
           build_stmt(node.stmt) if node.stmt
         end
       end
@@ -624,7 +654,14 @@ module OCC
               end
             else
               val = build_expr(d[:init])
-              emit(Store.new(slot, val))
+              # For struct-typed locals, pass the byte size so the codegen emits a
+              # proper struct copy (ldp/stp) rather than storing the source pointer.
+              esz = if ctype.is_a?(OCC::Types::StructType) && ctype.complete?
+                       ctype.size rescue 8
+                     else
+                       8
+                     end
+              emit(Store.new(slot, val, ctype, esz))
             end
           end
         end
@@ -823,20 +860,21 @@ module OCC
 
       def build_switch(node)
         switch_val  = build_expr(node.expr)
-        saved_break = @break_target
+        saved_break         = @break_target
+        saved_case_map      = @switch_case_map
+        saved_default_block = @switch_default_block
 
         items = node.body.is_a?(AST::CompoundStmt) ? node.body.items : [node.body]
 
-        # First pass: collect case values and create blocks for each case/default.
-        # Fall-through cases (case A: case B: body) are nested CaseStmts in our AST;
-        # all values in a chain share one block so the dispatch works correctly.
+        # First pass: collect ALL case values (including those nested inside case bodies)
+        # and create blocks. Fall-through chains (case A: case B: body) share one block.
         case_map      = {}   # integer_value => BasicBlock
         default_block = nil
 
         items.each do |item|
           case item
           when AST::CaseStmt
-            # Walk the nested CaseStmt chain, collecting all case values.
+            # Walk the chain of adjacent CaseStmts at this level.
             chain_vals = []
             s = item
             while s.is_a?(AST::CaseStmt)
@@ -844,16 +882,20 @@ module OCC
               chain_vals << v if v && !case_map.key?(v)
               s = s.stmt
             end
-            # All values in this chain share one block.
             blk = new_block(new_label('switch_case'))
             chain_vals.each { |v| case_map[v] = blk }
+            # Also scan the non-case body for case labels nested inside compound stmts.
+            scan_nested_cases(s, case_map)
           when AST::DefaultStmt
             default_block ||= new_block(new_label('switch_default'))
+            scan_nested_cases(item.stmt, case_map)
           end
         end
 
-        end_block     = new_block(new_label('switch_end'))
-        @break_target = end_block.label
+        end_block             = new_block(new_label('switch_end'))
+        @break_target         = end_block.label
+        @switch_case_map      = case_map
+        @switch_default_block = default_block
 
         # Emit dispatch: one comparison + conditional jump per case value
         case_map.each do |val, blk|
@@ -866,8 +908,6 @@ module OCC
         emit(Jump.new(default_block ? default_block.label : end_block.label))
 
         # Second pass: emit body items in order, switching to case blocks as encountered.
-        # Fall-through: if a case block is not terminated when the next case is reached,
-        # jump_to emits an explicit Jump to the next case block.
         items.each do |item|
           case item
           when AST::CaseStmt
@@ -882,13 +922,49 @@ module OCC
             switch_to(default_block)
             build_stmt(item.stmt) if item.stmt
           else
-            build_stmt(item)
+            build_block_item(item)
           end
         end
 
         jump_to(end_block) unless @block&.terminated?
         switch_to(end_block)
-        @break_target = saved_break
+        @break_target         = saved_break
+        @switch_case_map      = saved_case_map
+        @switch_default_block = saved_default_block
+      end
+
+      # Recursively find case labels nested inside compound statements within a case body,
+      # and register them in case_map. This handles C's rule that case labels inside nested
+      # blocks (e.g. the fall-through pattern "case A: { ...; case B: body }") are still
+      # valid dispatch targets for the enclosing switch.
+      def scan_nested_cases(stmt, case_map)
+        return unless stmt
+        case stmt
+        when AST::CaseStmt
+          chain_vals = []
+          s = stmt
+          while s.is_a?(AST::CaseStmt)
+            v = eval_case_value(s.value)
+            chain_vals << v if v && !case_map.key?(v)
+            s = s.stmt
+          end
+          unless chain_vals.empty?
+            blk = new_block(new_label('switch_case'))
+            chain_vals.each { |v| case_map[v] = blk }
+          end
+          scan_nested_cases(s, case_map)
+        when AST::DefaultStmt
+          scan_nested_cases(stmt.stmt, case_map)
+        when AST::CompoundStmt
+          stmt.items.each { |i| scan_nested_cases(i, case_map) }
+        when AST::IfStmt
+          scan_nested_cases(stmt.then_body, case_map)
+          scan_nested_cases(stmt.else_body, case_map) if stmt.else_body
+        when AST::WhileStmt, AST::DoWhileStmt
+          scan_nested_cases(stmt.body, case_map)
+        when AST::ForStmt
+          scan_nested_cases(stmt.body, case_map)
+        end
       end
 
       # Evaluate a constant expression to an integer, or nil if it can't be folded.
@@ -1060,7 +1136,10 @@ module OCC
         dst   = new_temp
         op    = node.op
         # For comparison/division/rshift, respect signedness of operands.
-        # Use unsigned variants when either operand is an unsigned integer type.
+        # Apply C's usual arithmetic conversions: when one operand is unsigned
+        # and the other is signed, use unsigned only if the unsigned type's rank
+        # (approximated by size) >= the signed type's rank. Otherwise the signed
+        # type dominates and the operation is signed.
         # FP types never use unsigned comparison variants (float has no signed/unsigned).
         if %i[gt lt geq leq slash percent rshift].include?(op)
           lct = node.left.ctype
@@ -1070,8 +1149,27 @@ module OCC
           fp_compare = lct_inner.is_a?(OCC::Types::FloatingType) ||
                        rct_inner.is_a?(OCC::Types::FloatingType)
           unless fp_compare
-            unsigned = unsigned_ctype?(lct) || unsigned_ctype?(rct) ||
-                       (pointer_ctype?(lct) && pointer_ctype?(rct))
+            lct_unsigned = unsigned_ctype?(lct)
+            rct_unsigned = unsigned_ctype?(rct)
+            unsigned = if pointer_ctype?(lct) && pointer_ctype?(rct)
+                         true
+                       elsif lct_unsigned && rct_unsigned
+                         true
+                       elsif lct_unsigned && !rct_unsigned
+                         # unsigned left, signed right: unsigned comparison only if
+                         # unsigned rank >= signed rank (C §6.3.1.8)
+                         ls = lct_inner.respond_to?(:size) ? lct_inner.size.to_i : 8
+                         rs = rct_inner.respond_to?(:size) ? rct_inner.size.to_i : 8
+                         ls >= rs
+                       elsif !lct_unsigned && rct_unsigned
+                         # signed left, unsigned right: unsigned comparison only if
+                         # unsigned rank >= signed rank
+                         ls = lct_inner.respond_to?(:size) ? lct_inner.size.to_i : 8
+                         rs = rct_inner.respond_to?(:size) ? rct_inner.size.to_i : 8
+                         rs >= ls
+                       else
+                         false
+                       end
             if unsigned
               op = case op
                    when :gt    then :ugt
@@ -1448,7 +1546,8 @@ module OCC
           else
             field_ptr = build_member_addr(node.target)
             elem_sz   = member_field_size(node.target)
-            emit(Store.new(field_ptr, val, nil, elem_sz))
+            val_ct    = node.value.respond_to?(:ctype) ? node.value.ctype : nil
+            emit(Store.new(field_ptr, val, val_ct, elem_sz))
           end
         end
 
@@ -1604,9 +1703,12 @@ module OCC
           dst
         else
           field_ptr = build_member_addr(node)
-          # Array-type fields decay to a pointer to their first element — return
-          # the address directly instead of loading through it.
-          if node.ctype.is_a?(OCC::Types::ArrayType)
+          # Array-type and struct/union-type fields return the address directly.
+          # Struct rvalues are always represented as addresses in OCC IR (consistent
+          # with build_deref for structs), so the Store small-struct-copy path can
+          # dereference them correctly.
+          if node.ctype.is_a?(OCC::Types::ArrayType) ||
+             node.ctype.is_a?(OCC::Types::StructType)
             return field_ptr
           end
           elem_sz   = member_field_size(node)

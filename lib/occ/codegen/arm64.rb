@@ -82,7 +82,9 @@ module OCC
             emit ".globl #{sym(name)}"
             emit '.p2align 3'
             emit "#{sym(name)}:"
-            emit "  .quad #{sym(init[:name])}"
+            ref_target = sym(init[:name])
+            ref_target += " + #{init[:offset]}" if init[:offset] && init[:offset] != 0
+            emit "  .quad #{ref_target}"
           else
             # Integer scalar: always emit as .quad so GlobalRef 8-byte loads work correctly.
             emit '.section __DATA,__data'
@@ -216,8 +218,15 @@ module OCC
         when Hash
           case val[:kind]
           when :string
-            lbl = val[:_label]
-            emit "  .quad #{lbl}"
+            if field_type.is_a?(OCC::Types::ArrayType)
+              # char arr[N] = "str" inside a struct: inline the bytes
+              bytes = val[:value].bytes[0...fsz]
+              bytes << 0 while bytes.length < fsz
+              bytes.each { |b| emit "  .byte #{b}" }
+            else
+              lbl = val[:_label]
+              emit "  .quad #{lbl}"
+            end
           when :ref
             emit "  .quad #{sym(val[:name])}"
           else
@@ -287,10 +296,13 @@ module OCC
         end
 
         # Save incoming parameters — integer args in x0-x7, FP args in d0-d7.
+        # Args beyond the 8th integer register are passed on the stack by the caller
+        # at [x29, #frame_sz], [x29, #frame_sz+8], etc.
         # Placeholder entries (name=nil) still consume a register slot so that
         # multi-register struct params land at the right positions.
         int_idx = 0
         fp_idx  = 0
+        stack_param_idx = 0
         func.params.each_with_index do |p, idx|
           slot = alloc_slot_for(IR::Temp.new(idx))
           if fp_ctype?(p[:type])
@@ -298,6 +310,19 @@ module OCC
             fp_idx += 1
           elsif int_idx < ARG_REGS.length
             emit_slot_store(ARG_REGS[int_idx], slot)
+            int_idx += 1
+          else
+            # Stack argument: caller placed it at [x29, #frame_sz + stack_param_idx*8]
+            stack_off = frame_sz + stack_param_idx * 8
+            if stack_off <= 32_760
+              emit "  ldr x9, [x29, ##{stack_off}]"
+            else
+              emit "  mov x16, ##{stack_off}"
+              emit '  add x16, x29, x16'
+              emit '  ldr x9, [x16]'
+            end
+            emit_slot_store('x9', slot)
+            stack_param_idx += 1
             int_idx += 1
           end
         end
@@ -447,7 +472,15 @@ module OCC
         when IR::Load
           if instr.ptr.is_a?(IR::Temp) && @alloca_slots.include?(instr.ptr.id)
             if @fp_alloca_slots.include?(instr.ptr.id)
-              emit_fp_slot_load('d10', slot_of(instr.ptr))
+              alloca_ct = @alloca_ctypes[instr.ptr.id]
+              slot = slot_of(instr.ptr)
+              if alloca_ct.respond_to?(:size) && alloca_ct.size == 4
+                # float (4-byte) slot: load as single, expand to double for computation
+                emit_fp_slot_load('s10', slot)
+                emit '  fcvt d10, s10'
+              else
+                emit_fp_slot_load('d10', slot)
+              end
               store_fp_temp(instr.dst, 'd10')
             else
               # Use a width-appropriate load to avoid reading garbage in upper bytes
@@ -486,7 +519,15 @@ module OCC
           if instr.ptr.is_a?(IR::Temp) && @alloca_slots.include?(instr.ptr.id)
             if @fp_alloca_slots.include?(instr.ptr.id) || fp_operand?(instr.value)
               load_fp_operand(instr.value, 'd9')
-              emit_fp_slot_store('d9', slot_of(instr.ptr))
+              alloca_ct = @alloca_ctypes[instr.ptr.id]
+              slot = slot_of(instr.ptr)
+              if alloca_ct.respond_to?(:size) && alloca_ct.size == 4
+                # float (4-byte) slot: narrow to single before storing so &f reads correct bytes
+                emit '  fcvt s9, d9'
+                emit_fp_slot_store('s9', slot)
+              else
+                emit_fp_slot_store('d9', slot)
+              end
               @fp_alloca_slots << instr.ptr.id  # mark slot as FP once we store FP into it
             elsif instr.elem_size.to_i > 8
               # Large struct copy into local slot: x9 = source addr, x10 = dest addr
@@ -839,15 +880,28 @@ module OCC
           emit "  bl #{sym(func_ref.name)}"
           emit_sp_add(stack_sz) if var_args.any?
         else
-          # Non-variadic: integer args in x0-x7, FP args in d0-d7
+          # Non-variadic: integer args in x0-x7, FP args in d0-d7.
+          # Args beyond the 8th integer slot are passed on the stack (AAPCS64).
+          int_count = args.count { |a| !fp_operand?(a) }
+          extra_int  = [int_count - ARG_REGS.length, 0].max
+          call_stack_sz = extra_int > 0 ? align16(extra_int * 8) : 0
+          emit_sp_sub(call_stack_sz) if call_stack_sz > 0
+
           int_idx = 0
           fp_idx  = 0
+          stack_idx = 0
           args.each do |a|
             if fp_operand?(a)
               load_fp_operand(a, "d#{fp_idx}") if fp_idx < 8
               fp_idx += 1
             else
-              load_operand(a, ARG_REGS[int_idx]) if int_idx < ARG_REGS.length
+              if int_idx < ARG_REGS.length
+                load_operand(a, ARG_REGS[int_idx])
+              else
+                load_operand(a, 'x9')
+                emit "  str x9, [sp, ##{stack_idx * 8}]"
+                stack_idx += 1
+              end
               int_idx += 1
             end
           end
@@ -863,6 +917,7 @@ module OCC
             load_operand(func_ref, 'x9')
             emit '  blr x9'
           end
+          emit_sp_add(call_stack_sz) if call_stack_sz > 0
         end
 
         # Capture return value

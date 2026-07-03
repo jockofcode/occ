@@ -18,6 +18,10 @@ typedef unsigned long pthread_once_t;
 #define PTHREAD_COND_INITIALIZER   0UL
 #define PTHREAD_RWLOCK_INITIALIZER 0UL
 #define PTHREAD_ONCE_INIT          0UL
+#define PTHREAD_MUTEX_NORMAL       0
+#define PTHREAD_MUTEX_ERRORCHECK   1
+#define PTHREAD_MUTEX_RECURSIVE    2
+#define PTHREAD_MUTEX_DEFAULT      PTHREAD_MUTEX_NORMAL
 
 extern int pthread_create(pthread_t *thread, const pthread_attr_t *attr,
                           void *(*start)(void *), void *arg);
@@ -26,6 +30,11 @@ extern int pthread_detach(pthread_t thread);
 extern pthread_t pthread_self(void);
 extern int pthread_equal(pthread_t t1, pthread_t t2);
 extern void pthread_exit(void *retval);
+
+extern int pthread_mutexattr_init(pthread_mutexattr_t *attr);
+extern int pthread_mutexattr_destroy(pthread_mutexattr_t *attr);
+extern int pthread_mutexattr_settype(pthread_mutexattr_t *attr, int type);
+extern int pthread_mutexattr_gettype(const pthread_mutexattr_t *attr, int *type);
 
 extern int pthread_mutex_init(pthread_mutex_t *m, const pthread_mutexattr_t *a);
 extern int pthread_mutex_destroy(pthread_mutex_t *m);

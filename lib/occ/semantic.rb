@@ -105,12 +105,15 @@ module OCC
           next
         end
 
+        # Define the variable before analyzing its initializer so that
+        # sizeof(*p) in p's own initializer resolves correctly (C99 §6.2.1:
+        # scope begins after the declarator).
+        @symbols.define(d[:name], type: base_type, kind: :var, location: decl.location)
+
         if d[:init]
           init_type = analyze_expr(d[:init])
           check_assignment_compat(base_type, init_type, decl.location) if d[:init].respond_to?(:ctype)
         end
-
-        @symbols.define(d[:name], type: base_type, kind: :var, location: decl.location)
       end
     end
 
@@ -215,6 +218,10 @@ module OCC
         c = eval_const_expr(node.cond)
         return nil if c.nil?
         c != 0 ? eval_const_expr(node.then_expr) : eval_const_expr(node.else_expr)
+      when AST::Cast
+        # For compile-time constant folding, evaluate inner expression.
+        # Integer truncation edge cases don't matter for array sizes.
+        eval_const_expr(node.expr)
       when AST::SizeofType
         node.sizeof_val || resolve_sizeof_type(node.type_spec)
       when AST::SizeofExpr
@@ -428,9 +435,10 @@ module OCC
         val = 0
         et.enumerators = {}
         spec.enumerators.each do |e|
-          val = e.value.is_a?(AST::IntLiteral) ? e.value.integer_value : val
+          explicit = e.value ? (eval_const_expr(e.value) || (e.value.is_a?(AST::IntLiteral) ? e.value.integer_value : nil)) : nil
+          val = explicit || val
           et.enumerators[e.name] = val
-          @symbols.define(e.name, type: Types::INT, kind: :enum_const, location: e.location)
+          @symbols.define(e.name, type: Types::INT, kind: :enum_const, value: val, location: e.location)
           val += 1
         end
       end

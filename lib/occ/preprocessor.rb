@@ -91,6 +91,7 @@ module OCC
                                                body: '((*((ptr))) = (val))' }
       @macros['__sync_lock_release']   = { kind: :function, params: ['ptr'], variadic: false,
                                             body: '((*((ptr))) = 0)' }
+      @macros['__sync_synchronize']    = { kind: :function, params: [], variadic: false, body: '' }
       @macros['__typeof']              = { kind: :function, params: ['x'], variadic: false, body: 'int' }
       @macros['__asm__']               = { kind: :function, params: [], variadic: true, body: '' }
       @macros['__asm']                 = { kind: :function, params: [], variadic: true, body: '' }
@@ -119,7 +120,10 @@ module OCC
     attr_reader :output
 
     def process
-      @output
+      # Strip any FROZEN markers that survived expansion (can happen when the
+      # iterative expand_macros loop stabilizes with markers still present, e.g.
+      # due to __LINE__ substitution changing the termination condition).
+      @output.gsub(/#{FROZEN_START}|#{FROZEN_END}/, '')
     end
 
     private
@@ -516,7 +520,16 @@ module OCC
       text
     end
 
-    def expand_pass(text)
+    # Sentinel characters used to "freeze" already-expanded argument tokens so
+    # they are not re-expanded during the macro body rescan.  These are C0
+    # control characters that never appear in real C source.
+    FROZEN_START = "\x01"
+    FROZEN_END   = "\x02"
+
+    # expand_pass performs one (deep) macro expansion pass over `text`.
+    # `expanding` is the Set of macro names currently being expanded; any name
+    # in this set is treated as a literal token (C §6.10.3.4 "blue paint").
+    def expand_pass(text, expanding: Set.new)
       result  = +''
       i       = 0
       in_str  = false
@@ -571,13 +584,21 @@ module OCC
           next
         end
 
+        # Frozen token: copy the content literally without expansion.
+        if ch == FROZEN_START
+          j = text.index(FROZEN_END, i + 1) || (text.length - 1)
+          result << text[i + 1...j]
+          i = j + 1
+          next
+        end
+
         # Try to match an identifier at position i
         if ch =~ /[a-zA-Z_]/
           j = i
           j += 1 while j < text.length && text[j] =~ /\w/
           name = text[i...j]
 
-          if (macro = @macros[name])
+          if (macro = @macros[name]) && !expanding.include?(name)
             if macro[:kind] == :function && text[j..].lstrip.start_with?('(')
               # Consume argument list
               k     = text.index('(', j)
@@ -588,12 +609,14 @@ module OCC
                  args.first.to_s.strip.match?(/^\(\s*constructor\s*\)$/)
                 result << '__occ_constructor'
               else
-                replacement = expand_function_macro(macro, args, name)
+                replacement = expand_function_macro(macro, args, name, expanding: expanding)
                 result << replacement
               end
               i = after
             elsif macro[:kind] == :object
-              result << macro[:body]
+              # Recursively expand body with this macro name disabled so
+              # self-referential macros (A → ... → A) produce a literal A.
+              result << expand_pass(macro[:body], expanding: expanding | Set[name])
               i = j
             else
               result << name
@@ -689,38 +712,56 @@ module OCC
       [args, i]
     end
 
-    def expand_function_macro(macro, args, name)
+    def expand_function_macro(macro, args, name, expanding: Set.new)
       body = macro[:body].dup
-      param_map = macro[:params].each_with_index.to_h { |p, i| [p, args[i] || ''] }
+      # raw_param_map is used for # stringification and ## token paste (C standard:
+      # these operators act on the unexpanded argument text).
+      raw_param_map = macro[:params].each_with_index.to_h { |p, i| [p, args[i] || ''] }
 
       # ## token paste: substitute both sides before concatenating.
       # Loop because a##b##c requires two passes (a##b → ab, then ab##c → abc).
       loop do
         prev = body.dup
         body.gsub!(/([a-zA-Z_]\w*|[0-9]+)\s*##\s*([a-zA-Z_]\w*|[0-9]+)/) do
-          (param_map[$1] || $1) + (param_map[$2] || $2)
+          (raw_param_map[$1] || $1) + (raw_param_map[$2] || $2)
         end
         break if body == prev
       end
       # Remove any remaining ## (e.g., empty-argument paste or ##__VA_ARGS__).
       body.gsub!(/\s*##\s*/, '')
 
-      # # stringification and parameter substitution
+      # # stringification (must run before parameter substitution)
       macro[:params].each_with_index do |param, idx|
         arg = args[idx] || ''
-        # Use block form to avoid gsub interpreting \ in arg as replacement escapes.
-        # arg.inspect wraps in "..." and escapes " → \" and \ → \\ — correct C stringify.
         body.gsub!(/\#\s*#{Regexp.escape(param)}/) { arg.inspect }
-        body.gsub!(/\b#{Regexp.escape(param)}\b/) { arg }
       end
 
-      # Variadic __VA_ARGS__
+      # Parameter substitution: expand each arg (with the current disabled set,
+      # NOT including `name`), then wrap in frozen markers so the substituted
+      # tokens survive the body rescan without being re-expanded.
+      unless macro[:params].empty?
+        frozen_param_map = raw_param_map.transform_values { |v|
+          expanded = expand_pass(v, expanding: expanding)
+          "#{FROZEN_START}#{expanded}#{FROZEN_END}"
+        }
+        param_regex = Regexp.new('\\b(' + macro[:params].map { |p| Regexp.escape(p) }.join('|') + ')\\b')
+        body.gsub!(param_regex) { frozen_param_map[$1] || $1 }
+      end
+
+      # Variadic __VA_ARGS__: expand and freeze
       if macro[:variadic]
-        va_args = args[macro[:params].length..].join(', ')
+        va_args = args[macro[:params].length..].map { |a|
+          expanded = expand_pass(a, expanding: expanding)
+          "#{FROZEN_START}#{expanded}#{FROZEN_END}"
+        }.join(', ')
         body.gsub!('__VA_ARGS__') { va_args }
       end
 
-      body
+      # Rescan the substituted body with this macro name disabled, so any
+      # occurrence of `name` in the result is treated as a literal identifier.
+      # Frozen tokens from the arg substitution above are copied without
+      # expansion, implementing C §6.10.3.4 "blue paint" for arguments.
+      expand_pass(body, expanding: expanding | Set[name])
     end
 
     # ── Constant expression evaluator for #if / #elif ─────────────────────────
@@ -762,7 +803,8 @@ module OCC
     class ConstExprParser
       PREC = { '||' => 1, '&&' => 2, '==' => 3, '!=' => 3,
                '<' => 4, '>' => 4, '<=' => 4, '>=' => 4,
-               '+' => 5, '-' => 5, '*' => 6, '/' => 6 }.freeze
+               '<<' => 5, '>>' => 5,
+               '+' => 6, '-' => 6, '*' => 7, '/' => 7 }.freeze
 
       def initialize(tokens)
         @tokens = tokens
@@ -826,6 +868,8 @@ module OCC
         when '>'   then l >  r ? 1 : 0
         when '<='  then l <= r ? 1 : 0
         when '>='  then l >= r ? 1 : 0
+        when '<<'  then l << r
+        when '>>'  then l >> r
         when '+'   then l + r
         when '-'   then l - r
         when '*'   then l * r

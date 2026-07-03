@@ -39,8 +39,23 @@
 #define F_GETLK     5
 #define F_SETLK     6
 #define F_SETLKW    7
+#define F_DUPFD_CLOEXEC 67
 
 #define FD_CLOEXEC  1
+
+/* flock l_type values */
+#define F_RDLCK     1
+#define F_WRLCK     2
+#define F_UNLCK     8
+
+/* struct flock for fcntl(F_SETLK/F_GETLK) */
+struct flock {
+    short   l_type;     /* F_RDLCK, F_WRLCK, F_UNLCK */
+    short   l_whence;   /* SEEK_SET, SEEK_CUR, SEEK_END */
+    off_t   l_start;    /* byte offset of lock region */
+    off_t   l_len;      /* length of lock region; 0=EOF */
+    pid_t   l_pid;      /* PID holding lock (F_GETLK only) */
+};
 
 extern int open(const char *path, int flags, ...);
 extern int creat(const char *path, mode_t mode);

@@ -16,3 +16,4 @@ typedef long          blkcnt_t;
 typedef unsigned long nlink_t;
 
 #endif /* _OCC_SYS_TYPES_H */
+typedef unsigned char uuid_t[16];
