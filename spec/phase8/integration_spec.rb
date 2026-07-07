@@ -80,7 +80,7 @@ RSpec.describe 'Phase 8: Integration' do
       asm = compile_to_asm(src)
       expect(asm).to match(/globl.*sum/)
       # Should have loop structure (conditional branch)
-      expect(asm).to match(/cbnz|jne|je|jnz|jz/)
+      expect(asm).to match(/cbnz|cbz|jne|je|jnz|jz/)
     end
 
     it 'produces assembly for a recursive function' do

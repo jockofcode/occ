@@ -13,6 +13,7 @@ module OCC
       @typedef_map  = {}    # name => CType
       @current_func = nil   # return type of the function being analysed
       @errors       = []
+      @pack_stack   = [nil] # nil = natural alignment; Integer = max field alignment
       seed_builtins
     end
 
@@ -43,8 +44,27 @@ module OCC
         analyze_declaration(node, global: true)
       when AST::StaticAssert
         check_static_assert(node)
+      when AST::PragmaPack
+        handle_pragma_pack(node.action)
       end
     end
+
+    def handle_pragma_pack(action)
+      case action
+      when :push
+        @pack_stack.push(@pack_stack.last)
+      when :pop
+        @pack_stack.pop if @pack_stack.length > 1
+      when :default
+        @pack_stack[-1] = nil
+      when 0
+        @pack_stack[-1] = nil  # 0 = reset to natural alignment
+      when Integer
+        @pack_stack[-1] = action
+      end
+    end
+
+    def current_pack = @pack_stack.last
 
     def analyze_function_def(fn)
       # resolve_type applies the full declarator including the function postfix,
@@ -336,6 +356,8 @@ module OCC
       @struct_tags[tag] = st if tag
 
       if spec.fields
+        pack       = current_pack   # nil = natural alignment; Integer = max field alignment
+        st.pack    = pack
         offset     = 0      # current byte offset within struct
         bit_offset = 0      # current bit offset within the current storage unit
         unit_size  = 0      # byte size of the current storage unit (0 = not in a bitfield run)
@@ -351,7 +373,8 @@ module OCC
               bit_offset = 0
               unit_size  = 0
             end
-            base_off = kind == :kw_struct ? align_up(offset, ft.align) : 0
+            eff_align = pack ? [ft.align, pack].min : ft.align
+            base_off = kind == :kw_struct ? align_up(offset, eff_align) : 0
             inlined = ft.fields.map do |f|
               { name: f[:name], type: f[:type],
                 offset: base_off + f[:offset],
@@ -381,27 +404,48 @@ module OCC
                   next nil
                 end
 
-                # Start a new storage unit if needed
-                if unit_size == 0 || bit_offset + width > unit_size * 8
+                # Under #pragma pack(n) where n < sizeof(T), consecutive bitfields
+                # are packed bit-for-bit with no storage unit boundaries
+                # (matching GCC/Clang behavior for tightly-packed structs).
+                packed_bf = pack && pack < ft_size
+
+                if unit_size == 0 || kind == :kw_union
+                  # Start a new bitfield group (first bitfield or union member).
                   if kind == :kw_struct && unit_size > 0 && bit_offset > 0
                     offset += unit_size
                   end
                   if kind == :kw_struct
-                    offset    = align_up(offset, ft_size)
+                    eff_bf_align = packed_bf ? pack : ft_size
+                    offset = align_up(offset, eff_bf_align)
+                  end
+                  bit_offset = 0
+                  unit_size  = packed_bf ? (width + 7) / 8 : ft_size
+                elsif !packed_bf && bit_offset + width > unit_size * 8
+                  # Standard C: field overflows current storage unit; start a new one.
+                  if kind == :kw_struct && bit_offset > 0
+                    offset += unit_size
+                  end
+                  if kind == :kw_struct
+                    offset = align_up(offset, ft_size)
                   end
                   bit_offset = 0
                   unit_size  = ft_size
                 end
+                # In packed_bf mode with an ongoing group: bits accumulate
+                # without starting a new unit; unit_size is updated below.
+
+                f_bit_offset = bit_offset
+                bit_offset  += width
+                unit_size    = (bit_offset + 7) / 8 if packed_bf
 
                 f = d[:name] ? {
                   name:       d[:name],
                   type:       ft,
                   offset:     offset,
-                  bit_offset: bit_offset,
+                  bit_offset: f_bit_offset,
                   bit_width:  width,
                   unit_size:  unit_size
                 } : nil
-                bit_offset += width
                 f
               else
                 # ── Regular member ───────────────────────────────────────────────
@@ -411,7 +455,8 @@ module OCC
                   bit_offset = 0
                   unit_size  = 0
                 end
-                offset = align_up(offset, ft.align) if kind == :kw_struct
+                eff_align = pack ? [ft.align, pack].min : ft.align
+                offset = align_up(offset, eff_align) if kind == :kw_struct
                 f = d[:name] ? { name: d[:name], type: ft, offset: offset,
                                  bit_offset: nil, bit_width: nil, unit_size: nil } : nil
                 offset += (ft.size rescue 4) if kind == :kw_struct
@@ -506,9 +551,12 @@ module OCC
 
     def analyze_expr(node)
       return Types::INT unless node
-      # Hash nodes — only _Generic selections are meaningful here.
+      # Hash nodes — only _Generic and initializer_list are meaningful here.
       if node.is_a?(Hash)
         return resolve_generic(node) if node[:kind] == :generic
+        if node[:kind] == :initializer_list
+          (node[:items] || []).each { |item| analyze_expr(item[:value]) if item[:value] }
+        end
         return Types::INT
       end
 
@@ -547,20 +595,50 @@ module OCC
       ctype
     end
 
+    LLONG_MAX  = (1 << 63) - 1
+    ULLONG_MAX = (1 << 64) - 1
+    INT_MAX    = (1 << 31) - 1
+    UINT_MAX   = (1 << 32) - 1
+    LONG_MAX   = (1 << 63) - 1
+    ULONG_MAX  = (1 << 64) - 1
+
     def type_of_int_literal(node)
       suffix = node.suffix.downcase
+      val    = node.integer_value
+      # hex/octal constants can promote to unsigned types without 'u' suffix (C11 §6.4.4.1 Table 7)
+      hex_or_oct = node.raw.start_with?('0x', '0X') ||
+                   (node.raw.start_with?('0') && node.raw.length > 1)
+
       if suffix.include?('ull') || suffix.include?('llu')
         Types::ULONGLONG
       elsif suffix.include?('ll')
-        Types::LONGLONG
+        # ll/LL: long long int; if value exceeds LLONG_MAX, unsigned long long (hex/oct only)
+        hex_or_oct && val > LLONG_MAX ? Types::ULONGLONG : Types::LONGLONG
       elsif suffix.include?('ul') || suffix.include?('lu')
         Types::ULONG
       elsif suffix.include?('u')
-        Types::UINT
+        val <= UINT_MAX ? Types::UINT : Types::ULONG
       elsif suffix.include?('l')
-        Types::LONG
+        if hex_or_oct
+          val <= LONG_MAX ? Types::LONG : Types::ULONG
+        else
+          Types::LONG
+        end
       else
-        Types::INT
+        # No suffix: decimal uses int/long/long long only; hex/oct may promote to unsigned
+        if hex_or_oct
+          if val <= INT_MAX then Types::INT
+          elsif val <= UINT_MAX then Types::UINT
+          elsif val <= LONG_MAX then Types::LONG
+          elsif val <= ULONG_MAX then Types::ULONG
+          else Types::ULONGLONG
+          end
+        else
+          if val <= INT_MAX then Types::INT
+          elsif val <= LONG_MAX then Types::LONG
+          else Types::LONGLONG
+          end
+        end
       end
     end
 

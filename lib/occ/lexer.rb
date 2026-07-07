@@ -8,7 +8,10 @@ module OCC
     def initialize(source, filename = '<stdin>')
       @filename = filename
       # Splice physical lines: backslash-newline is removed before tokenising.
-      @source = source.gsub(/\\\n/, '')
+      # Force binary (ASCII-8BIT) encoding so String#[] is always O(1) byte
+      # access.  Without this, any UTF-8 multibyte char in a string literal
+      # makes every subsequent str[pos] call O(pos), yielding O(N²) lexing.
+      @source = source.gsub(/\\\n/, '').b
       @pos    = 0
       @line   = 1
       @col    = 1
@@ -196,7 +199,8 @@ module OCC
     def scan_ident_or_keyword(l)
       start = @pos
       advance while !at_end? && cur =~ /[a-zA-Z0-9_]/
-      text = @source[start...@pos]
+      # Source is binary; identifiers are always ASCII so UTF-8 reinterpret is safe.
+      text = @source[start...@pos].force_encoding('UTF-8')
       type = KEYWORDS[text] || :ident
       Token.new(type, text, l)
     end
@@ -265,7 +269,7 @@ module OCC
         end
       end
 
-      raw  = @source[start...@pos]
+      raw  = @source[start...@pos].force_encoding('UTF-8')  # numbers are always ASCII
       type = is_float ? :float_lit : :int_lit
       Token.new(type, { raw: raw, suffix: suffix }, l)
     end
@@ -274,7 +278,7 @@ module OCC
 
     def scan_string_literal(l, prefix: nil)
       advance   # consume opening "
-      value = +''
+      value = +''.b  # binary accumulator: source is binary, bytes pass through unchanged
       loop do
         raise LexError.new('unterminated string literal', l) if at_end? || cur == "\n"
         break if cur == '"'
@@ -326,13 +330,13 @@ module OCC
         hex = +''
         4.times { hex << advance if !at_end? && cur =~ /[0-9a-fA-F]/ }
         raise LexError.new('invalid \\u escape sequence', loc) if hex.length != 4
-        [hex.to_i(16)].pack('U')
+        [hex.to_i(16)].pack('U').b  # pack as UTF-8 codepoint bytes, keep binary
       when 'U'
         advance
         hex = +''
         8.times { hex << advance if !at_end? && cur =~ /[0-9a-fA-F]/ }
         raise LexError.new('invalid \\U escape sequence', loc) if hex.length != 8
-        [hex.to_i(16)].pack('U')
+        [hex.to_i(16)].pack('U').b  # pack as UTF-8 codepoint bytes, keep binary
       when /[0-7]/
         oct = +''
         3.times { oct << advance if !at_end? && cur =~ /[0-7]/ }

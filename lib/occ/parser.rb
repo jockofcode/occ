@@ -91,6 +91,10 @@ module OCC
         return parse_static_assert
       end
 
+      if cur?(:ident) && cur.value == '__occ_pragma_pack__'
+        return parse_pragma_pack(l)
+      end
+
       specs = parse_declaration_specifiers
       return AST::Declaration.new(specifiers: specs, declarators: [], location: l) if cur?(:semicolon) && advance
 
@@ -625,6 +629,21 @@ module OCC
       expect(:rparen)
       expect(:semicolon)
       AST::StaticAssert.new(expr: expr, message: msg, location: l)
+    end
+
+    def parse_pragma_pack(l = loc)
+      advance  # consume __occ_pragma_pack__
+      expect(:lparen)
+      action = if cur?(:ident)
+        advance.value.to_sym  # :push or :pop
+      elsif cur?(:int_lit)
+        advance.value[:raw].to_i
+      else
+        :default
+      end
+      expect(:rparen)
+      expect(:semicolon)
+      AST::PragmaPack.new(action: action, location: l)
     end
 
     # ── Expressions ───────────────────────────────────────────────────────────

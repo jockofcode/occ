@@ -150,10 +150,10 @@ module OCC
 
     class StructType < CType
       attr_reader :keyword, :tag
-      attr_accessor :fields   # [{name:, type:, offset:}] or nil if incomplete
+      attr_accessor :fields, :pack   # pack: nil (natural) or Integer (max field alignment)
 
       def initialize(keyword, tag)
-        @keyword = keyword; @tag = tag; @fields = nil
+        @keyword = keyword; @tag = tag; @fields = nil; @pack = nil
       end
 
       def struct? = @keyword == :kw_struct
@@ -167,7 +167,15 @@ module OCC
         else
           # Flexible array members (unsized arrays) contribute 0 to struct size — exclude them.
           sized = @fields.reject { |f| f[:type].is_a?(ArrayType) && f[:type].count.nil? }
-          sized.last ? sized.last[:offset] + sized.last[:type].size : 0
+          if sized.last
+            last = sized.last
+            # For bitfields: use unit_size (the actual bytes consumed in the
+            # storage unit or packed group) rather than the underlying type size.
+            last_sz = (last[:bit_width] && last[:unit_size]) ? last[:unit_size] : (last[:type].size rescue 4)
+            last[:offset] + last_sz
+          else
+            0
+          end
         end
         # Add tail padding so sizeof(struct/union) is a multiple of its alignment (C standard).
         al = self.align
@@ -176,7 +184,8 @@ module OCC
 
       def align
         return 1 unless complete? && !@fields.empty?
-        @fields.map { |f| f[:type].align }.max
+        natural = @fields.map { |f| f[:type].align }.max
+        @pack ? [@pack, natural].min : natural
       end
 
       def to_s = "#{@keyword == :kw_struct ? 'struct' : 'union'} #{@tag}"

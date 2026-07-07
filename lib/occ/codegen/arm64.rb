@@ -168,30 +168,89 @@ module OCC
         end
       end
 
-      def emit_struct_init_data(struct_type, items, strings)
-        cur_off = 0
-        struct_type.fields.each_with_index do |field, fi|
-          field_off = field[:offset]
-          ft = field[:type]
-          fsz = type_byte_size(ft)
-
-          next if field_off < cur_off
-
-          if field_off > cur_off
-            emit "  .zero #{field_off - cur_off}"
-            cur_off = field_off
+      def emit_packed_bytes(value, sz)
+        case sz
+        when 1 then emit "  .byte #{value & 0xFF}"
+        when 2 then emit "  .short #{value & 0xFFFF}"
+        when 4 then emit "  .long #{value & 0xFFFFFFFF}"
+        when 8 then emit "  .quad #{value & 0xFFFF_FFFF_FFFF_FFFF}"
+        else
+          remaining = value
+          sz.times do
+            emit "  .byte #{remaining & 0xFF}"
+            remaining >>= 8
           end
-
-          item = items[fi]
-          if item.nil?
-            emit "  .zero #{fsz}"
-          elsif item.is_a?(Hash) && item[:kind] == :initializer_list
-            emit_compound_init_data(ft, item[:items], strings)
-          else
-            emit_compound_field_value(item, ft, strings)
-          end
-          cur_off = field_off + fsz
         end
+      end
+
+      def emit_struct_init_data(struct_type, items, strings)
+        cur_off  = 0
+        fields   = struct_type.fields
+        n_fields = fields.length
+        fi       = 0
+
+        while fi < n_fields
+          field     = fields[fi]
+          field_off = field[:offset]
+          ft        = field[:type]
+
+          if field[:bit_width]
+            # Bitfield: collect all fields sharing this storage unit/group and pack them.
+            unit_off  = field_off
+            packed    = 0
+            nfi       = fi
+            while nfi < n_fields
+              bf = fields[nfi]
+              break unless bf[:bit_width] && bf[:offset] == unit_off
+              val     = items[nfi]
+              val     = val.is_a?(Integer) ? val : 0
+              mask    = (1 << bf[:bit_width]) - 1
+              packed |= (val & mask) << bf[:bit_offset]
+              nfi    += 1
+            end
+            # Use the last field's unit_size: in packed (bit-packing) mode each
+            # field updates unit_size to ceil(cumulative_bits/8), so the last
+            # field's unit_size is the total byte count for the group.
+            unit_size = fields[nfi - 1][:unit_size]
+            fi = nfi
+
+            next if unit_off < cur_off  # already emitted this storage unit
+
+            if unit_off > cur_off
+              emit "  .zero #{unit_off - cur_off}"
+              cur_off = unit_off
+            end
+
+            emit_packed_bytes(packed, unit_size)
+            cur_off = unit_off + unit_size
+          else
+            # Regular (non-bitfield) field. Skip if offset already covered
+            # (handles union members that all share the same byte offset).
+            if field_off < cur_off
+              fi += 1
+              next
+            end
+
+            fsz = type_byte_size(ft)
+
+            if field_off > cur_off
+              emit "  .zero #{field_off - cur_off}"
+              cur_off = field_off
+            end
+
+            item = items[fi]
+            if item.nil?
+              emit "  .zero #{fsz}"
+            elsif item.is_a?(Hash) && item[:kind] == :initializer_list
+              emit_compound_init_data(ft, item[:items], strings)
+            else
+              emit_compound_field_value(item, ft, strings)
+            end
+            cur_off = field_off + fsz
+            fi += 1
+          end
+        end
+
         if struct_type.size > cur_off
           emit "  .zero #{struct_type.size - cur_off}"
         end
@@ -228,7 +287,9 @@ module OCC
               emit "  .quad #{lbl}"
             end
           when :ref
-            emit "  .quad #{sym(val[:name])}"
+            ref_target = sym(val[:name])
+            ref_target += " + #{val[:offset]}" if val[:offset] && val[:offset] != 0
+            emit "  .quad #{ref_target}"
           else
             emit "  .zero #{fsz}"
           end
@@ -256,6 +317,7 @@ module OCC
         @fp_alloca_slots = Set.new # alloca slots holding fp values
         @fp_temps      = Set.new  # temp IDs that hold fp (double/float) values
         @float_pool    = []   # [{label:, value:}] for literal-pool fp constants
+        @cond_skip_seq = 0    # unique suffix for CondJump skip labels
 
         # Pre-scan: collect alloca temps, their sizes, and mark FP allocas
         alloca_extra = 0  # extra bytes beyond 8 for oversized alloca temps
@@ -264,9 +326,10 @@ module OCC
             next unless i.is_a?(IR::Alloca)
             @alloca_slots << i.dst.id
             sz = ctype_stack_size(i.ctype)
-            @alloca_sizes[i.dst.id] = sz
+            sz_aligned = (sz + 7) / 8 * 8  # round to 8-byte multiple for slot advancement
+            @alloca_sizes[i.dst.id] = sz    # keep true size for load-width detection
             @alloca_ctypes[i.dst.id] = i.ctype
-            alloca_extra += [sz - 8, 0].max
+            alloca_extra += [sz_aligned - 8, 0].max
             @fp_alloca_slots << i.dst.id if fp_ctype?(i.ctype)
           end
         end
@@ -530,26 +593,24 @@ module OCC
               end
               @fp_alloca_slots << instr.ptr.id  # mark slot as FP once we store FP into it
             elsif instr.elem_size.to_i > 8
-              # Large struct copy into local slot: x9 = source addr, x10 = dest addr
+              # Large struct copy into local slot: x9 = source addr, x10 = dest addr.
+              # If source is a constant (e.g. zero-init), fill directly — do not use it as an address.
               load_operand(instr.value, 'x9')
               emit_addr_from_fp('x10', slot_of(instr.ptr))
-              emit_struct_copy('x9', 'x10', instr.elem_size)
-            elsif instr.type.is_a?(OCC::Types::StructType) && instr.elem_size.to_i.between?(1, 8)
-              # Small struct copy (1–8 bytes): source is a struct address temp.
-              # Load the struct bytes from that address, then write to local slot.
-              load_operand(instr.value, 'x9')
-              slot = slot_of(instr.ptr)
-              if instr.elem_size <= 4
-                emit '  ldr w10, [x9]'
-                if slot <= 32_760
-                  emit "  str w10, [x29, ##{slot}]"
-                else
-                  emit_addr_from_fp('x16', slot)
-                  emit '  str w10, [x16]'
-                end
+              if instr.value.is_a?(IR::Const)
+                emit_struct_fill('x9', 'x10', instr.elem_size)
               else
-                emit '  ldr x10, [x9]'
-                emit_slot_store('x10', slot)
+                emit_struct_copy('x9', 'x10', instr.elem_size)
+              end
+            elsif instr.type.is_a?(OCC::Types::StructType) && instr.elem_size.to_i.between?(1, 8)
+              # Small struct: source is a struct address temp OR a constant (e.g. zero-init).
+              # Use emit_struct_copy/fill so load/store widths match the actual struct size.
+              load_operand(instr.value, 'x9')
+              emit_addr_from_fp('x10', slot_of(instr.ptr))
+              if instr.value.is_a?(IR::Const)
+                emit_struct_fill('x9', 'x10', instr.elem_size)
+              else
+                emit_struct_copy('x9', 'x10', instr.elem_size)
               end
             else
               load_operand(instr.value, 'x9')
@@ -570,15 +631,16 @@ module OCC
               if fp_val
                 emit '  str d9, [x10]'
               elsif instr.elem_size > 8
-                emit_struct_copy('x9', 'x10', instr.elem_size)
-              elsif instr.type.is_a?(OCC::Types::StructType) && instr.elem_size.to_i.between?(1, 8)
-                # x9 = source struct address; dereference to copy struct bytes to dest
-                if instr.elem_size <= 4
-                  emit '  ldr w11, [x9]'
-                  emit '  str w11, [x10]'
+                if instr.value.is_a?(IR::Const)
+                  emit_struct_fill('x9', 'x10', instr.elem_size)
                 else
-                  emit '  ldr x11, [x9]'
-                  emit '  str x11, [x10]'
+                  emit_struct_copy('x9', 'x10', instr.elem_size)
+                end
+              elsif instr.type.is_a?(OCC::Types::StructType) && instr.elem_size.to_i.between?(1, 8)
+                if instr.value.is_a?(IR::Const)
+                  emit_struct_fill('x9', 'x10', instr.elem_size)
+                else
+                  emit_struct_copy('x9', 'x10', instr.elem_size)
                 end
               else
                 case instr.elem_size
@@ -594,14 +656,16 @@ module OCC
               if fp_val
                 emit '  str d9, [x10]'
               elsif instr.elem_size > 8
-                emit_struct_copy('x9', 'x10', instr.elem_size)
-              elsif instr.type.is_a?(OCC::Types::StructType) && instr.elem_size.to_i.between?(1, 8)
-                if instr.elem_size <= 4
-                  emit '  ldr w11, [x9]'
-                  emit '  str w11, [x10]'
+                if instr.value.is_a?(IR::Const)
+                  emit_struct_fill('x9', 'x10', instr.elem_size)
                 else
-                  emit '  ldr x11, [x9]'
-                  emit '  str x11, [x10]'
+                  emit_struct_copy('x9', 'x10', instr.elem_size)
+                end
+              elsif instr.type.is_a?(OCC::Types::StructType) && instr.elem_size.to_i.between?(1, 8)
+                if instr.value.is_a?(IR::Const)
+                  emit_struct_fill('x9', 'x10', instr.elem_size)
+                else
+                  emit_struct_copy('x9', 'x10', instr.elem_size)
                 end
               else
                 case instr.elem_size
@@ -674,7 +738,13 @@ module OCC
 
         when IR::CondJump
           load_operand(instr.cond, 'x9')
-          emit "  cbnz x9, #{func_local(instr.true_label)}"
+          # Use cbz to a local skip label + unconditional b for the true branch.
+          # cbnz/cbz are limited to ±1MB; b is ±128MB. In very large functions the
+          # true-target can be far, so we always route the far jump through b.
+          skip_lbl = "#{func_local(instr.true_label)}_cjskip#{@cond_skip_seq += 1}"
+          emit "  cbz  x9, #{skip_lbl}"
+          emit "  b    #{func_local(instr.true_label)}"
+          emit "#{skip_lbl}:"
           emit "  b    #{func_local(instr.false_label)}"
 
         when IR::Return
@@ -684,6 +754,16 @@ module OCC
               load_fp_operand(instr.value, 'd0')
             else
               load_operand(instr.value, 'x0')
+              # Truncate narrow unsigned return values so callers see wrapping semantics.
+              # (OCC arithmetic uses 64-bit registers; unsigned 32/16/8-bit overflow must wrap.)
+              rt = @func.return_type
+              if rt.is_a?(OCC::Types::IntegerType) && !rt.signed?
+                case rt.size.to_i
+                when 4 then emit '  ubfx x0, x0, #0, #32'
+                when 2 then emit '  ubfx x0, x0, #0, #16'
+                when 1 then emit '  ubfx x0, x0, #0, #8'
+                end
+              end
             end
           end
           # Epilogue
@@ -807,6 +887,17 @@ module OCC
           emit '  add x9, x9, x10'
         end
 
+        # Truncate unsigned 32-bit (and smaller) arithmetic results so overflow wraps correctly.
+        # OCC uses 64-bit registers; e.g. uint32_t(1)+uint32_t(UINT32_MAX) = 0x100000000 not 0.
+        if instr.type.is_a?(OCC::Types::IntegerType) && !instr.type.signed? &&
+           %i[plus minus star slash udiv percent umod amp pipe caret lshift rshift urshift].include?(instr.op)
+          case instr.type.size.to_i
+          when 4 then emit '  ubfx x9, x9, #0, #32'
+          when 2 then emit '  ubfx x9, x9, #0, #16'
+          when 1 then emit '  ubfx x9, x9, #0, #8'
+          end
+        end
+
         store_temp(instr.dst, 'x9')
       end
 
@@ -925,14 +1016,23 @@ module OCC
         if @mod.fp_funcs.include?(func_name) || fp_ctype?(instr.type)
           store_fp_temp(instr.dst, 'd0')
         else
-          # Sign-extend narrow signed int returns: external C functions (libc) place int/short/char
-          # in w0/h0/b0 which zeroes x0's upper bits; occ-compiled functions use full 64-bit x0.
-          # sxtw/sxth/sxtb normalises both cases to a consistent 64-bit signed value on the stack.
-          if instr.type.is_a?(OCC::Types::IntegerType) && instr.type.signed? && instr.type.size < 8
-            case instr.type.size
-            when 4 then emit '  sxtw x0, w0'
-            when 2 then emit '  sxth x0, w0'
-            when 1 then emit '  sxtb x0, w0'
+          # Normalise narrow integer returns to consistent 64-bit representations.
+          # Signed: sign-extend (libc returns w0; OCC returns full x0 — sxtw/sxth/sxtb handles both).
+          # Unsigned: zero-extend upper bits — OCC arithmetic may leave overflow bits set (e.g.
+          # safe_add_uint32(1, UINT32_MAX) computes 0x100000000; ubfx truncates to correct 0).
+          if instr.type.is_a?(OCC::Types::IntegerType) && instr.type.size.to_i < 8
+            if instr.type.signed?
+              case instr.type.size.to_i
+              when 4 then emit '  sxtw x0, w0'
+              when 2 then emit '  sxth x0, w0'
+              when 1 then emit '  sxtb x0, w0'
+              end
+            else
+              case instr.type.size.to_i
+              when 4 then emit '  ubfx x0, x0, #0, #32'
+              when 2 then emit '  ubfx x0, x0, #0, #16'
+              when 1 then emit '  ubfx x0, x0, #0, #8'
+              end
             end
           end
           store_temp(instr.dst, 'x0')
@@ -948,10 +1048,10 @@ module OCC
         id = temp.id
         return @slot_map[id] if @slot_map.key?(id)
         sz = @alloca_sizes&.[](id) || 8
-        # Keep 8-byte alignment
+        sz_aligned = (sz + 7) / 8 * 8  # advance slot_next by aligned size to avoid gaps
         @slot_next = ((@slot_next + 7) / 8 * 8)
         offset = @slot_next + 16   # +16 so first slot is at fp+16
-        @slot_next += sz
+        @slot_next += sz_aligned
         @slot_map[id] = offset
         offset
       end
@@ -1077,9 +1177,25 @@ module OCC
               emit "  ldr  #{reg}, [#{reg}, #{sym(op.name)}@GOTPAGEOFF]"
             end
           elsif @mod.globals.key?(op.name)
-            # Locally-defined data global: direct page-relative load
+            # Locally-defined data global: direct page-relative load with correct width
+            g_type = @mod.globals[op.name][:type]&.unqualified
+            g_sz   = (g_type.respond_to?(:size) ? g_type.size : 8 rescue 8)
+            signed = g_type.is_a?(OCC::Types::IntegerType) && g_type.signed?
+            wreg   = reg.start_with?('x') ? "w#{reg[1..]}" : reg
             emit "  adrp #{reg}, #{sym(op.name)}@PAGE"
-            emit "  ldr  #{reg}, [#{reg}, #{sym(op.name)}@PAGEOFF]"
+            case g_sz
+            when 1
+              emit(signed ? "  ldrsb #{reg}, [#{reg}, #{sym(op.name)}@PAGEOFF]"
+                          : "  ldrb #{wreg}, [#{reg}, #{sym(op.name)}@PAGEOFF]")
+            when 2
+              emit(signed ? "  ldrsh #{reg}, [#{reg}, #{sym(op.name)}@PAGEOFF]"
+                          : "  ldrh #{wreg}, [#{reg}, #{sym(op.name)}@PAGEOFF]")
+            when 4
+              emit(signed ? "  ldrsw #{reg}, [#{reg}, #{sym(op.name)}@PAGEOFF]"
+                          : "  ldr  #{wreg}, [#{reg}, #{sym(op.name)}@PAGEOFF]")
+            else
+              emit "  ldr  #{reg}, [#{reg}, #{sym(op.name)}@PAGEOFF]"
+            end
           else
             # Extern/dylib data global: GOT gives address of variable, then load value
             emit "  adrp #{reg}, #{sym(op.name)}@GOTPAGE"
@@ -1123,6 +1239,28 @@ module OCC
           emit "  ldrb w11, [#{src}, ##{offset}]"
           emit "  strb w11, [#{dst}, ##{offset}]"
         end
+      end
+
+      # Fill size bytes at [dst] with val_reg (for constant zero-init of large structs).
+      def emit_struct_fill(val_reg, dst, size)
+        offset = 0
+        while offset + 16 <= size
+          emit "  stp #{val_reg}, #{val_reg}, [#{dst}, ##{offset}]"
+          offset += 16
+        end
+        if offset + 8 <= size
+          emit "  str #{val_reg}, [#{dst}, ##{offset}]"
+          offset += 8
+        end
+        if offset + 4 <= size
+          emit "  str w#{val_reg[1..]}, [#{dst}, ##{offset}]"
+          offset += 4
+        end
+        if offset + 2 <= size
+          emit "  strh w#{val_reg[1..]}, [#{dst}, ##{offset}]"
+          offset += 2
+        end
+        emit "  strb w#{val_reg[1..]}, [#{dst}, ##{offset}]" if offset < size
       end
 
       def collect_temp_count(func)

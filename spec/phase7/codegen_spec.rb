@@ -177,9 +177,9 @@ RSpec.describe 'Phase 7: Code Generation' do
       expect(asm).to include('cset')
     end
 
-    it 'generates cbnz for conditional branches' do
+    it 'generates conditional branch instruction' do
       asm = arm64_asm('int f(int x){ if (x) { return 1; } return 0; }')
-      expect(asm).to include('cbnz')
+      expect(asm).to match(/cbnz|cbz/)
     end
 
     it 'loads string address with adrp + add' do

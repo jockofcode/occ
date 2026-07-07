@@ -19,6 +19,12 @@ module OCC
 
     # ── Declarations ─────────────────────────────────────────────────────────────
 
+    # #pragma pack directive emitted by preprocessor as __occ_pragma_pack__(n)
+    class PragmaPack < Node
+      attr_reader :action  # :push, :pop, :default, or Integer (alignment)
+      def initialize(action:, **kw) = (super(**kw); @action = action)
+    end
+
     class Declaration < Node
       attr_accessor :specifiers, :declarators   # declarators: [{name:, type_fn:, init:}]
       def initialize(specifiers:, declarators:, **kw)

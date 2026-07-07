@@ -532,6 +532,14 @@ module OCC
               load_fp_operand(instr.value, '%xmm0')
             else
               load_operand(instr.value, '%rax')
+              rt = @func.return_type
+              if rt.is_a?(OCC::Types::IntegerType) && !rt.signed?
+                case rt.size.to_i
+                when 4 then emit '  movl %eax, %eax'
+                when 2 then emit '  movzwq %ax, %rax'
+                when 1 then emit '  movzbq %al, %rax'
+                end
+              end
             end
           end
           emit '  movq %rbp, %rsp'
@@ -638,6 +646,16 @@ module OCC
           emit '  movzbq %al, %rax'
         else
           emit '  addq %rcx, %rax'   # fallback
+        end
+
+        # Truncate unsigned 32-bit (and smaller) arithmetic results so overflow wraps correctly.
+        if instr.type.is_a?(OCC::Types::IntegerType) && !instr.type.signed? &&
+           %i[plus minus star slash udiv percent umod amp pipe caret lshift rshift urshift].include?(instr.op)
+          case instr.type.size.to_i
+          when 4 then emit '  movl %eax, %eax'
+          when 2 then emit '  movzwq %ax, %rax'
+          when 1 then emit '  movzbq %al, %rax'
+          end
         end
 
         store_temp(instr.dst, '%rax')
@@ -755,6 +773,13 @@ module OCC
         if @mod.fp_funcs.include?(func_name) || fp_ctype?(instr.type)
           store_fp_temp(instr.dst, '%xmm0')
         else
+          if instr.type.is_a?(OCC::Types::IntegerType) && !instr.type.signed? && instr.type.size.to_i < 8
+            case instr.type.size.to_i
+            when 4 then emit '  movl %eax, %eax'
+            when 2 then emit '  movzwq %ax, %rax'
+            when 1 then emit '  movzbq %al, %rax'
+            end
+          end
           store_temp(instr.dst, '%rax')
         end
       end

@@ -491,7 +491,27 @@ module OCC
     # ── #pragma ───────────────────────────────────────────────────────────────
 
     def process_pragma(rest, filename)
-      @once_files << filename if rest.strip == 'once'
+      s = rest.strip
+      if s == 'once'
+        @once_files << filename
+      elsif s =~ /\Apack\s*\((.*)\)\z/i
+        emit_pragma_pack($1.strip)
+      end
+    end
+
+    def emit_pragma_pack(args_str)
+      parts = args_str.split(',').map(&:strip)
+      case parts[0]
+      when 'push'
+        @output << '__occ_pragma_pack__(push);'
+        @output << "__occ_pragma_pack__(#{parts[1]});" if parts[1]
+      when 'pop'
+        @output << '__occ_pragma_pack__(pop);'
+      when ''
+        @output << '__occ_pragma_pack__(0);'
+      else
+        @output << "__occ_pragma_pack__(#{parts[0]});"
+      end
     end
 
     # ── Macro expansion ───────────────────────────────────────────────────────

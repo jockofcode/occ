@@ -279,11 +279,12 @@ module OCC
       end
 
       def build_function(fn)
-        @temp_counter  = 0
-        @label_counter = 0
-        @locals        = {}
-        @local_ctypes  = {}
-        @static_locals = {}
+        @temp_counter    = 0
+        @label_counter   = 0
+        @locals          = {}
+        @local_ctypes    = {}
+        @static_locals   = {}
+        @func_ret_ctype  = fn.respond_to?(:resolved_return_type) ? fn.resolved_return_type : nil
 
         ret_type = fn.specifiers.type_keywords.first&.to_s || 'int'
 
@@ -353,7 +354,16 @@ module OCC
           alloca_ct = lp[:ctype] || lp[:type]
           emit(Alloca.new(slot, alloca_ct))
           if cts.length == 1
-            emit(Store.new(slot, cts.first))
+            struct_sz = alloca_ct.is_a?(OCC::Types::StructType) && alloca_ct.complete? ? (alloca_ct.size rescue 0) : 0
+            if struct_sz > 16
+              # Large struct passed indirectly via pointer in a single register.
+              # Copy the struct bytes from the incoming pointer into our alloca slot.
+              base_addr = new_temp
+              emit(AddrOf.new(base_addr, slot))
+              emit(Store.new(base_addr, cts.first, alloca_ct, struct_sz))
+            else
+              emit(Store.new(slot, cts.first))
+            end
           else
             base_addr = new_temp
             emit(AddrOf.new(base_addr, slot))
@@ -498,13 +508,11 @@ module OCC
         when AST::UnaryOp
           if expr.op == :addr_of && allow_ref
             operand = expr.operand
-            case operand
-            when AST::Identifier
+            addr = const_addr_of(operand)
+            if addr
+              addr[:offset] && addr[:offset] != 0 ? addr : { kind: :ref, name: addr[:name] }
+            elsif operand.is_a?(AST::Identifier)
               { kind: :ref, name: operand.name }
-            when AST::IndexExpr
-              base = operand.array
-              idx  = eval_const_init(operand.index, allow_ref: false)
-              { kind: :ref, name: base.name, offset: idx } if base.is_a?(AST::Identifier) && idx.is_a?(Integer)
             end
           else
             v = eval_const_init(expr.operand, allow_ref: allow_ref)
@@ -535,6 +543,37 @@ module OCC
               items: (expr[:items] || []).map { |item| eval_const_init(item[:value], allow_ref: true) } }
           end
         else nil
+        end
+      end
+
+      # Recursively resolve a constant lvalue expression to {kind: :ref, name:, offset:}.
+      # Handles &arr[i], &arr[i][j], &arr[i][j][k], &struct.field, etc.
+      def const_addr_of(expr)
+        case expr
+        when AST::Identifier
+          { kind: :ref, name: expr.name, offset: 0 }
+        when AST::IndexExpr
+          base_addr = const_addr_of(expr.array)
+          return nil unless base_addr
+          idx = eval_const_init(expr.index, allow_ref: false)
+          return nil unless idx.is_a?(Integer)
+          arr_ct = expr.array.ctype || infer_node_ctype(expr.array)
+          esz = elem_size_for(arr_ct)
+          { kind: :ref, name: base_addr[:name], offset: base_addr[:offset] + idx * esz }
+        when AST::MemberExpr
+          # dot-access only; arrow requires runtime dereference
+          return nil if expr.arrow
+          base_addr = const_addr_of(expr.expr)
+          return nil unless base_addr
+          struct_ct = expr.expr.ctype || infer_node_ctype(expr.expr)
+          return nil unless struct_ct
+          struct_ct = struct_ct.unqualified if struct_ct.respond_to?(:unqualified)
+          return nil unless struct_ct.is_a?(OCC::Types::StructType) && struct_ct.complete?
+          field = struct_ct.fields.find { |f| f[:name] == expr.member }
+          return nil unless field
+          { kind: :ref, name: base_addr[:name], offset: base_addr[:offset] + field[:offset] }
+        else
+          nil
         end
       end
 
@@ -673,12 +712,48 @@ module OCC
         @static_locals[name] || name
       end
 
+      # Read-modify-write a bitfield in a struct initializer.
+      # fptr points to the group start (field[:offset] within the struct base).
+      # Computes byte_start from bit_offset, loads the minimum power-of-2 unit,
+      # clears the field's bits, ORs in val, and stores back.
+      def write_bitfield_init(fptr, field, val)
+        raw_bit_offset = field[:bit_offset]
+        byte_start     = raw_bit_offset / 8
+        adj_bit_offset = raw_bit_offset % 8
+        total_bits     = adj_bit_offset + field[:bit_width]
+        load_size      = total_bits <= 8 ? 1 : total_bits <= 16 ? 2 : total_bits <= 32 ? 4 : 8
+
+        unit_ptr = if byte_start.zero?
+                     fptr
+                   else
+                     t = new_temp
+                     emit(Binary.new(t, :plus, fptr, Const.new(byte_start)))
+                     t
+                   end
+
+        old_unit   = new_temp
+        emit(Load.new(old_unit, unit_ptr, nil, load_size))
+        mask        = (1 << field[:bit_width]) - 1
+        clear_mask  = ~(mask << adj_bit_offset) & 0xFFFF_FFFF_FFFF_FFFF
+        cleared     = new_temp
+        emit(Binary.new(cleared, :amp, old_unit, Const.new(clear_mask)))
+        val_masked  = new_temp
+        emit(Binary.new(val_masked, :amp, val, Const.new(mask)))
+        val_shifted = new_temp
+        emit(Binary.new(val_shifted, :lshift, val_masked, Const.new(adj_bit_offset)))
+        new_unit    = new_temp
+        emit(Binary.new(new_unit, :pipe, cleared, val_shifted))
+        emit(Store.new(unit_ptr, new_unit, nil, load_size))
+      end
+
       # Emit stores for a brace-enclosed initializer list into memory starting at base_ptr.
       def build_initializer_list(base_ptr, init_list, ctype)
         items = init_list[:items] || []
 
         if ctype.is_a?(OCC::Types::StructType) && ctype.complete?
-          # Zero-initialize all fields first (C11 §6.7.9 ¶10: unspecified members are zero)
+          # Zero-initialize all fields first (C11 §6.7.9 ¶10: unspecified members are zero).
+          # Bitfields use read-modify-write to correctly handle packed groups where multiple
+          # fields share the same storage unit bytes.
           ctype.fields.each do |field|
             next unless field[:name]
             fptr = if field[:offset].zero?
@@ -688,8 +763,12 @@ module OCC
                      emit(Binary.new(t, :plus, base_ptr, Const.new(field[:offset])))
                      t
                    end
-            esz = field[:type].size rescue 8
-            emit(Store.new(fptr, Const.new(0), field[:type], esz))
+            if field[:bit_width]
+              write_bitfield_init(fptr, field, Const.new(0))
+            else
+              esz = field[:type].size rescue 8
+              emit(Store.new(fptr, Const.new(0), field[:type], esz))
+            end
           end
           # Then apply explicit initializers
           items.each_with_index do |item, seq_idx|
@@ -710,6 +789,9 @@ module OCC
                    end
             if item[:value].is_a?(Hash) && item[:value][:kind] == :initializer_list
               build_initializer_list(fptr, item[:value], field[:type])
+            elsif field[:bit_width]
+              val = build_expr(item[:value])
+              write_bitfield_init(fptr, field, val)
             else
               val = build_expr(item[:value])
               esz = field[:type].size rescue 8
@@ -745,6 +827,21 @@ module OCC
       def build_return(node)
         if node.value
           val = build_expr(node.value)
+          # Implicit narrowing coercion: return (int)(-244) in a uint8_t function → truncate
+          ret_ct = @func_ret_ctype
+          val_ct = node.value.respond_to?(:ctype) ? node.value.ctype : nil
+          if ret_ct && val_ct
+            ret_inner = ret_ct.respond_to?(:unqualified) ? ret_ct.unqualified : ret_ct
+            val_inner = val_ct.respond_to?(:unqualified) ? val_ct.unqualified : val_ct
+            if ret_inner.is_a?(OCC::Types::IntegerType) &&
+               val_inner.is_a?(OCC::Types::IntegerType) &&
+               ret_inner.size < val_inner.size &&
+               ret_inner.size < 4  # only sub-int widths need explicit truncation
+              cast_tmp = new_temp
+              emit(Cast.new(cast_tmp, val, ret_inner.to_s, ret_ct))
+              val = cast_tmp
+            end
+          end
           emit(Return.new(val))
         else
           emit(Return.new)
@@ -1141,7 +1238,7 @@ module OCC
         # (approximated by size) >= the signed type's rank. Otherwise the signed
         # type dominates and the operation is signed.
         # FP types never use unsigned comparison variants (float has no signed/unsigned).
-        if %i[gt lt geq leq slash percent rshift].include?(op)
+        if %i[gt lt geq leq eq neq slash percent rshift].include?(op)
           lct = node.left.ctype
           rct = node.right.ctype
           lct_inner = lct.respond_to?(:unqualified) ? lct.unqualified : lct
@@ -1156,17 +1253,17 @@ module OCC
                        elsif lct_unsigned && rct_unsigned
                          true
                        elsif lct_unsigned && !rct_unsigned
-                         # unsigned left, signed right: unsigned comparison only if
-                         # unsigned rank >= signed rank (C §6.3.1.8)
+                         # C §6.3.1.8: unsigned comparison only if the unsigned
+                         # type has rank >= int (size >= 4). Sub-int unsigned types
+                         # (uint8_t, uint16_t) are promoted to signed int first.
                          ls = lct_inner.respond_to?(:size) ? lct_inner.size.to_i : 8
                          rs = rct_inner.respond_to?(:size) ? rct_inner.size.to_i : 8
-                         ls >= rs
+                         ls >= rs && ls >= 4
                        elsif !lct_unsigned && rct_unsigned
-                         # signed left, unsigned right: unsigned comparison only if
-                         # unsigned rank >= signed rank
+                         # Same rule on the other side
                          ls = lct_inner.respond_to?(:size) ? lct_inner.size.to_i : 8
                          rs = rct_inner.respond_to?(:size) ? rct_inner.size.to_i : 8
-                         rs >= ls
+                         rs >= ls && rs >= 4
                        else
                          false
                        end
@@ -1181,6 +1278,30 @@ module OCC
                    when :rshift  then :urshift
                    else op
                    end
+              # C §6.3.1.8: when unsigned wins, the signed operand is converted
+              # to the unsigned type. For uint32_t vs int32_t: int32_t(-1)
+              # sign-extends to 0xFFFFFFFFFFFFFFFF in a 64-bit register =
+              # UINT64_MAX, not UINT32_MAX. Cast signed to uint32_t to zero-
+              # extend correctly before the unsigned comparison.
+              # For uint64_t vs int32_t: int32_t sign-extends to the correct
+              # uint64_t representation already (e.g. -7 → 0xFFFFFFF9 in 32
+              # bits, but 0xFFFFFFFFFFFFFFF9 sign-extended = correct uint64).
+              # Only cast when the unsigned side is also 4 bytes.
+              if lct_unsigned && !rct_unsigned &&
+                 rct_inner.is_a?(OCC::Types::IntegerType) && rct_inner.size == 4 &&
+                 lct_inner.respond_to?(:size) && lct_inner.size.to_i == 4
+                unsigned_ct = OCC::Types::UINT
+                cast_t = new_temp
+                emit(Cast.new(cast_t, right, unsigned_ct.to_s, unsigned_ct))
+                right = cast_t
+              elsif !lct_unsigned && rct_unsigned &&
+                    lct_inner.is_a?(OCC::Types::IntegerType) && lct_inner.size == 4 &&
+                    rct_inner.respond_to?(:size) && rct_inner.size.to_i == 4
+                unsigned_ct = OCC::Types::UINT
+                cast_t = new_temp
+                emit(Cast.new(cast_t, left, unsigned_ct.to_s, unsigned_ct))
+                left = cast_t
+              end
             end
           end
         end
@@ -1260,6 +1381,13 @@ module OCC
         dst
       end
 
+      def maybe_truncate_narrow(val, ct)
+        return val unless ct.is_a?(OCC::Types::IntegerType) && ct.size < 4
+        trunc = new_temp
+        emit(Cast.new(trunc, val, ct.to_s, ct))
+        trunc
+      end
+
       def build_unary(node)
         case node.op
         when :addr_of
@@ -1273,9 +1401,10 @@ module OCC
               emit(AddrOf.new(dst, GlobalRef.new(global_name_for(node.operand.name))))
             end
           when AST::IndexExpr
-            arr = build_expr(node.operand.array)
-            idx = build_expr(node.operand.index)
-            esz = elem_size_for(node.operand.array.ctype)
+            arr      = build_expr(node.operand.array)
+            idx      = build_expr(node.operand.index)
+            array_ct = node.operand.array.ctype || infer_node_ctype(node.operand.array)
+            esz      = elem_size_for(array_ct)
             emit(Gep.new(dst, arr, idx, esz))
           when AST::MemberExpr
             return build_member_addr(node.operand)
@@ -1335,6 +1464,7 @@ module OCC
             else
               emit(Binary.new(new_val, :plus, old, Const.new(1)))
             end
+            new_val = maybe_truncate_narrow(new_val, ct) unless esz
             emit(Store.new(slot, new_val))
             new_val
           else
@@ -1347,6 +1477,7 @@ module OCC
             else
               emit(Binary.new(new_val, :plus, old, Const.new(1)))
             end
+            new_val = maybe_truncate_narrow(new_val, ct) unless esz
             emit(Store.new(addr, new_val, nil, sz))
             new_val
           end
@@ -1362,6 +1493,7 @@ module OCC
             else
               emit(Binary.new(new_val, :plus, old, Const.new(1)))
             end
+            new_val = maybe_truncate_narrow(new_val, ct) unless esz
             emit(Store.new(slot, new_val))
             old
           else
@@ -1374,6 +1506,7 @@ module OCC
             else
               emit(Binary.new(new_val, :plus, old, Const.new(1)))
             end
+            new_val = maybe_truncate_narrow(new_val, ct) unless esz
             emit(Store.new(addr, new_val, nil, sz))
             old
           end
@@ -1389,6 +1522,7 @@ module OCC
             else
               emit(Binary.new(new_val, :minus, old, Const.new(1)))
             end
+            new_val = maybe_truncate_narrow(new_val, ct) unless esz
             emit(Store.new(slot, new_val))
             new_val
           else
@@ -1401,6 +1535,7 @@ module OCC
             else
               emit(Binary.new(new_val, :minus, old, Const.new(1)))
             end
+            new_val = maybe_truncate_narrow(new_val, ct) unless esz
             emit(Store.new(addr, new_val, nil, sz))
             new_val
           end
@@ -1416,6 +1551,7 @@ module OCC
             else
               emit(Binary.new(new_val, :minus, old, Const.new(1)))
             end
+            new_val = maybe_truncate_narrow(new_val, ct) unless esz
             emit(Store.new(slot, new_val))
             old
           else
@@ -1428,6 +1564,7 @@ module OCC
             else
               emit(Binary.new(new_val, :minus, old, Const.new(1)))
             end
+            new_val = maybe_truncate_narrow(new_val, ct) unless esz
             emit(Store.new(addr, new_val, nil, sz))
             old
           end
@@ -1480,6 +1617,14 @@ module OCC
             emit(Binary.new(result, op, old, val))
           end
           val = result
+          # Compound assignment to narrow integer types: the expression value must
+          # be the stored (truncated) value, not the wide intermediate result.
+          tct_inner = tct.respond_to?(:unqualified) ? tct.unqualified : tct
+          if tct_inner.is_a?(OCC::Types::IntegerType) && tct_inner.size < 8
+            trunc = new_temp
+            emit(Cast.new(trunc, val, tct_inner.to_s, tct))
+            val = trunc
+          end
         end
 
         # Implicit integer → float/double conversion when assigning to an FP lvalue.
@@ -1490,6 +1635,14 @@ module OCC
             cast_t = new_temp
             emit(Cast.new(cast_t, val, val_ct, tgt_ct))
             val = cast_t
+          end
+          # Simple assignment to narrow integer types: the expression value must be
+          # the stored (truncated) value, not the wide rhs (e.g. uint32_t = int64_t).
+          tgt_inner = tgt_ct.respond_to?(:unqualified) ? tgt_ct.unqualified : tgt_ct
+          if tgt_inner.is_a?(OCC::Types::IntegerType) && tgt_inner.size < 8
+            trunc = new_temp
+            emit(Cast.new(trunc, val, tgt_inner.to_s, tgt_inner))
+            val = trunc
           end
         end
 
@@ -1515,13 +1668,27 @@ module OCC
             ptr     = saved_deref_ptr || build_expr(node.target.operand)
             elem_sz = saved_deref_esz || elem_size_for(node.target.operand.ctype)
             val_ct  = node.value.respond_to?(:ctype) ? node.value.ctype : nil
+            # GlobalRef as ptr means a pointer stored in a global variable.
+            # Use AddrOf+Load: load_operand(GlobalRef) already loads the global's
+            # VALUE, so Load(GlobalRef) would double-dereference. Instead emit
+            # AddrOf(addr, GlobalRef) then Load(t, addr) to read the pointer once.
+            if ptr.is_a?(IR::GlobalRef) && @mod.globals.key?(ptr.name)
+              addr = new_temp
+              emit(AddrOf.new(addr, ptr))
+              t = new_temp
+              g_type = @mod.globals[ptr.name][:type]
+              g_sz   = g_type.respond_to?(:size) ? (g_type.size rescue 8) : 8
+              emit(Load.new(t, addr, g_type, g_sz))
+              ptr = t
+            end
             emit(Store.new(ptr, val, val_ct, elem_sz))
           end
         when AST::IndexExpr
-          arr    = build_expr(node.target.array)
-          idx    = build_expr(node.target.index)
-          elem_sz = elem_size_for(node.target.array.ctype)
-          ptr    = new_temp
+          arr     = build_expr(node.target.array)
+          idx     = build_expr(node.target.index)
+          tgt_act = node.target.array.ctype || infer_node_ctype(node.target.array)
+          elem_sz = elem_size_for(tgt_act)
+          ptr     = new_temp
           emit(Gep.new(ptr, arr, idx, elem_sz))
           val_ct  = node.value.respond_to?(:ctype) ? node.value.ctype : nil
           emit(Store.new(ptr, val, val_ct, elem_sz))
@@ -1642,18 +1809,56 @@ module OCC
       def build_index(node)
         arr     = build_expr(node.array)
         idx     = build_expr(node.index)
-        elem_sz = elem_size_for(node.array.ctype)
-        ptr     = new_temp
+        # When the semantic analyzer skips annotating sub-expressions inside
+        # initializer lists, node.array.ctype may be nil. Fall back to inferring
+        # the type from the identifier's global registration or @local_ctypes.
+        array_ct  = node.array.ctype || infer_node_ctype(node.array)
+        elem_sz   = elem_size_for(array_ct)
+        # Infer the result type for this indexing (element of the array/pointer).
+        result_ct = node.ctype || infer_index_result_ctype(array_ct)
+        ptr       = new_temp
         emit(Gep.new(ptr, arr, idx, elem_sz))
         # If the indexed result is itself an aggregate (array or struct), do
         # not load through the pointer — the expression decays to its address.
-        if node.ctype.is_a?(OCC::Types::ArrayType) ||
-           node.ctype.is_a?(OCC::Types::StructType)
+        if result_ct.is_a?(OCC::Types::ArrayType) ||
+           result_ct.is_a?(OCC::Types::StructType)
           return ptr
         end
         dst = new_temp
-        emit(Load.new(dst, ptr, node.ctype, elem_sz))
+        emit(Load.new(dst, ptr, result_ct, elem_sz))
         dst
+      end
+
+      # Infer the ctype of a node when semantic analysis didn't annotate it.
+      def infer_node_ctype(node)
+        case node
+        when AST::Identifier
+          slot = @locals[node.name]
+          slot ? @local_ctypes[node.name] : (@mod.globals[global_name_for(node.name)]&.dig(:type))
+        when AST::IndexExpr
+          parent_ct = node.ctype || infer_node_ctype(node.array)
+          infer_index_result_ctype(parent_ct)
+        when AST::MemberExpr
+          # Infer the type of a member access (e.g. for const_addr_of of nested members).
+          return nil if node.arrow
+          parent_ct = node.expr.ctype || infer_node_ctype(node.expr)
+          return nil unless parent_ct
+          parent_ct = parent_ct.unqualified if parent_ct.respond_to?(:unqualified)
+          # For pointer member access, unwrap pointer first.
+          parent_ct = parent_ct.base if node.arrow && parent_ct.is_a?(OCC::Types::PointerType)
+          return nil unless parent_ct.is_a?(OCC::Types::StructType) && parent_ct.complete?
+          field = parent_ct.fields.find { |f| f[:name] == node.member }
+          field&.dig(:type)
+        end
+      end
+
+      # Return the element type when indexing into array_ct.
+      def infer_index_result_ctype(array_ct)
+        ct = array_ct.respond_to?(:unqualified) ? array_ct.unqualified : array_ct
+        case ct
+        when OCC::Types::ArrayType   then ct.element
+        when OCC::Types::PointerType then ct.base
+        end
       end
 
       # ── Member access ────────────────────────────────────────────────────────
@@ -1676,11 +1881,14 @@ module OCC
         # Base pointer: for -> load the pointer value; for . take the address of the struct.
         base_ptr = node.arrow ? build_expr(node.expr) : lvalue_addr(node.expr)
 
-        if field[:offset].zero?
+        byte_off = field[:offset]
+        # For packed bitfields, the load unit starts at group_byte + floor(bit_offset/8).
+        byte_off += field[:bit_offset] / 8 if field[:bit_width]
+        if byte_off.zero?
           base_ptr
         else
           t = new_temp
-          emit(Binary.new(t, :plus, base_ptr, Const.new(field[:offset])))
+          emit(Binary.new(t, :plus, base_ptr, Const.new(byte_off)))
           t
         end
       rescue
@@ -1698,9 +1906,19 @@ module OCC
           shifted = new_temp
           emit(Binary.new(shifted, :rshift, raw, Const.new(bf[:bit_offset])))
           mask    = (1 << bf[:bit_width]) - 1
-          dst     = new_temp
-          emit(Binary.new(dst, :amp, shifted, Const.new(mask)))
-          dst
+          masked  = new_temp
+          emit(Binary.new(masked, :amp, shifted, Const.new(mask)))
+          if bf[:signed]
+            # Sign-extend: shift left to place sign bit at bit 63, then arithmetic right shift
+            shl_amt = 64 - bf[:bit_width]
+            t1 = new_temp
+            emit(Binary.new(t1, :lshift, masked, Const.new(shl_amt)))
+            dst = new_temp
+            emit(Binary.new(dst, :rshift, t1, Const.new(shl_amt)))
+            dst
+          else
+            masked
+          end
         else
           field_ptr = build_member_addr(node)
           # Array-type and struct/union-type fields return the address directly.
@@ -1718,7 +1936,10 @@ module OCC
         end
       end
 
-      # Return bitfield metadata {bit_offset:, bit_width:, unit_size:} or nil.
+      # Return bitfield metadata {bit_offset:, bit_width:, unit_size:, byte_start:, signed:} or nil.
+      # Under #pragma pack, bit_offset can be ≥ 8, meaning the load must start
+      # at group_byte + floor(bit_offset/8) with an adjusted bit position within
+      # that aligned load unit.
       def bitfield_info(node)
         ctype = node.expr.ctype
         return nil unless ctype
@@ -1727,8 +1948,19 @@ module OCC
         return nil unless ctype.is_a?(OCC::Types::StructType) && ctype.complete?
         field = ctype.fields.find { |f| f[:name] == node.member }
         return nil unless field && field[:bit_width]
-        { bit_offset: field[:bit_offset], bit_width: field[:bit_width],
-          unit_size: field[:unit_size] || 4 }
+        ft = field[:type]
+        ft = ft.unqualified if ft.respond_to?(:unqualified)
+        signed = ft.is_a?(OCC::Types::IntegerType) && ft.signed?
+        raw_bit_offset = field[:bit_offset]
+        bit_width      = field[:bit_width]
+        # Byte start within the group: for packed bitfields bit_offset can be ≥ 8.
+        byte_start     = raw_bit_offset / 8
+        adj_bit_offset = raw_bit_offset % 8
+        # Minimum power-of-2 load size that covers all the bits from adj_bit_offset.
+        total_bits = adj_bit_offset + bit_width
+        load_size  = total_bits <= 8 ? 1 : total_bits <= 16 ? 2 : total_bits <= 32 ? 4 : 8
+        { bit_offset: adj_bit_offset, bit_width: bit_width,
+          unit_size: load_size, byte_start: byte_start, signed: signed }
       rescue
         nil
       end
@@ -1758,12 +1990,29 @@ module OCC
             emit(AddrOf.new(dst, GlobalRef.new(global_name_for(node.name))))
           end
         when AST::UnaryOp
-          return build_expr(node.operand) if node.op == :deref
+          if node.op == :deref
+            result = build_expr(node.operand)
+            # GlobalRef as ptr means a pointer stored in a global variable.
+            # We need the VALUE stored in the global (the pointer) — not the
+            # global's own address, and not a double-dereference.
+            # Use AddrOf to get &global, then Load to read global's value.
+            if result.is_a?(IR::GlobalRef) && @mod.globals.key?(result.name)
+              addr = new_temp
+              emit(AddrOf.new(addr, result))
+              t = new_temp
+              g_type = @mod.globals[result.name][:type]
+              g_sz   = g_type.respond_to?(:size) ? (g_type.size rescue 8) : 8
+              emit(Load.new(t, addr, g_type, g_sz))
+              return t
+            end
+            return result
+          end
           emit(Copy.new(dst, build_expr(node)))
         when AST::IndexExpr
-          arr    = build_expr(node.array)
-          idx    = build_expr(node.index)
-          esz    = elem_size_for(node.array.ctype)
+          arr     = build_expr(node.array)
+          idx     = build_expr(node.index)
+          arr_act = node.array.ctype || infer_node_ctype(node.array)
+          esz     = elem_size_for(arr_act)
           emit(Gep.new(dst, arr, idx, esz))
         when AST::MemberExpr
           return build_member_addr(node)
