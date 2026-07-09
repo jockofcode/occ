@@ -10,4 +10,8 @@ extern int bcmp(const void *b1, const void *b2, size_t len);
 extern void bcopy(const void *src, void *dst, size_t len);
 extern void bzero(void *b, size_t len);
 
+extern int ffs(int i);
+extern int ffsl(long i);
+extern int ffsll(long long i);
+
 #endif /* _OCC_STRINGS_H */

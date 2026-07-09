@@ -82,23 +82,28 @@ module OCC
       require_relative 'codegen/amd64'
       require_relative 'codegen/arm64'
 
-      target        = options[:target] || detect_target
-      occ_include   = File.join(File.dirname(__FILE__), 'include')
-      include_paths = [occ_include] + (options[:include_paths] || [])
-      defines       = options[:defines] || []
+      target          = options[:target] || detect_target
+      occ_include     = File.join(File.dirname(__FILE__), 'include')
+      include_paths   = [occ_include] + (options[:include_paths] || [])
+      framework_paths = options[:framework_paths] || []
+      defines         = options[:defines] || []
 
       # Phase 3: Preprocess
       pp     = Preprocessor.new(source, filename,
                                 include_paths: include_paths,
+                                framework_paths: framework_paths,
                                 defines: defines,
                                 target: target)
       source = pp.process
+      pp     = nil
+      GC.compact
 
-      # Phase 2: Lex
-      tokens = Lexer.new(source, filename).tokenize
-
-      # Phase 4: Parse
-      ast = Parser.new(tokens).parse
+      # Phase 2+4: Lex and Parse in lockstep — no token array materialised
+      lexer  = Lexer.new(source, filename)
+      source = nil
+      ast    = Parser.new(lexer).parse
+      lexer  = nil
+      GC.compact
 
       # Phase 5: Semantic analysis
       sa = Semantic.new
@@ -107,6 +112,9 @@ module OCC
 
       # Phase 6: IR
       ir_mod = IR::Builder.new.build(ast)
+      ast = nil
+      sa  = nil
+      GC.compact
 
       # Phase 7: Code generation
       gen = case target
@@ -116,7 +124,9 @@ module OCC
               Codegen::AMD64.new(ir_mod, target: target)
             end
 
-      gen.generate
+      asm = gen.generate
+      ir_mod = nil
+      asm
     end
 
     def self.assemble(asm_text, obj_path, target)
@@ -154,12 +164,13 @@ module OCC
 
     def self.parse_options(args)
       options = {
-        files:         [],
-        output:        nil,
-        compile_only:  false,
-        include_paths: [],
-        defines:       [],
-        target:        detect_target
+        files:           [],
+        output:          nil,
+        compile_only:    false,
+        include_paths:   [],
+        framework_paths: [],
+        defines:         [],
+        target:          detect_target
       }
 
       i = 0
@@ -176,6 +187,12 @@ module OCC
           i += 1
         when '-I'
           options[:include_paths] << args[i + 1]
+          i += 2
+        when /\A-F(.+)/
+          options[:framework_paths] << Regexp.last_match(1)
+          i += 1
+        when '-F'
+          options[:framework_paths] << args[i + 1]
           i += 2
         when /\A-D(.+)/
           options[:defines] << Regexp.last_match(1)

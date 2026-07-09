@@ -115,6 +115,18 @@ extern float fmodf(float x, float y);
 extern float fmaxf(float x, float y);
 extern float fminf(float x, float y);
 
+/* Error function */
+extern double erf(double x);
+extern double erfc(double x);
+extern float  erff(float x);
+extern float  erfcf(float x);
+
+/* Bessel functions */
+extern double j0(double x);
+extern double j1(double x);
+extern double y0(double x);
+extern double y1(double x);
+
 /* Classification macros (simplified) */
 #define isnan(x)    ((x) != (x))
 #define isinf(x)    (!isnan(x) && isnan((x) - (x)))

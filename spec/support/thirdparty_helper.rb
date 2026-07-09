@@ -52,13 +52,20 @@ module ThirdpartyHelper
     end
 
     unless system('git', '-C', repo_dir, 'checkout', '--quiet', commit)
-      # Cached repo may be corrupted — wipe and re-clone
-      FileUtils.rm_rf(repo_dir)
-      out, err, status = Open3.capture3('git', 'clone', '--quiet', '--no-tags', url, repo_dir)
-      unless status.success?
-        skip "failed to re-clone #{url}: #{err.strip}"
+      # Tag refs are not fetched with --no-tags; try fetching it explicitly first
+      system('git', '-C', repo_dir, 'fetch', '--quiet', 'origin',
+             "refs/tags/#{commit}:refs/tags/#{commit}")
+      unless system('git', '-C', repo_dir, 'checkout', '--quiet', commit)
+        # Cached repo may be corrupted — wipe and re-clone
+        FileUtils.rm_rf(repo_dir)
+        out, err, status = Open3.capture3('git', 'clone', '--quiet', '--no-tags', url, repo_dir)
+        unless status.success?
+          skip "failed to re-clone #{url}: #{err.strip}"
+        end
+        system('git', '-C', repo_dir, 'fetch', '--quiet', 'origin',
+               "refs/tags/#{commit}:refs/tags/#{commit}")
+        skip "failed to checkout #{commit}" unless system('git', '-C', repo_dir, 'checkout', '--quiet', commit)
       end
-      skip "failed to checkout #{commit}" unless system('git', '-C', repo_dir, 'checkout', '--quiet', commit)
     end
 
     repo_dir

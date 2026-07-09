@@ -239,9 +239,22 @@ module OCC
         return nil if c.nil?
         c != 0 ? eval_const_expr(node.then_expr) : eval_const_expr(node.else_expr)
       when AST::Cast
-        # For compile-time constant folding, evaluate inner expression.
-        # Integer truncation edge cases don't matter for array sizes.
-        eval_const_expr(node.expr)
+        v = eval_const_expr(node.expr)
+        return nil if v.nil?
+        # Apply unsigned wrapping so (unsigned int)-1 = UINT_MAX, etc.
+        ct = resolve_type(node.type_spec[:specs], node.type_spec[:type_fn]) rescue nil
+        if ct
+          u = ct.respond_to?(:unqualified) ? ct.unqualified : ct
+          if u.respond_to?(:size) && u.respond_to?(:signed?) && !u.signed?
+            bits = (u.size rescue 4) * 8
+            v = v & ((1 << bits) - 1)
+          elsif u.respond_to?(:size) && u.respond_to?(:signed?) && u.signed?
+            bits = (u.size rescue 4) * 8
+            v = v & ((1 << bits) - 1)
+            v -= (1 << bits) if v >= (1 << (bits - 1))
+          end
+        end
+        v
       when AST::SizeofType
         node.sizeof_val || resolve_sizeof_type(node.type_spec)
       when AST::SizeofExpr
@@ -281,6 +294,44 @@ module OCC
       8
     end
 
+    # ── Statement expression type ─────────────────────────────────────────────
+
+    def type_of_stmt_expr(node)
+      last_type = Types::VOID
+      @symbols.push_scope
+      node.body.items.each do |item|
+        if item.is_a?(AST::ExprStmt)
+          last_type = item.expr ? analyze_expr(item.expr) : Types::VOID
+        else
+          analyze_block_item(item)
+          last_type = Types::VOID
+        end
+      end
+      @symbols.pop_scope
+      last_type.is_a?(Types::VoidType) ? Types::INT : last_type
+    rescue StandardError
+      Types::INT
+    end
+
+    # ── __builtin_offsetof ────────────────────────────────────────────────────
+
+    def eval_builtin_offsetof(node)
+      spec = node.type_spec.is_a?(Hash) ? node.type_spec[:specs] : node.type_spec
+      type_fn = node.type_spec.is_a?(Hash) ? node.type_spec[:type_fn] : nil
+      base = (build_base_type(spec) rescue nil)
+      ct = type_fn ? (type_fn.call(base) rescue base) : base
+      ct = ct.unqualified if ct.respond_to?(:unqualified)
+      return 0 unless ct.is_a?(Types::StructType) && ct.complete?
+      node.member_chain.inject(0) do |off, name|
+        field = ct.fields.find { |f| f[:name] == name }
+        break 0 unless field
+        ct = field[:type].respond_to?(:unqualified) ? field[:type].unqualified : field[:type]
+        off + field[:offset]
+      end
+    rescue StandardError
+      0
+    end
+
     # ── Type resolution ───────────────────────────────────────────────────────
 
     def resolve_type(spec, type_fn)
@@ -290,6 +341,10 @@ module OCC
     end
 
     def build_base_type(spec)
+      if spec.typeof_operand
+        return resolve_typeof(spec.typeof_operand, spec.typeof_is_type)
+      end
+
       if spec.typedef_name
         t = @typedef_map[spec.typedef_name]
         return t || err("unknown typedef '#{spec.typedef_name}'")
@@ -303,6 +358,21 @@ module OCC
       end
 
       Types.from_specifiers(spec)
+    end
+
+    def resolve_typeof(operand, is_type)
+      if is_type
+        # __typeof__(type-name)
+        specs = operand[:specs]
+        type_fn = operand[:type_fn]
+        base = (build_base_type(specs) rescue Types::INT)
+        type_fn ? (type_fn.call(base) rescue base) : base
+      else
+        # __typeof__(expression)
+        analyze_expr(operand) rescue Types::INT
+      end
+    rescue StandardError
+      Types::INT
     end
 
     # Convert the hash-form type (produced by Parser's type_fn) to a CType.
@@ -586,6 +656,10 @@ module OCC
                                   end
                 Types::ULONG
               when AST::AlignofType then Types::ULONG
+              when AST::StmtExpr    then type_of_stmt_expr(node)
+              when AST::BuiltinOffsetof
+                node.sizeof_val = eval_builtin_offsetof(node)
+                Types::ULONG
               when AST::CommaExpr
                 node.exprs.map { |e| analyze_expr(e) }.last
               else
@@ -718,7 +792,15 @@ module OCC
       analyze_expr(node.cond)
       tt = analyze_expr(node.then_expr)
       et = analyze_expr(node.else_expr)
-      Types.usual_arithmetic_conversion(tt.unqualified, et.unqualified)
+      tt_u = tt.respond_to?(:unqualified) ? tt.unqualified : tt
+      et_u = et.respond_to?(:unqualified) ? et.unqualified : et
+      # C §6.5.15: if either branch is a pointer, return the pointer type directly.
+      # usual_arithmetic_conversion handles pointer-pointer as ptrdiff_t (meant for
+      # subtraction), which is wrong for ternary type inference.
+      return tt_u if tt_u.is_a?(Types::PointerType)
+      return et_u if et_u.is_a?(Types::PointerType)
+      return tt_u if tt_u.is_a?(Types::VoidType) || et_u.is_a?(Types::VoidType)
+      Types.usual_arithmetic_conversion(tt_u, et_u)
     rescue StandardError
       tt
     end
@@ -820,6 +902,73 @@ module OCC
       @symbols.define('malloc',  type: Types::FunctionType.new(Types::PointerType.new(Types::VOID), [{ name: 'sz', type: Types::ULONG }]), kind: :func)
       @symbols.define('free',    type: Types::FunctionType.new(Types::VOID, [{ name: 'p', type: Types::PointerType.new(Types::VOID) }]), kind: :func)
       @symbols.define('exit',    type: Types::FunctionType.new(Types::VOID, [{ name: 'c', type: Types::INT }]), kind: :func)
+
+      # GCC bit-manipulation builtins — return int, take one unsigned int arg
+      int_int_fn = Types::FunctionType.new(Types::INT, [{ name: 'x', type: Types::UINT }])
+      int_ul_fn  = Types::FunctionType.new(Types::INT, [{ name: 'x', type: Types::ULONG }])
+      %w[__builtin_clz __builtin_ctz __builtin_popcount].each { |n| @symbols.define(n, type: int_int_fn, kind: :func) }
+      %w[__builtin_clzl __builtin_ctzl __builtin_popcountl
+         __builtin_clzll __builtin_ctzll __builtin_popcountll].each { |n| @symbols.define(n, type: int_ul_fn, kind: :func) }
+      uint_uint_fn = Types::FunctionType.new(Types::UINT,  [{ name: 'x', type: Types::UINT }])
+      ulong_ulong_fn = Types::FunctionType.new(Types::ULONG, [{ name: 'x', type: Types::ULONG }])
+      @symbols.define('__builtin_bswap32', type: uint_uint_fn,   kind: :func)
+      @symbols.define('__builtin_bswap64', type: ulong_ulong_fn, kind: :func)
+
+      # C23 checked-arithmetic builtins (bool __builtin_add_overflow(T a, T b, T *result))
+      void_p = Types::PointerType.new(Types::VOID)
+      overflow_fn = Types::FunctionType.new(Types::INT,
+                      [{ name: 'a', type: Types::ULONG },
+                       { name: 'b', type: Types::ULONG },
+                       { name: 'r', type: void_p }])
+      %w[__builtin_add_overflow __builtin_sub_overflow
+         __builtin_mul_overflow].each { |n| @symbols.define(n, type: overflow_fn, kind: :func) }
+
+      # C11 atomic builtins (treated as non-atomic for single-threaded miniruby)
+      atomic_fn = Types::FunctionType.new(Types::ULONG,
+                    [{ name: 'ptr', type: void_p },
+                     { name: 'val', type: Types::ULONG },
+                     { name: 'order', type: Types::INT }], variadic: false)
+      %w[__atomic_fetch_add __atomic_fetch_sub __atomic_fetch_and
+         __atomic_fetch_or  __atomic_fetch_xor __atomic_fetch_nand
+         __atomic_add_fetch __atomic_sub_fetch __atomic_and_fetch
+         __atomic_or_fetch  __atomic_xor_fetch].each { |n| @symbols.define(n, type: atomic_fn, kind: :func) }
+      atomic_load_fn = Types::FunctionType.new(Types::ULONG,
+                         [{ name: 'ptr', type: void_p },
+                          { name: 'order', type: Types::INT }])
+      %w[__atomic_load_n].each { |n| @symbols.define(n, type: atomic_load_fn, kind: :func) }
+      atomic_store_fn = Types::FunctionType.new(Types::VOID,
+                          [{ name: 'ptr', type: void_p },
+                           { name: 'val', type: Types::ULONG },
+                           { name: 'order', type: Types::INT }])
+      %w[__atomic_store_n].each { |n| @symbols.define(n, type: atomic_store_fn, kind: :func) }
+      atomic_cas_fn = Types::FunctionType.new(Types::INT,
+                        [{ name: 'ptr', type: void_p },
+                         { name: 'exp', type: void_p },
+                         { name: 'des', type: Types::ULONG },
+                         { name: 'weak', type: Types::INT },
+                         { name: 'suc', type: Types::INT },
+                         { name: 'fail', type: Types::INT }])
+      %w[__atomic_compare_exchange_n].each { |n| @symbols.define(n, type: atomic_cas_fn, kind: :func) }
+
+      # setjmp/longjmp family — jmp_buf decays to int* in function params
+      jmp_buf_ptr = Types::PointerType.new(Types::INT)
+      @symbols.define('setjmp',    type: Types::FunctionType.new(Types::INT,  [{ name: 'env', type: jmp_buf_ptr }]), kind: :func)
+      @symbols.define('longjmp',   type: Types::FunctionType.new(Types::VOID, [{ name: 'env', type: jmp_buf_ptr }, { name: 'val', type: Types::INT }]), kind: :func)
+      @symbols.define('_setjmp',   type: Types::FunctionType.new(Types::INT,  [{ name: 'env', type: jmp_buf_ptr }]), kind: :func)
+      @symbols.define('_longjmp',  type: Types::FunctionType.new(Types::VOID, [{ name: 'env', type: jmp_buf_ptr }, { name: 'val', type: Types::INT }]), kind: :func)
+      @symbols.define('sigsetjmp', type: Types::FunctionType.new(Types::INT,  [{ name: 'env', type: jmp_buf_ptr }, { name: 'savemask', type: Types::INT }]), kind: :func)
+      @symbols.define('siglongjmp',type: Types::FunctionType.new(Types::VOID, [{ name: 'env', type: jmp_buf_ptr }, { name: 'val', type: Types::INT }]), kind: :func)
+
+      # alloca (stack allocation)
+      @symbols.define('__builtin_alloca', type: Types::FunctionType.new(Types::PointerType.new(Types::VOID), [{ name: 'sz', type: Types::ULONG }]), kind: :func)
+      @symbols.define('alloca',           type: Types::FunctionType.new(Types::PointerType.new(Types::VOID), [{ name: 'sz', type: Types::ULONG }]), kind: :func)
+
+      # Alignment hint — returns the pointer unchanged
+      void_ptr = Types::PointerType.new(Types::VOID)
+      @symbols.define('__builtin_assume_aligned', type: Types::FunctionType.new(void_ptr, [{ name: 'ptr', type: void_ptr }, { name: 'align', type: Types::ULONG }], variadic: true), kind: :func)
+
+      # Prefetch hint — no-op void
+      @symbols.define('__builtin_prefetch', type: Types::FunctionType.new(Types::VOID, [{ name: 'addr', type: void_ptr }], variadic: true), kind: :func)
     end
   end
 end

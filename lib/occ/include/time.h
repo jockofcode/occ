@@ -6,6 +6,8 @@
 typedef long time_t;
 typedef long clock_t;
 typedef long suseconds_t;
+typedef int  clockid_t;
+typedef int  timer_t;
 
 #define CLOCKS_PER_SEC 1000000L
 #define TIME_UTC       1
@@ -46,8 +48,9 @@ extern char    *asctime(const struct tm *tm);
 extern char    *ctime(const time_t *timep);
 
 extern int      nanosleep(const struct timespec *req, struct timespec *rem);
-extern int      clock_gettime(int clk_id, struct timespec *tp);
-extern int      clock_settime(int clk_id, const struct timespec *tp);
+extern int      clock_gettime(clockid_t clk_id, struct timespec *tp);
+extern int      clock_settime(clockid_t clk_id, const struct timespec *tp);
+extern int      clock_getres(clockid_t clk_id, struct timespec *tp);
 
 #define CLOCK_REALTIME  0
 #define CLOCK_MONOTONIC 1

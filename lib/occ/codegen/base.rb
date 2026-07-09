@@ -6,21 +6,22 @@ module OCC
     class Base
       def initialize(mod)
         @mod = mod
-        @out = []
+        @out = +''
       end
 
       def generate
         emit_preamble
         @mod.strings.each_with_index { |s, i| emit_string_constant(i, s) }
         @mod.globals.each            { |name, g| emit_global(name, g) }
+        @mod.tls_globals.each        { |name, g| emit_tls_global(name, g) }
         @mod.functions.each          { |f| emit_function(f) }
-        @out.join("\n")
+        @out
       end
 
       private
 
-      def emit(line) = @out << line
-      def emit_blank  = @out << ''
+      def emit(line) = (@out << line << "\n")
+      def emit_blank  = (@out << "\n")
 
       # Produce an assembler-quoted string literal from a Ruby string.
       # Uses octal escapes for non-printable / non-ASCII bytes so that GNU as
@@ -45,6 +46,7 @@ module OCC
       def emit_preamble         = nil
       def emit_string_constant(id, value) = nil
       def emit_global(name, g)  = nil
+      def emit_tls_global(name, g) = nil
       def emit_function(func)   = nil
     end
   end

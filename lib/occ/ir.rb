@@ -172,17 +172,19 @@ module OCC
     # ── Module ────────────────────────────────────────────────────────────────
 
     class Mod
-      attr_reader :functions, :globals, :strings, :variadic_funcs, :fp_funcs, :func_names,
-                  :defined_funcs
+      attr_reader :functions, :globals, :tls_globals, :strings, :variadic_funcs, :fp_funcs,
+                  :func_names, :defined_funcs, :static_funcs
 
       def initialize
         @functions     = []
         @globals       = {}         # name => {type:, init:}
+        @tls_globals   = {}         # name => {type:, init:}  (_Thread_local variables)
         @strings       = []         # StringRef values
         @variadic_funcs = {}        # name => named_param_count
         @fp_funcs       = Set.new   # names of functions returning float/double
         @func_names     = Set.new   # all known function names (defined or declared extern)
         @defined_funcs  = Set.new   # functions with a body in this translation unit
+        @static_funcs   = Set.new   # functions declared static (internal linkage)
       end
 
       def add_function(f)
@@ -190,11 +192,13 @@ module OCC
         @func_names << f.name
         @defined_funcs << f.name
       end
-      def add_global(name, type, init = nil) = (@globals[name] = { type: type, init: init })
+      def add_global(name, type, init = nil, static: false) = (@globals[name] = { type: type, init: init, static: static })
+      def add_tls_global(name, type) = (@tls_globals[name] = { type: type })
       def add_string(value) = StringRef.new(@strings.tap { @strings << value }.length - 1)
       def mark_variadic(name, named_count = 0) = (@variadic_funcs[name] = named_count)
-      def mark_fp_func(name)  = @fp_funcs << name
-      def mark_func(name)     = @func_names << name
+      def mark_fp_func(name)    = @fp_funcs << name
+      def mark_func(name)       = @func_names << name
+      def mark_static_func(name) = @static_funcs << name
 
       def to_s
         parts = []
@@ -312,7 +316,7 @@ module OCC
           end
         end
 
-        is_static = fn.specifiers.storage == :static
+        is_static = fn.specifiers.storage == :static || @mod.static_funcs.include?(fn.name)
         is_ctor   = fn.respond_to?(:constructor) && fn.constructor
         @func = Function.new(fn.name, flat_params, ret_type, variadic: variadic, static: is_static, constructor: is_ctor)
         @mod.add_function(@func)
@@ -398,9 +402,7 @@ module OCC
         sz > 8 && sz <= 16 ? 2 : 1
       end
 
-      def build_global_decl(decl)
-        # Collect enum constants from inline enum definitions.
-        tag_decl = decl.specifiers.tag_decl
+      def collect_enum_constants(tag_decl)
         if tag_decl.is_a?(AST::EnumSpec) && tag_decl.enumerators
           val = 0
           tag_decl.enumerators.each do |e|
@@ -411,7 +413,16 @@ module OCC
             @enum_constants[e.name] = val
             val += 1
           end
+        elsif tag_decl.is_a?(AST::StructSpec) && tag_decl.fields
+          tag_decl.fields.each do |field_decl|
+            collect_enum_constants(field_decl.specifiers.tag_decl) if field_decl.specifiers.tag_decl
+          end
         end
+      end
+
+      def build_global_decl(decl)
+        # Collect enum constants from inline enum/struct definitions (including nested enums in structs).
+        collect_enum_constants(decl.specifiers.tag_decl) if decl.specifiers.tag_decl
 
         # Typedef declarations define types, not variables — nothing to emit.
         return if decl.specifiers.storage == :typedef
@@ -452,7 +463,11 @@ module OCC
           # But register them in func_names so the codegen emits correct function-address
           # code (not data-load code) when these names appear in expressions.
           type_sample = d[:type_fn]&.call(:base)
-          if type_sample.is_a?(Hash) && type_sample[:kind] == :function
+          resolved = d[:resolved_type]
+          resolved_bare = resolved.respond_to?(:unqualified) ? resolved.unqualified : resolved
+          is_func_decl = (type_sample.is_a?(Hash) && type_sample[:kind] == :function) ||
+                         resolved_bare.is_a?(OCC::Types::FunctionType)
+          if is_func_decl
             full_type = d[:type_fn]&.call(base_type) rescue nil
             if full_type.is_a?(Hash) && full_type[:kind] == :function
               params = full_type[:params]
@@ -462,8 +477,13 @@ module OCC
               end
               ret = full_type[:return]
               @mod.mark_fp_func(d[:name]) if ret.is_a?(OCC::Types::FloatingType)
-              @mod.mark_func(d[:name])
+            elsif resolved_bare.is_a?(OCC::Types::FunctionType)
+              ft = resolved_bare
+              @mod.mark_variadic(d[:name], ft.params.length) if ft.variadic
+              @mod.mark_fp_func(d[:name]) if ft.return_type.is_a?(OCC::Types::FloatingType)
             end
+            @mod.mark_func(d[:name])
+            @mod.mark_static_func(d[:name]) if decl.specifiers.storage == :static
             next
           end
 
@@ -475,9 +495,15 @@ module OCC
           end
           # Discard function-type results (shouldn't happen here, but be safe)
           actual_type = 'int' if actual_type.is_a?(Hash)
+          actual_type = 'int' if actual_type.is_a?(OCC::Types::FunctionType)
 
-          init_val = d[:init] ? eval_const_init(d[:init], allow_ref: true) : nil
-          @mod.add_global(d[:name], actual_type, init_val)
+          if decl.specifiers.storage == :_Thread_local
+            @mod.add_tls_global(d[:name], actual_type)
+          else
+            init_val = d[:init] ? eval_const_init(d[:init], allow_ref: true) : nil
+            is_static_global = decl.specifiers.storage == :static
+            @mod.add_global(d[:name], actual_type, init_val, static: is_static_global)
+          end
         end
       end
 
@@ -540,7 +566,10 @@ module OCC
         when Hash
           if expr[:kind] == :initializer_list
             { kind: :initializer_list,
-              items: (expr[:items] || []).map { |item| eval_const_init(item[:value], allow_ref: true) } }
+              items: (expr[:items] || []).map { |item|
+                { designators: item[:designators] || [],
+                  value: eval_const_init(item[:value], allow_ref: true) }
+              } }
           end
         else nil
         end
@@ -620,19 +649,8 @@ module OCC
       end
 
       def build_local_decl(decl)
-        # Collect enum constants from inline enum definitions (may appear locally).
-        tag_decl = decl.specifiers.tag_decl
-        if tag_decl.is_a?(AST::EnumSpec) && tag_decl.enumerators
-          val = 0
-          tag_decl.enumerators.each do |e|
-            if e.value
-              ev = eval_const_init(e.value)
-              val = ev if ev
-            end
-            @enum_constants[e.name] = val
-            val += 1
-          end
-        end
+        # Collect enum constants from inline enum/struct definitions (including nested enums in structs).
+        collect_enum_constants(decl.specifiers.tag_decl) if decl.specifiers.tag_decl
 
         is_static = decl.specifiers.storage == :static ||
                     decl.specifiers.storage == :_Thread_local
@@ -655,9 +673,20 @@ module OCC
             # collision with file-scope names or static locals in other functions.
             mangled = "__static_#{@func.name}_#{d[:name]}"
             init_val = d[:init] ? eval_const_init(d[:init], allow_ref: true) : nil
-            @mod.add_global(mangled, ctype || 'int', init_val)
+            @mod.add_global(mangled, ctype || 'int', init_val, static: true)
             @static_locals[d[:name]] = mangled
             @local_ctypes[d[:name]] = ctype if ctype
+            next
+          end
+
+          # Block-scoped function declarations (e.g. `void foo(void);`) are
+          # prototypes — they introduce a name but allocate no stack storage.
+          # Register the function so calls to it are emitted as direct bl, not
+          # as loads through a (garbage) stack slot.
+          if ctype.is_a?(OCC::Types::FunctionType)
+            @mod.mark_func(d[:name])
+            @mod.mark_variadic(d[:name], ctype.params.length) if ctype.variadic
+            @mod.mark_fp_func(d[:name]) if ctype.return_type.is_a?(OCC::Types::FloatingType)
             next
           end
 
@@ -1125,6 +1154,8 @@ module OCC
         when AST::MemberExpr    then build_member(node)
         when AST::SizeofType    then build_sizeof_type(node)
         when AST::SizeofExpr    then build_sizeof_expr(node)
+        when AST::BuiltinOffsetof then Const.new(node.sizeof_val || 0)
+        when AST::StmtExpr      then build_stmt_expr(node)
         when AST::CommaExpr
           node.exprs.map { |e| build_expr(e) }.last
         when Hash
@@ -1408,6 +1439,13 @@ module OCC
             emit(Gep.new(dst, arr, idx, esz))
           when AST::MemberExpr
             return build_member_addr(node.operand)
+          when AST::UnaryOp
+            if node.operand.op == :deref
+              # &(*ptr) == ptr — evaluate the inner pointer expression directly
+              return build_expr(node.operand.operand)
+            else
+              emit(Copy.new(dst, build_expr(node.operand)))
+            end
           else
             emit(Copy.new(dst, build_expr(node.operand)))
           end
@@ -1880,6 +1918,15 @@ module OCC
 
         # Base pointer: for -> load the pointer value; for . take the address of the struct.
         base_ptr = node.arrow ? build_expr(node.expr) : lvalue_addr(node.expr)
+        if node.arrow && base_ptr.is_a?(IR::GlobalRef) && @mod.globals.key?(base_ptr.name)
+          addr = new_temp
+          emit(AddrOf.new(addr, base_ptr))
+          t = new_temp
+          g_type = @mod.globals[base_ptr.name][:type]
+          g_sz   = g_type.respond_to?(:size) ? (g_type.size rescue 8) : 8
+          emit(Load.new(t, addr, g_type, g_sz))
+          base_ptr = t
+        end
 
         byte_off = field[:offset]
         # For packed bitfields, the load unit starts at group_byte + floor(bit_offset/8).
@@ -2084,6 +2131,25 @@ module OCC
         when AST::StringLiteral then Const.new(8)  # pointer
         else Const.new(8)
         end
+      end
+
+      # Build IR for a GCC statement expression ({ ... }).
+      # All statements in the body are emitted inline; the last expression
+      # statement's value becomes the result of the entire expression.
+      def build_stmt_expr(node)
+        result = Const.new(0)
+        node.body.items.each do |item|
+          case item
+          when AST::Declaration
+            build_local_decl(item)
+          when AST::ExprStmt
+            result = item.expr ? build_expr(item.expr) : Const.new(0)
+          else
+            build_stmt(item)
+            result = Const.new(0)
+          end
+        end
+        result
       end
     end
   end

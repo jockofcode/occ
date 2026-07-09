@@ -4,6 +4,7 @@
 #include <sys/types.h>
 
 typedef void (*sighandler_t)(int);
+typedef sighandler_t sig_t;
 typedef int sig_atomic_t;
 
 /* Standard signals */
@@ -47,14 +48,38 @@ typedef int sig_atomic_t;
 /* sigset_t */
 typedef unsigned long sigset_t;
 
+/* sigval — used inside siginfo_t */
+union sigval {
+    int   sival_int;
+    void *sival_ptr;
+};
+
+/* siginfo_t — signal information structure */
+typedef struct __siginfo {
+    int           si_signo;
+    int           si_errno;
+    int           si_code;
+    int           si_pid;
+    unsigned int  si_uid;
+    int           si_status;
+    void         *si_addr;
+    union sigval  si_value;
+    long          si_band;
+    unsigned long __pad[7];
+} siginfo_t;
+
 /* signal() installs handler and returns previous; raise() sends signal to self */
 extern sighandler_t signal(int signum, sighandler_t handler);
 extern int          raise(int sig);
 extern int          kill(pid_t pid, int sig);
+extern int          killpg(pid_t pgrp, int sig);
 
 /* sigaction */
 struct sigaction {
-    sighandler_t sa_handler;
+    union {
+        sighandler_t  sa_handler;
+        void        (*sa_sigaction)(int, siginfo_t *, void *);
+    };
     sigset_t     sa_mask;
     int          sa_flags;
 };
@@ -69,6 +94,27 @@ extern int sigismember(const sigset_t *set, int signum);
 extern int sigprocmask(int how, const sigset_t *set, sigset_t *oldset);
 extern int sigpending(sigset_t *set);
 extern int sigsuspend(const sigset_t *mask);
+
+/* alternate signal stack */
+typedef struct {
+    void  *ss_sp;
+    int    ss_flags;
+    size_t ss_size;
+} stack_t;
+
+#define MINSIGSTKSZ 2048
+#define SIGSTKSZ    8192
+#define SS_DISABLE  4
+
+extern int sigaltstack(const stack_t *ss, stack_t *oss);
+
+/* si_code values for SI_USER and other sources */
+#define SI_USER     0x10001
+#define SI_QUEUE    0x10002
+#define SI_TIMER    0x10003
+#define SI_ASYNCIO  0x10004
+#define SI_MESGQ    0x10005
+#define SI_KERNEL   0x10006
 
 #define SA_NOCLDSTOP  1
 #define SA_NOCLDWAIT  2

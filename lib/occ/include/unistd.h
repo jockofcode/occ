@@ -75,9 +75,10 @@ extern int   optind, opterr, optopt;
 extern int   getopt(int argc, char *const argv[], const char *optstring);
 
 /* sysconf constants */
-#define _SC_CLK_TCK       2
-#define _SC_PAGESIZE       30
-#define _SC_PAGE_SIZE      _SC_PAGESIZE
+#define _SC_CLK_TCK          2
+#define _SC_NGROUPS_MAX      4
+#define _SC_PAGESIZE         30
+#define _SC_PAGE_SIZE        _SC_PAGESIZE
 #define _SC_NPROCESSORS_ONLN 84
 
 #endif /* _OCC_UNISTD_H */

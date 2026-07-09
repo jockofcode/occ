@@ -14,6 +14,29 @@ typedef unsigned long      uintptr_t;
 typedef long               intmax_t;
 typedef unsigned long      uintmax_t;
 
+typedef __int128           __int128_t;
+typedef unsigned __int128  __uint128_t;
+
+/* Least-width integer types */
+typedef signed char        int_least8_t;
+typedef unsigned char      uint_least8_t;
+typedef short              int_least16_t;
+typedef unsigned short     uint_least16_t;
+typedef int                int_least32_t;
+typedef unsigned int       uint_least32_t;
+typedef long               int_least64_t;
+typedef unsigned long      uint_least64_t;
+
+/* Fast integer types */
+typedef signed char        int_fast8_t;
+typedef unsigned char      uint_fast8_t;
+typedef long               int_fast16_t;
+typedef unsigned long      uint_fast16_t;
+typedef long               int_fast32_t;
+typedef unsigned long      uint_fast32_t;
+typedef long               int_fast64_t;
+typedef unsigned long      uint_fast64_t;
+
 #ifndef _OCC_STDDEF_H
 typedef unsigned long size_t;
 #endif
@@ -38,6 +61,18 @@ typedef unsigned long size_t;
 #define INTMAX_MIN  INT64_MIN
 #define INTMAX_MAX  INT64_MAX
 #define UINTMAX_MAX UINT64_MAX
+
+/* Integer constant macros */
+#define INT8_C(c)   c
+#define UINT8_C(c)  c ## U
+#define INT16_C(c)  c
+#define UINT16_C(c) c ## U
+#define INT32_C(c)  c
+#define UINT32_C(c) c ## U
+#define INT64_C(c)  c ## L
+#define UINT64_C(c) c ## UL
+#define INTMAX_C(c)  c ## L
+#define UINTMAX_C(c) c ## UL
 
 /* Convenience macros for printf format strings */
 #define PRId8   "d"

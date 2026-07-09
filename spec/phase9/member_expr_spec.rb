@@ -133,6 +133,25 @@ RSpec.describe 'Phase 9: MemberExpr, type-sized loads/stores, stdlib headers' do
       result = compile_and_run(src)
       expect(result[:stdout].strip).to eq('7')
     end
+
+    it 'assigns through a global struct pointer without overwriting the pointer' do
+      src = <<~C
+        extern int printf(const char *fmt, ...);
+        extern void *malloc(unsigned long n);
+        struct Box { void *ptr; int n; };
+        struct Box *g;
+        int main(void) {
+          g = (struct Box *)malloc(sizeof(struct Box));
+          void *before = g;
+          g->ptr = malloc(16);
+          g->n = 42;
+          printf("%d %d\\n", g == before, g->n);
+          return 0;
+        }
+      C
+      result = compile_and_run(src)
+      expect(result[:stdout].strip).to eq('1 42')
+    end
   end
 
   # ── Type-sized GEP: correct array element stride ─────────────────────────────

@@ -15,12 +15,14 @@ module OCC
       '__STDC_HOSTED__'      => '1'
     }.freeze
 
-    def initialize(source, filename, include_paths: [], defines: {}, target: nil)
-      @filename      = filename
-      @include_paths = include_paths
-      @macros        = {}
+    def initialize(source, filename, include_paths: [], framework_paths: [], defines: {}, target: nil)
+      @filename        = filename
+      @include_paths   = include_paths
+      @framework_paths = framework_paths
+      @macros          = {}
       @once_files    = Set.new      # files seen via #pragma once
       @include_stack = [filename]   # guard against recursive includes
+      @include_depth = 0            # 0 = main file, >0 = inside an include
 
       PREDEFINED.each { |k, v| define_object_macro(k, v) }
       # Date/time macros – set once at instantiation
@@ -40,17 +42,38 @@ module OCC
       end
       case tgt
       when :arm64_macos
-        define_object_macro('__aarch64__', '1')
-        define_object_macro('__arm64__',   '1')
-        define_object_macro('__APPLE__',   '1')
-        define_object_macro('__MACH__',    '1')
+        define_object_macro('__aarch64__',      '1')
+        define_object_macro('__arm64__',        '1')
+        define_object_macro('__APPLE__',        '1')
+        define_object_macro('__MACH__',         '1')
+        define_object_macro('__LITTLE_ENDIAN__','1')
+        define_object_macro('__LP64__',         '1')
+        define_object_macro('__SIZEOF_POINTER__','8')
+        define_object_macro('__POINTER_WIDTH__','64')
+        define_object_macro('__INTPTR_WIDTH__', '64')
+        define_object_macro('__SIZEOF_LONG__',  '8')
+        define_object_macro('__LONG_MAX__',     '9223372036854775807L')
       when :amd64_macos
-        define_object_macro('__x86_64__',  '1')
-        define_object_macro('__APPLE__',   '1')
-        define_object_macro('__MACH__',    '1')
+        define_object_macro('__x86_64__',       '1')
+        define_object_macro('__APPLE__',        '1')
+        define_object_macro('__MACH__',         '1')
+        define_object_macro('__LITTLE_ENDIAN__','1')
+        define_object_macro('__LP64__',         '1')
+        define_object_macro('__SIZEOF_POINTER__','8')
+        define_object_macro('__POINTER_WIDTH__','64')
+        define_object_macro('__INTPTR_WIDTH__', '64')
+        define_object_macro('__SIZEOF_LONG__',  '8')
+        define_object_macro('__LONG_MAX__',     '9223372036854775807L')
       else
-        define_object_macro('__x86_64__',  '1')
-        define_object_macro('__linux__',   '1')
+        define_object_macro('__x86_64__',       '1')
+        define_object_macro('__linux__',        '1')
+        define_object_macro('__LITTLE_ENDIAN__','1')
+        define_object_macro('__LP64__',         '1')
+        define_object_macro('__SIZEOF_POINTER__','8')
+        define_object_macro('__POINTER_WIDTH__','64')
+        define_object_macro('__INTPTR_WIDTH__', '64')
+        define_object_macro('__SIZEOF_LONG__',  '8')
+        define_object_macro('__LONG_MAX__',     '9223372036854775807L')
       end
 
       # GCC/Clang compiler extension macros — silently consumed by expansion
@@ -70,14 +93,23 @@ module OCC
       define_object_macro('__GNUC_PATCHLEVEL__', '1')
       define_object_macro('__builtin_va_list',   'char*')
       define_object_macro('__thread',            '_Thread_local')
+      define_object_macro('__int128_t',          '__int128')
+      define_object_macro('__uint128_t',         'unsigned __int128')
       # Function-like extension macros
       @macros['__attribute__']         = { kind: :function, params: ['x'], variadic: false, body: '' }
       @macros['__attribute']           = { kind: :function, params: ['x'], variadic: false, body: '' }
       @macros['__declspec']            = { kind: :function, params: ['x'], variadic: false, body: '' }
-      @macros['__builtin_expect']      = { kind: :function, params: ['expr', 'val'], variadic: false, body: 'expr' }
-      @macros['__builtin_unreachable'] = { kind: :function, params: [], variadic: true,  body: '' }
-      @macros['__builtin_offsetof']    = { kind: :function, params: ['type', 'member'], variadic: false, body: '0' }
-      @macros['__typeof__']            = { kind: :function, params: ['x'], variadic: false, body: 'int' }
+      @macros['__builtin_expect']       = { kind: :function, params: ['expr', 'val'], variadic: false, body: 'expr' }
+      @macros['__builtin_unreachable']  = { kind: :function, params: [], variadic: true, body: '' }
+      @macros['__builtin_constant_p']   = { kind: :function, params: ['x'], variadic: false, body: '0' }
+
+      # C11 atomic memory-order constants (we treat atomics as non-atomic)
+      @macros['__ATOMIC_RELAXED']  = { kind: :object, body: '0' }
+      @macros['__ATOMIC_CONSUME']  = { kind: :object, body: '1' }
+      @macros['__ATOMIC_ACQUIRE']  = { kind: :object, body: '2' }
+      @macros['__ATOMIC_RELEASE']  = { kind: :object, body: '3' }
+      @macros['__ATOMIC_ACQ_REL']  = { kind: :object, body: '4' }
+      @macros['__ATOMIC_SEQ_CST']  = { kind: :object, body: '5' }
       # GCC atomic builtins — provide non-atomic fallback for single-threaded use
       @macros['__sync_bool_compare_and_swap'] = { kind: :function, params: ['ptr', 'old', 'new_val'], variadic: false,
                                                    body: '(*((ptr)) == (old) ? ((*((ptr)) = (new_val)), 1) : 0)' }
@@ -92,9 +124,43 @@ module OCC
       @macros['__sync_lock_release']   = { kind: :function, params: ['ptr'], variadic: false,
                                             body: '((*((ptr))) = 0)' }
       @macros['__sync_synchronize']    = { kind: :function, params: [], variadic: false, body: '' }
-      @macros['__typeof']              = { kind: :function, params: ['x'], variadic: false, body: 'int' }
-      @macros['__asm__']               = { kind: :function, params: [], variadic: true, body: '' }
-      @macros['__asm']                 = { kind: :function, params: [], variadic: true, body: '' }
+      # GCC __atomic_* builtins — non-atomic fallback (single-threaded semantics)
+      @macros['__atomic_load_n']       = { kind: :function, params: ['ptr', 'ord'], variadic: false,
+                                            body: '(*(ptr))' }
+      @macros['__atomic_store_n']      = { kind: :function, params: ['ptr', 'val', 'ord'], variadic: false,
+                                            body: '((*(ptr)) = (val))' }
+      @macros['__atomic_exchange_n']   = { kind: :function, params: ['ptr', 'val', 'ord'], variadic: false,
+                                            body: '(__extension__ ({ __typeof__(*(ptr)) __occ_xchg_old = *(ptr); *(ptr) = (val); __occ_xchg_old; }))' }
+      @macros['__atomic_fetch_add']    = { kind: :function, params: ['ptr', 'val', 'ord'], variadic: false,
+                                            body: '(__extension__ ({ __typeof__(*(ptr)) __occ_fa_old = *(ptr); *(ptr) += (val); __occ_fa_old; }))' }
+      @macros['__atomic_add_fetch']    = { kind: :function, params: ['ptr', 'val', 'ord'], variadic: false,
+                                            body: '(__extension__ ({ *(ptr) += (val); *(ptr); }))' }
+      @macros['__atomic_fetch_sub']    = { kind: :function, params: ['ptr', 'val', 'ord'], variadic: false,
+                                            body: '(__extension__ ({ __typeof__(*(ptr)) __occ_fs_old = *(ptr); *(ptr) -= (val); __occ_fs_old; }))' }
+      @macros['__atomic_sub_fetch']    = { kind: :function, params: ['ptr', 'val', 'ord'], variadic: false,
+                                            body: '(__extension__ ({ *(ptr) -= (val); *(ptr); }))' }
+      @macros['__atomic_or_fetch']     = { kind: :function, params: ['ptr', 'val', 'ord'], variadic: false,
+                                            body: '(__extension__ ({ *(ptr) |= (val); *(ptr); }))' }
+      @macros['__atomic_and_fetch']    = { kind: :function, params: ['ptr', 'val', 'ord'], variadic: false,
+                                            body: '(__extension__ ({ *(ptr) &= (val); *(ptr); }))' }
+      @macros['__atomic_compare_exchange_n'] = { kind: :function,
+                                            params: ['ptr', 'expected', 'desired', 'weak', 'suc', 'fail'],
+                                            variadic: false,
+                                            body: '(__extension__ ({ __typeof__(*(ptr)) __occ_cas_cur = *(ptr); int __occ_cas_eq = (__occ_cas_cur == *(expected)); if (__occ_cas_eq) { *(ptr) = (desired); } else { *(expected) = __occ_cas_cur; } __occ_cas_eq; }))' }
+      # __asm__ and __asm are handled as keywords by the lexer (mapped to :kw_asm),
+      # so they must NOT be defined as preprocessor macros here.
+      # Type-checking builtins — return constants since we don't do compile-time type evaluation
+      @macros['__builtin_types_compatible_p'] = { kind: :function, params: ['t1', 't2'], variadic: false, body: '0' }
+      @macros['__builtin_choose_expr']  = { kind: :function, params: ['cond', 'then_e', 'else_e'], variadic: false, body: '(else_e)' }
+      # Memory builtins — delegate to standard library functions
+      @macros['__builtin_memcpy']  = { kind: :function, params: ['d', 's', 'n'], variadic: false, body: 'memcpy(d, s, n)' }
+      @macros['__builtin_memset']  = { kind: :function, params: ['s', 'c', 'n'], variadic: false, body: 'memset(s, c, n)' }
+      @macros['__builtin_memmove'] = { kind: :function, params: ['d', 's', 'n'], variadic: false, body: 'memmove(d, s, n)' }
+      @macros['__builtin_memcmp']  = { kind: :function, params: ['s1', 's2', 'n'], variadic: false, body: 'memcmp(s1, s2, n)' }
+      @macros['__builtin_strlen']  = { kind: :function, params: ['s'], variadic: false, body: 'strlen(s)' }
+      @macros['__builtin_strcmp']  = { kind: :function, params: ['s1', 's2'], variadic: false, body: 'strcmp(s1, s2)' }
+      @macros['__builtin_strcpy']  = { kind: :function, params: ['d', 's'], variadic: false, body: 'strcpy(d, s)' }
+      @macros['_Pragma']               = { kind: :function, params: ['x'], variadic: false, body: '' }
       @macros['__has_attribute']       = { kind: :function, params: ['x'], variadic: false, body: '0' }
       @macros['__has_feature']         = { kind: :function, params: ['x'], variadic: false, body: '0' }
       @macros['__has_extension']       = { kind: :function, params: ['x'], variadic: false, body: '0' }
@@ -120,10 +186,8 @@ module OCC
     attr_reader :output
 
     def process
-      # Strip any FROZEN markers that survived expansion (can happen when the
-      # iterative expand_macros loop stabilizes with markers still present, e.g.
-      # due to __LINE__ substitution changing the termination condition).
-      @output.gsub(/#{FROZEN_START}|#{FROZEN_END}/, '')
+      # Strip any FROZEN/BLUE markers that survived expansion.
+      @output.gsub(/[#{FROZEN_START}#{FROZEN_END}#{BLUE_START}#{BLUE_END}]/, '')
     end
 
     private
@@ -131,17 +195,27 @@ module OCC
     # ── Entry point for processing a block of source ─────────────────────────
 
     def process_source(source, filename)
-      @output  ||= +''
-      lines = strip_comments(source).split("\n", -1)
-      i     = 0
+      @output    ||= +''
+      # C standard: phase 2 (line splicing) before phase 3 (comment stripping).
+      # Keep original lines so we can use them to detect continuation backslashes
+      # that may have been inside block comments (and thus stripped away).
+      orig_lines = source.split("\n", -1)
+      stripped   = strip_comments(source)
+      lines      = stripped.split("\n", -1)
+      stripped   = nil
+      i          = 0
 
       while i < lines.length
-        raw = lines[i]
+        raw      = lines[i]
+        lines[i] = nil
 
-        # Splice continuations within this line (already handled globally in
-        # the Lexer, but we also do it here for directive lines).
-        while raw.end_with?('\\') && i + 1 < lines.length
-          raw = raw.chomp('\\') + lines[i + 1]
+        # Splice continuations. Use the original (pre-strip) line to detect a
+        # trailing backslash that strip_comments may have removed (e.g. a `\`
+        # inside a block comment like `/* foo \` still acts as a line
+        # continuation per C phase 2, which runs before comment stripping).
+        while (raw.end_with?('\\') || (orig_lines[i] || '').end_with?('\\')) &&
+              i + 1 < lines.length
+          raw = (raw.end_with?('\\') ? raw.chomp('\\') : raw) + lines[i + 1]
           i  += 1
         end
 
@@ -179,7 +253,7 @@ module OCC
           @output  << expanded << "\n"
           i += 1
         else
-          @output << "\n"
+          @output << "\n" if @include_depth == 0
           i += 1
         end
       end
@@ -336,6 +410,7 @@ module OCC
     # Returns the new value of i after processing the directive.
     def handle_directive(directive, filename, i, lines)
       keyword, rest = directive.split(/\s+/, 2)
+      keyword = keyword.to_s  # nil from empty directive → ''
       rest = (rest || '').strip
 
       case keyword
@@ -373,7 +448,7 @@ module OCC
         warn "#{filename}:#{i + 1}: warning: unknown directive '##{keyword}'" if active?
       end
 
-      @output << "\n"   # preserve line count
+      @output << "\n" if @include_depth == 0   # preserve line count for main file only
       i + 1
     end
 
@@ -403,6 +478,10 @@ module OCC
     # ── #include ──────────────────────────────────────────────────────────────
 
     def process_include(rest, from_file, lineno)
+      # If the argument is neither "..." nor <...>, macro-expand it first
+      # (e.g. #include THREAD_IMPL_H where the macro expands to "thread_pthread.h")
+      rest = expand_macros(rest.strip, from_file, lineno).strip unless rest.strip.start_with?('"', '<')
+
       path = resolve_include(rest, from_file)
       unless path
         raise PreprocError.new("cannot find include file: #{rest}",
@@ -411,7 +490,9 @@ module OCC
 
       return if @once_files.include?(path)
 
-      if @include_stack.include?(path)
+      # Allow at most one level of intentional self-inclusion (X-macro pattern).
+      # True infinite recursion is caught by the include guard mechanism or the depth cap.
+      if @include_stack.count(path) >= 2
         raise PreprocError.new("recursive include: #{path}",
                                SourceLocation.new(from_file, lineno, 1))
       end
@@ -425,6 +506,7 @@ module OCC
       end
 
       @include_stack.push(path)
+      @include_depth += 1
       saved_output = @output
       @output = +''
       process_source(content, path)
@@ -432,6 +514,7 @@ module OCC
       @output = saved_output
       @output << included
       @include_stack.pop
+      @include_depth -= 1
     end
 
     def resolve_include(spec, from_file)
@@ -451,6 +534,16 @@ module OCC
       @include_paths.each do |dir|
         candidate = File.join(dir, name)
         return candidate if File.exist?(candidate)
+      end
+
+      # Search framework paths for <Framework/Header.h> style includes
+      if name.include?('/')
+        parts = name.split('/', 2)
+        fw_name, header = parts[0], parts[1]
+        @framework_paths.each do |fdir|
+          candidate = File.join(fdir, "#{fw_name}.framework", 'Headers', header)
+          return candidate if File.exist?(candidate)
+        end
       end
 
       nil
@@ -520,20 +613,11 @@ module OCC
     # the # stringification and ## token-paste operators.
 
     def expand_macros(text, filename, lineno)
-      # Replace __FILE__ and __LINE__ in the initial text AND after each
-      # expansion pass (they may appear inside macro bodies like `fail()`).
-      file_replacement = %("#{filename}")
-
-      replace_builtins = ->(t) {
-        t.gsub('__FILE__', file_replacement)
-         .gsub('__LINE__', lineno.to_s)
-      }
-
-      text = replace_builtins.call(text)
-
-      # Iterative expansion (max 32 passes to prevent infinite loops)
+      # Iterative expansion (max 32 passes to prevent infinite loops).
+      # __FILE__ and __LINE__ are handled inside expand_pass so they are
+      # respected only outside string/char literals.
       32.times do
-        expanded = replace_builtins.call(expand_pass(text))
+        expanded = expand_pass(text, file: filename, line: lineno)
         break if expanded == text
         text = expanded
       end
@@ -546,10 +630,18 @@ module OCC
     FROZEN_START = "\x01"
     FROZEN_END   = "\x02"
 
+    # "Blue paint" sentinels: mark tokens that were suppressed due to the C
+    # §6.10.3.4 blue-paint rule (self-referential macros).  Unlike FROZEN
+    # markers (which are stripped by expand_pass after one rescan), BLUE
+    # markers are preserved across all passes of the outer expand_macros loop
+    # and are only removed at the very end of processing.
+    BLUE_START = "\x03"
+    BLUE_END   = "\x04"
+
     # expand_pass performs one (deep) macro expansion pass over `text`.
     # `expanding` is the Set of macro names currently being expanded; any name
     # in this set is treated as a literal token (C §6.10.3.4 "blue paint").
-    def expand_pass(text, expanding: Set.new)
+    def expand_pass(text, expanding: Set.new, file: nil, line: nil)
       result  = +''
       i       = 0
       in_str  = false
@@ -612,11 +704,34 @@ module OCC
           next
         end
 
+        # Blue-painted token: copy the content literally AND keep the markers
+        # so the outer expand_macros loop doesn't re-expand it.
+        if ch == BLUE_START
+          j = text.index(BLUE_END, i + 1) || (text.length - 1)
+          result << BLUE_START << text[i + 1...j] << BLUE_END
+          i = j + 1
+          next
+        end
+
         # Try to match an identifier at position i
         if ch =~ /[a-zA-Z_]/
           j = i
           j += 1 while j < text.length && text[j] =~ /\w/
           name = text[i...j]
+
+          # __FILE__ and __LINE__ are built-in position macros; handle here so
+          # they are never expanded inside string or char literals (the in_str/
+          # in_char guards above already prevent us reaching this branch while
+          # inside a literal).
+          if name == '__FILE__' && file
+            result << %("#{file}")
+            i = j
+            next
+          elsif name == '__LINE__' && line
+            result << line.to_s
+            i = j
+            next
+          end
 
           if (macro = @macros[name]) && !expanding.include?(name)
             if macro[:kind] == :function && text[j..].lstrip.start_with?('(')
@@ -643,7 +758,14 @@ module OCC
               i = j
             end
           else
-            result << name
+            # Not a known macro, or it's in the expanding set (blue-painted).
+            # Blue-paint suppressed macro occurrences so the outer
+            # expand_macros loop doesn't re-expand them (C §6.10.3.4).
+            if expanding.include?(name) && @macros.key?(name)
+              result << BLUE_START << name << BLUE_END
+            else
+              result << name
+            end
             i = j
           end
         else
@@ -732,6 +854,59 @@ module OCC
       [args, i]
     end
 
+    # Like String#gsub but skips content inside string and char literals.
+    # The block receives the full matched string as its argument (not via $1).
+    def gsub_outside_strings(text, regex, &block)
+      result  = +''
+      i       = 0
+      escape  = false
+      in_str  = false
+      in_char = false
+      chunk   = +''
+
+      while i < text.length
+        ch = text[i]
+        if escape
+          (in_str || in_char ? (result << ch) : (chunk << ch))
+          escape = false; i += 1; next
+        end
+        if in_str
+          if ch == '\\'
+            result << ch; escape = true
+          elsif ch == '"'
+            result << ch; in_str = false
+          else
+            result << ch
+          end
+          i += 1; next
+        end
+        if in_char
+          if ch == '\\'
+            result << ch; escape = true
+          elsif ch == "'"
+            result << ch; in_char = false
+          else
+            result << ch
+          end
+          i += 1; next
+        end
+        if ch == '"'
+          result << chunk.gsub(regex) { |m| block.call(m) }
+          chunk = +''
+          result << ch; in_str = true; i += 1; next
+        end
+        if ch == "'"
+          result << chunk.gsub(regex) { |m| block.call(m) }
+          chunk = +''
+          result << ch; in_char = true; i += 1; next
+        end
+        chunk << ch
+        i += 1
+      end
+      result << chunk.gsub(regex) { |m| block.call(m) }
+      result
+    end
+
     def expand_function_macro(macro, args, name, expanding: Set.new)
       body = macro[:body].dup
       # raw_param_map is used for # stringification and ## token paste (C standard:
@@ -765,7 +940,7 @@ module OCC
           "#{FROZEN_START}#{expanded}#{FROZEN_END}"
         }
         param_regex = Regexp.new('\\b(' + macro[:params].map { |p| Regexp.escape(p) }.join('|') + ')\\b')
-        body.gsub!(param_regex) { frozen_param_map[$1] || $1 }
+        body = gsub_outside_strings(body, param_regex) { |m| frozen_param_map[m] || m }
       end
 
       # Variadic __VA_ARGS__: expand and freeze
@@ -791,12 +966,40 @@ module OCC
 
     def eval_constant_expr(expr)
       expr = expr.strip
+      # Step 0: resolve __has_include() — only returns 1 for files in OCC's own include dir
+      # (avoids pulling in huge Apple SDK chains for conditionally-included system headers)
+      occ_dir = File.expand_path('../include', __FILE__)
+      expr = expr.gsub(/__has_include\s*\(\s*([<"][^>"]*[>"])\s*\)/) do
+        spec = Regexp.last_match(1)
+        name = spec[1...-1]
+        occ_path = File.join(occ_dir, name)
+        File.exist?(occ_path) ? '1' : '0'
+      end
       # Step 1: resolve defined() BEFORE any macro expansion
       expr = expr.gsub(/defined\s*\(\s*([a-zA-Z_]\w*)\s*\)/) do
         @macros.key?(Regexp.last_match(1)) ? '1' : '0'
       end
       expr = expr.gsub(/defined\s+([a-zA-Z_]\w*)/) do
         @macros.key?(Regexp.last_match(1)) ? '1' : '0'
+      end
+      # Step 1b: replace character literals with their ASCII integer values
+      # Handles simple char literals: 'x' → ASCII, '\n' → 10, '\t' → 9, '\\' → 92, etc.
+      expr = expr.gsub(/'(\\?.)'/) do
+        ch = Regexp.last_match(1)
+        if ch.start_with?('\\')
+          case ch[1]
+          when 'n'  then 10
+          when 't'  then 9
+          when 'r'  then 13
+          when '0'  then 0
+          when '\\' then 92
+          when '\'' then 39
+          when '"'  then 34
+          else ch[1].ord
+          end
+        else
+          ch.ord
+        end.to_s
       end
       # Step 2: expand remaining macros
       expr = expand_macros(expr, '<if>', 0)

@@ -45,4 +45,47 @@
 #define SCNu32  "u"
 #define SCNu64  "lu"
 
+/* pointer-width format macros (uintptr_t is 64-bit on ARM64/x86-64) */
+#define PRIdPTR  "ld"
+#define PRIiPTR  "li"
+#define PRIoPTR  "lo"
+#define PRIuPTR  "lu"
+#define PRIxPTR  "lx"
+#define PRIXptr  "lX"
+#define PRIXPTR  "lX"
+
+#define SCNdPTR  "ld"
+#define SCNiPTR  "li"
+#define SCNoPTR  "lo"
+#define SCNuPTR  "lu"
+#define SCNxPTR  "lx"
+
+/* LEAST / FAST width-printf macros (common subset) */
+#define PRId32LEAST  "d"
+#define PRId64LEAST  "ld"
+#define PRIu32LEAST  "u"
+#define PRIu64LEAST  "lu"
+#define PRIx32LEAST  "x"
+#define PRIx64LEAST  "lx"
+
+#define PRId32FAST   "d"
+#define PRId64FAST   "ld"
+#define PRIu32FAST   "u"
+#define PRIu64FAST   "lu"
+#define PRIx32FAST   "x"
+#define PRIx64FAST   "lx"
+
+#define PRIdMAX  "ld"
+#define PRIiMAX  "li"
+#define PRIoMAX  "lo"
+#define PRIuMAX  "lu"
+#define PRIxMAX  "lx"
+#define PRIXMAX  "lX"
+
+#define SCNdMAX  "ld"
+#define SCNiMAX  "li"
+#define SCNoMAX  "lo"
+#define SCNuMAX  "lu"
+#define SCNxMAX  "lx"
+
 #endif /* _OCC_INTTYPES_H */

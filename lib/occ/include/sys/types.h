@@ -15,5 +15,18 @@ typedef long          blksize_t;
 typedef long          blkcnt_t;
 typedef unsigned long nlink_t;
 
-#endif /* _OCC_SYS_TYPES_H */
+typedef unsigned char  u_char;
+typedef unsigned short u_short;
+typedef unsigned int   u_int;
+typedef unsigned long  u_long;
+typedef unsigned char  u_int8_t;
+typedef unsigned short u_int16_t;
+typedef unsigned int   u_int32_t;
+typedef unsigned long  u_int64_t;
+typedef char          *caddr_t;
+
+typedef struct { int val[2]; } fsid_t;
+
 typedef unsigned char uuid_t[16];
+
+#endif /* _OCC_SYS_TYPES_H */

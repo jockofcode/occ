@@ -12,7 +12,7 @@ module OCC
     FUNC_SPECIFIERS   = %i[kw_inline kw__Noreturn].freeze
     BASIC_TYPE_SPECS  = %i[kw_void kw_char kw_short kw_int kw_long kw_float
                            kw_double kw_signed kw_unsigned kw__Bool
-                           kw__Complex kw__Imaginary].freeze
+                           kw__Complex kw__Imaginary kw__int128].freeze
 
     # Operator precedence table for expression parsing (Pratt style).
     # Values are [binding_power, right_associative?]
@@ -41,11 +41,23 @@ module OCC
                     percent_assign amp_assign pipe_assign caret_assign
                     lshift_assign rshift_assign].freeze
 
-    def initialize(tokens)
-      @tokens  = tokens.reject { |t| t.type == :eof } + [tokens.find { |t| t.type == :eof } || tokens.last]
-      @pos     = 0
-      @typedefs    = Set.new   # names declared via typedef
-      @constructors = Set.new  # names declared with __attribute__((constructor))
+    # Accepts either a Lexer (streaming, memory-efficient) or a token array
+    # (legacy path — array is wrapped in a one-shot Enumerator).
+    def initialize(source)
+      case source
+      when Array
+        # Legacy: token array — filter to one trailing eof
+        non_eof = source.reject { |t| t.type == :eof }
+        eof_tok = source.find { |t| t.type == :eof } || source.last
+        @lex_iter = (non_eof + [eof_tok]).each
+      else
+        @lex_iter = source   # Lexer responds to next_token
+      end
+      @buf      = []         # small look-ahead ring buffer
+      @prev_loc = nil        # location of the last consumed non-eof token
+      @eof_tok  = nil        # cached eof sentinel (never call lexer past eof)
+      @typedefs    = Set.new
+      @constructors = Set.new
     end
 
     def parse
@@ -58,18 +70,37 @@ module OCC
 
     # ── Token helpers ─────────────────────────────────────────────────────────
 
-    def cur           = @tokens[@pos]
-    def peek(n = 1)   = @tokens[@pos + n]
-    def loc           = cur.location
+    def cur
+      @buf[0] ||= tok_fetch
+    end
+
+    def peek(n = 1)
+      (@buf.length..n).each { @buf << tok_fetch }
+      @buf[n]
+    end
+
+    def loc = cur.location
 
     def advance
-      t = @tokens[@pos]
-      @pos += 1 unless t.eof?
+      t = cur
+      @buf.shift
+      @prev_loc = t.location unless t.eof?
       t
     end
 
+    def tok_fetch
+      return @eof_tok if @eof_tok
+      t = @lex_iter.respond_to?(:next_token) ? @lex_iter.next_token : @lex_iter.next
+      @eof_tok = t if t.eof?
+      t
+    rescue StopIteration
+      @eof_tok ||= Token.new(:eof, nil, @prev_loc)
+    end
+
     def expect(type)
-      raise ParseError.new("expected #{type}, got #{cur.type} ('#{cur.value}')", cur.location) unless cur.type == type
+      unless cur.type == type
+        raise ParseError.new("expected #{type}, got #{cur.type} ('#{cur.value}')", cur.location)
+      end
       advance
     end
 
@@ -108,6 +139,9 @@ module OCC
         advance
       end
 
+      # Optional asm("symbol") after a declarator — GCC symbol-renaming extension.
+      skip_asm_rename
+
       if params && cur?(:lbrace)
         # Function definition
         body = parse_compound_statement
@@ -127,7 +161,9 @@ module OCC
       while match(:comma)
         n, fn, _p = parse_declarator(allow_abstract: false)
         ini = parse_initializer if match(:assign)
+        skip_asm_rename
         declarators << { name: n, type_fn: fn, init: ini }
+        @typedefs << n if specs.storage == :typedef
       end
 
       @typedefs << name if specs.storage == :typedef
@@ -155,13 +191,33 @@ module OCC
         when :kw__Alignas
           advance; expect(:lparen); parse_type_name_or_expr; expect(:rparen)
         when *BASIC_TYPE_SPECS
-          spec.type_keywords << cur.type.to_s.sub('kw_', '').to_sym
+          kw = cur.type.to_s.sub('kw_', '').to_sym
+          # Map __int128 to a recognizable keyword string for from_specifiers
+          kw = :__int128 if cur.type == :kw__int128
+          spec.type_keywords << kw
           advance
         when :kw_struct, :kw_union
+          break if spec.tag_decl  # already have a tag; stop here
           spec.tag_decl = parse_struct_or_union
-          break
+          # Continue loop to pick up trailing qualifiers (e.g. `struct Foo const *p`)
         when :kw_enum
+          break if spec.tag_decl  # already have a tag; stop here
           spec.tag_decl = parse_enum
+          # Continue loop to pick up trailing qualifiers (e.g. `enum E const x`)
+        when :kw__typeof__, :kw__typeof
+          advance  # consume __typeof__ / __typeof
+          expect(:lparen)
+          if is_type_start?
+            tn = parse_type_name
+            expect(:rparen)
+            spec.typeof_operand = tn
+            spec.typeof_is_type = true
+          else
+            expr = parse_assignment_expr
+            expect(:rparen)
+            spec.typeof_operand = expr
+            spec.typeof_is_type = false
+          end
           break
         when :ident
           # Typedef name – only if it's a known typedef and no conflicting type keyword
@@ -420,7 +476,7 @@ module OCC
       BASIC_TYPE_SPECS.include?(cur.type) ||
         STORAGE_CLASSES.include?(cur.type) ||
         TYPE_QUALIFIERS.include?(cur.type) ||
-        cur_any?(:kw_struct, :kw_union, :kw_enum) ||
+        cur_any?(:kw_struct, :kw_union, :kw_enum, :kw__typeof__, :kw__typeof) ||
         (cur?(:ident) && @typedefs.include?(cur.value))
     end
 
@@ -498,6 +554,8 @@ module OCC
         AST::DefaultStmt.new(stmt: stmt, location: l)
       when :kw__Static_assert
         parse_static_assert
+      when :kw_asm
+        parse_asm_statement
       when :semicolon
         advance
         AST::ExprStmt.new(expr: nil, location: l)
@@ -542,11 +600,13 @@ module OCC
       declarators = []
       unless cur?(:semicolon)
         n, fn, _p = parse_declarator(allow_abstract: false)
+        skip_asm_rename
         init = parse_initializer if match(:assign)
         declarators << { name: n, type_fn: fn, init: init }
         @typedefs << n if specs.storage == :typedef
         while match(:comma)
           n2, fn2, _ = parse_declarator(allow_abstract: false)
+          skip_asm_rename
           ini2 = parse_initializer if match(:assign)
           declarators << { name: n2, type_fn: fn2, init: ini2 }
           @typedefs << n2 if specs.storage == :typedef
@@ -624,11 +684,51 @@ module OCC
       l = loc; advance  # _Static_assert
       expect(:lparen)
       expr = parse_assignment_expr
-      expect(:comma)
-      msg = expect(:string_lit).value[:value]
+      msg = ''
+      if match(:comma)
+        # Message is mandatory in C11, optional in C23; may be adjacent string literals
+        msg = expect(:string_lit).value[:value]
+        msg += advance.value[:value] while cur?(:string_lit)
+      end
       expect(:rparen)
       expect(:semicolon)
       AST::StaticAssert.new(expr: expr, message: msg, location: l)
+    end
+
+    # Consume an optional asm("symbol") rename annotation after a declarator.
+    # GCC extension: `int func(void) asm("_mangled_name");`
+    def skip_asm_rename
+      return unless cur?(:kw_asm)
+      advance  # consume asm/__asm__
+      match(:kw_volatile)
+      expect(:lparen)
+      depth = 1
+      while depth > 0 && !cur.eof?
+        depth += 1 if cur?(:lparen)
+        depth -= 1 if cur?(:rparen)
+        break if depth.zero?
+        advance
+      end
+      expect(:rparen)
+    end
+
+    # Parse and discard an asm statement: asm [volatile] ("..." : ...) ;
+    # The entire asm body is consumed and emitted as a no-op.
+    def parse_asm_statement
+      advance  # consume 'asm'
+      match(:kw_volatile)  # optional volatile qualifier
+      match(:kw_goto)      # optional goto qualifier
+      expect(:lparen)
+      depth = 1
+      while depth > 0 && !cur.eof?
+        depth += 1 if cur?(:lparen)
+        depth -= 1 if cur?(:rparen)
+        break if depth.zero?
+        advance
+      end
+      expect(:rparen)
+      expect(:semicolon)
+      AST::ExprStmt.new(expr: nil, location: @prev_loc)
     end
 
     def parse_pragma_pack(l = loc)
@@ -711,10 +811,10 @@ module OCC
         l = loc; advance
         type_spec = parse_type_name
         expect(:rparen)
-        # Compound literal: (type-name) { ... }
+        # Compound literal: (type-name) { ... } with optional postfix ([idx], .member, etc.)
         if cur?(:lbrace)
           init = parse_initializer
-          return AST::Cast.new(type_spec: type_spec, expr: init, location: l)
+          return apply_postfix_suffixes(AST::Cast.new(type_spec: type_spec, expr: init, location: l), l)
         end
         expr = parse_cast_expr
         return AST::Cast.new(type_spec: type_spec, expr: expr, location: l)
@@ -724,32 +824,38 @@ module OCC
     end
 
     def cast_lookahead?
-      saved_pos = @pos
-      begin
-        advance  # consume the (
-        is_type_start? && balanced_type_name_followed_by_rparen?
-      rescue StandardError
-        false
-      ensure
-        @pos = saved_pos
-      end
+      # Streaming-safe: peek ahead without consuming tokens.
+      # cur is '(' — peek(1) should be a type-name start, then scan for ')'
+      is_type_start_peek? && balanced_rparen_ahead?
+    rescue StandardError
+      false
     end
 
-    def balanced_type_name_followed_by_rparen?
-      depth = 1
-      pos   = @pos
+    def is_type_start_peek?
+      t = peek(1)
+      BASIC_TYPE_SPECS.include?(t.type) ||
+        STORAGE_CLASSES.include?(t.type) ||
+        TYPE_QUALIFIERS.include?(t.type) ||
+        t.type == :kw_struct || t.type == :kw_union || t.type == :kw_enum ||
+        t.type == :kw__typeof__ || t.type == :kw__typeof ||
+        (t.type == :ident && @typedefs.include?(t.value))
+    end
+
+    def balanced_rparen_ahead?
+      depth = 1  # we've logically consumed '(', looking for the matching ')'
+      n     = 1  # peek(1) is the first token inside '('
       loop do
-        break if pos >= @tokens.length
-        case @tokens[pos].type
+        tok = peek(n)
+        case tok.type
         when :lparen then depth += 1
         when :rparen
           depth -= 1
           return true if depth.zero?
         when :eof then return false
         end
-        pos += 1
+        n += 1
+        return false if n > 256
       end
-      false
     end
 
     def parse_type_name
@@ -792,6 +898,23 @@ module OCC
         tn = parse_type_name
         expect(:rparen)
         AST::AlignofType.new(type_spec: tn, location: l)
+      when :kw__builtin_offsetof
+        advance  # __builtin_offsetof
+        expect(:lparen)
+        tn = parse_type_name
+        expect(:comma)
+        chain = [expect(:ident).value]
+        while match(:dot)
+          chain << expect(:ident).value
+        end
+        # Allow optional array subscript [0] — skip it
+        while cur?(:lbracket)
+          advance
+          parse_assignment_expr
+          expect(:rbracket)
+        end
+        expect(:rparen)
+        AST::BuiltinOffsetof.new(type_spec: tn, member_chain: chain, location: l)
       else
         parse_postfix_expr
       end
@@ -799,8 +922,10 @@ module OCC
 
     def parse_postfix_expr
       l    = loc
-      expr = parse_primary_expr
+      apply_postfix_suffixes(parse_primary_expr, l)
+    end
 
+    def apply_postfix_suffixes(expr, l)
       loop do
         case cur.type
         when :lbracket
@@ -863,10 +988,17 @@ module OCC
         AST::Identifier.new(name: advance.value, location: l)
       when :lparen
         advance
-        # Could be a parenthesised expression or compound literal
-        expr = parse_expr
-        expect(:rparen)
-        expr
+        if cur?(:lbrace)
+          # GCC statement expression: ({ stmts... })
+          body = parse_compound_statement
+          expect(:rparen)
+          AST::StmtExpr.new(body: body, location: l)
+        else
+          # Parenthesised expression or compound literal
+          expr = parse_expr
+          expect(:rparen)
+          expr
+        end
       when :kw__Generic
         parse_generic_selection
       else

@@ -15,9 +15,13 @@ module OCC
       @pos    = 0
       @line   = 1
       @col    = 1
+      # Per-file identifier intern table: deduplicates repeated identifiers so
+      # all occurrences of e.g. "VALUE" share one frozen string object.
+      @idents = {}
     end
 
     # Returns an Array of Token, terminated by an :eof token.
+    # Kept for compatibility; prefer next_token for memory efficiency.
     def tokenize
       tokens = []
       loop do
@@ -27,6 +31,14 @@ module OCC
       end
       tokens << Token.new(:eof, nil, loc)
       tokens
+    end
+
+    # Returns the next token from the source, or :eof when done.
+    # Callers can use this to avoid materializing the full token array.
+    def next_token
+      skip_whitespace_and_comments
+      return Token.new(:eof, nil, loc) if at_end?
+      scan_token
     end
 
     private
@@ -202,7 +214,14 @@ module OCC
       # Source is binary; identifiers are always ASCII so UTF-8 reinterpret is safe.
       text = @source[start...@pos].force_encoding('UTF-8')
       type = KEYWORDS[text] || :ident
-      Token.new(type, text, l)
+      if type == :ident
+        # Deduplicate: all occurrences of the same name share one frozen string.
+        text = (@idents[text] ||= -text)
+        Token.new(:ident, text, l)
+      else
+        # Keywords: type symbol encodes the keyword; no need to store value string.
+        Token.new(type, nil, l)
+      end
     end
 
     # ── String/char prefix (L, u, U, u8) ────────────────────────────────────

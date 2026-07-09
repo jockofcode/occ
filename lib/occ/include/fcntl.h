@@ -57,10 +57,22 @@ struct flock {
     pid_t   l_pid;      /* PID holding lock (F_GETLK only) */
 };
 
+/* openat() directory file descriptor constants */
+#define AT_FDCWD            (-2)
+#define AT_SYMLINK_NOFOLLOW 0x0020
+#define AT_SYMLINK_FOLLOW   0x0040
+#define AT_REMOVEDIR        0x0080
+#define AT_REALDEV          0x0200
+#define AT_FDONLY           0x0400
+
 extern int open(const char *path, int flags, ...);
 extern int creat(const char *path, mode_t mode);
 extern int fcntl(int fd, int cmd, ...);
 extern int openat(int dirfd, const char *path, int flags, ...);
+extern int fstatat(int dirfd, const char *path, void *statbuf, int flags);
+extern int unlinkat(int dirfd, const char *path, int flags);
+extern int linkat(int olddirfd, const char *oldpath, int newdirfd, const char *newpath, int flags);
+extern int renameat(int olddirfd, const char *oldpath, int newdirfd, const char *newpath);
 
 #include <unistd.h>
 

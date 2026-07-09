@@ -45,7 +45,61 @@ module OCC
         emit_blank
       end
 
+      # Emit an ARM64 macOS Thread Local Variable descriptor.
+      # Each TLS variable needs a TLV descriptor in __DATA,__thread_vars and
+      # zero-initialised storage in __DATA,__thread_bss.
+      def emit_tls_global(name, g)
+        size  = type_byte_size(g[:type])
+        align = (size >= 8 ? 3 : size >= 4 ? 2 : size >= 2 ? 1 : 0)
+        init_lbl = "#{sym(name)}$tlv$init"
+
+        # Zero-initialised TLS backing store (macOS .tbss directive)
+        emit ".tbss #{init_lbl}, #{size}, #{align}"
+
+        # TLV descriptor in __thread_vars
+        emit '.section __DATA,__thread_vars,thread_local_variables'
+        emit ".globl #{sym(name)}"
+        emit '.p2align 3'
+        emit "#{sym(name)}:"
+        emit '  .quad __tlv_bootstrap'
+        emit '  .quad 0'
+        emit "  .quad #{init_lbl}"
+
+        emit '.section __TEXT,__text,regular,pure_instructions'
+      end
+
+      # Load the address of a TLS variable into x0 via the TLV descriptor.
+      # After return: x0 = &varname  (caller-saved; callee must preserve any live regs)
+      def emit_tls_addr(name)
+        emit "  adrp x0, #{sym(name)}@TLVPPAGE"
+        emit "  ldr  x0, [x0, #{sym(name)}@TLVPPAGEOFF]"
+        emit '  ldr  x8, [x0]'
+        emit '  blr  x8'
+      end
+
+      # Load the value of a TLS variable into reg.
+      def emit_tls_load(name, reg)
+        g_type = @mod.tls_globals[name][:type]
+        g_sz   = begin
+                   (g_type.respond_to?(:unqualified) ? g_type.unqualified : g_type)
+                     .then { |t| t.respond_to?(:byte_size) ? t.byte_size : type_byte_size(t) }
+                 rescue StandardError
+                   8
+                 end
+        emit_tls_addr(name)
+        # x0 now holds the address of the TLS variable; load from it
+        # ARM64: writing to w-register zero-extends to the full x-register automatically
+        w_reg = reg.start_with?('x') ? "w#{reg[1..]}" : reg
+        case g_sz
+        when 1 then emit "  ldrb #{w_reg}, [x0]"
+        when 2 then emit "  ldrh #{w_reg}, [x0]"
+        when 4 then emit "  ldr  #{w_reg}, [x0]"
+        else        emit "  ldr  #{reg}, [x0]"
+        end
+      end
+
       def emit_global(name, g)
+        is_static = g[:static]
         init = g[:init]
         if init
           if init.is_a?(Hash) && init[:kind] == :initializer_list
@@ -55,7 +109,7 @@ module OCC
               # char arr[] = "str": emit string bytes inline at the global symbol.
               # Using __TEXT,__const avoids cstring merging which breaks embedded nulls.
               emit '.section __TEXT,__const'
-              emit ".globl #{sym(name)}"
+              emit ".globl #{sym(name)}" unless is_static
               emit "#{sym(name)}:"
               emit "  .asciz #{asm_string(init[:value])}"
             else
@@ -65,7 +119,7 @@ module OCC
               emit "#{str_lbl}:"
               emit "  .asciz #{asm_string(init[:value])}"
               emit '.section __DATA,__data'
-              emit ".globl #{sym(name)}"
+              emit ".globl #{sym(name)}" unless is_static
               emit '.p2align 3'
               emit "#{sym(name)}:"
               emit "  .quad #{str_lbl}"
@@ -73,13 +127,13 @@ module OCC
           elsif init.is_a?(Float)
             sz = type_byte_size(g[:type])
             emit '.section __DATA,__data'
-            emit ".globl #{sym(name)}"
+            emit ".globl #{sym(name)}" unless is_static
             emit ".p2align #{sz == 4 ? 2 : 3}"
             emit "#{sym(name)}:"
             emit(sz == 4 ? "  .float #{init}" : "  .double #{init}")
           elsif init.is_a?(Hash) && init[:kind] == :ref
             emit '.section __DATA,__data'
-            emit ".globl #{sym(name)}"
+            emit ".globl #{sym(name)}" unless is_static
             emit '.p2align 3'
             emit "#{sym(name)}:"
             ref_target = sym(init[:name])
@@ -88,7 +142,7 @@ module OCC
           else
             # Integer scalar: always emit as .quad so GlobalRef 8-byte loads work correctly.
             emit '.section __DATA,__data'
-            emit ".globl #{sym(name)}"
+            emit ".globl #{sym(name)}" unless is_static
             emit '.p2align 3'
             emit "#{sym(name)}:"
             emit "  .quad #{init}"
@@ -96,7 +150,13 @@ module OCC
           emit '.section __TEXT,__text,regular,pure_instructions'
         else
           size = type_byte_size(g[:type])
-          emit ".comm #{sym(name)},#{size},3"
+          if is_static
+            # Static zero-initialized: use .zerofill in __BSS without .globl so the
+            # symbol stays local to this translation unit.
+            emit ".zerofill __DATA,__bss,#{sym(name)},#{size},3"
+          else
+            emit ".comm #{sym(name)},#{size},3"
+          end
         end
       end
 
@@ -120,11 +180,23 @@ module OCC
 
         # Emit the data
         emit '.section __DATA,__data'
-        emit ".globl #{sym(name)}"
+        emit ".globl #{sym(name)}" unless g[:static]
         emit '.p2align 3'
         emit "#{sym(name)}:"
 
         emit_compound_init_data(type, init[:items], strings)
+      end
+
+      # Extract the raw value from an initializer item, which may be in wrapped
+      # form {designators:, value:} (from eval_const_init) or already a plain value.
+      def item_raw_value(item)
+        item.is_a?(Hash) && item.key?(:designators) ? item[:value] : item
+      end
+
+      # Return the field designator name from an item, or nil if positional.
+      def item_field_name(item)
+        return nil unless item.is_a?(Hash) && item[:designators]&.any?
+        item[:designators].find { |d| d[0] == :field }&.last
       end
 
       # Recursively assign labels to string items in a compound initializer (mutates items).
@@ -132,13 +204,14 @@ module OCC
         result = {}
         return result unless init_node.is_a?(Hash) && init_node[:kind] == :initializer_list
         (init_node[:items] || []).each_with_index do |item, i|
-          next unless item.is_a?(Hash)
-          if item[:kind] == :string
+          raw = item_raw_value(item)
+          next unless raw.is_a?(Hash)
+          if raw[:kind] == :string
             lbl = "l_cstr_#{prefix}_#{@cstring_counter += 1}"
-            result[lbl] = item[:value]
-            item[:_label] = lbl
-          elsif item[:kind] == :initializer_list
-            result.merge!(collect_compound_strings(item, "#{prefix}_#{i}"))
+            result[lbl] = raw[:value]
+            raw[:_label] = lbl
+          elsif raw[:kind] == :initializer_list
+            result.merge!(collect_compound_strings(raw, "#{prefix}_#{i}"))
           end
         end
         result
@@ -146,25 +219,27 @@ module OCC
 
       # Emit raw bytes for a compound initializer matched against `type`.
       def emit_compound_init_data(type, items, strings)
-        if type.is_a?(OCC::Types::ArrayType)
-          elem_type = type.element
+        bare = type.respond_to?(:unqualified) ? type.unqualified : type
+        if bare.is_a?(OCC::Types::ArrayType)
+          elem_type = bare.element
           items.each do |item|
-            if item.is_a?(Hash) && item[:kind] == :initializer_list
-              emit_compound_init_data(elem_type, item[:items], strings)
+            raw = item_raw_value(item)
+            if raw.is_a?(Hash) && raw[:kind] == :initializer_list
+              emit_compound_init_data(elem_type, raw[:items], strings)
             else
-              emit_compound_field_value(item, elem_type, strings)
+              emit_compound_field_value(raw, elem_type, strings)
             end
           end
           # Zero-fill to declared array size
-          if type.count && type.count > items.length
-            remaining = (type.count - items.length) * type_byte_size(elem_type)
+          if bare.count && bare.count > items.length
+            remaining = (bare.count - items.length) * type_byte_size(elem_type)
             emit "  .zero #{remaining}" if remaining > 0
           end
-        elsif type.is_a?(OCC::Types::StructType)
-          emit_struct_init_data(type, items, strings)
+        elsif bare.is_a?(OCC::Types::StructType)
+          emit_struct_init_data(bare, items, strings)
         else
           # Scalar fallback — emit each item as one element of `type` size
-          items.each { |item| emit_compound_field_value(item, type, strings) }
+          items.each { |item| emit_compound_field_value(item_raw_value(item), type, strings) }
         end
       end
 
@@ -184,10 +259,33 @@ module OCC
       end
 
       def emit_struct_init_data(struct_type, items, strings)
-        cur_off  = 0
         fields   = struct_type.fields
         n_fields = fields.length
-        fi       = 0
+
+        # Build field_name → index map for designator resolution.
+        field_by_name = {}
+        fields.each_with_index { |f, i| field_by_name[f[:name].to_s] = i }
+
+        # Assign raw values to field indices using designators; fall back to positional.
+        field_values = {}
+        cursor = 0
+        (items || []).each do |item|
+          raw   = item_raw_value(item)
+          fname = item_field_name(item)
+          if fname
+            idx = field_by_name[fname.to_s]
+            if idx
+              field_values[idx] = raw
+              cursor = idx + 1
+            end
+          else
+            field_values[cursor] = raw
+            cursor += 1
+          end
+        end
+
+        cur_off = 0
+        fi      = 0
 
         while fi < n_fields
           field     = fields[fi]
@@ -202,19 +300,16 @@ module OCC
             while nfi < n_fields
               bf = fields[nfi]
               break unless bf[:bit_width] && bf[:offset] == unit_off
-              val     = items[nfi]
+              val     = field_values[nfi]
               val     = val.is_a?(Integer) ? val : 0
               mask    = (1 << bf[:bit_width]) - 1
               packed |= (val & mask) << bf[:bit_offset]
               nfi    += 1
             end
-            # Use the last field's unit_size: in packed (bit-packing) mode each
-            # field updates unit_size to ceil(cumulative_bits/8), so the last
-            # field's unit_size is the total byte count for the group.
             unit_size = fields[nfi - 1][:unit_size]
             fi = nfi
 
-            next if unit_off < cur_off  # already emitted this storage unit
+            next if unit_off < cur_off
 
             if unit_off > cur_off
               emit "  .zero #{unit_off - cur_off}"
@@ -238,7 +333,7 @@ module OCC
               cur_off = field_off
             end
 
-            item = items[fi]
+            item = field_values[fi]
             if item.nil?
               emit "  .zero #{fsz}"
             elsif item.is_a?(Hash) && item[:kind] == :initializer_list
@@ -651,8 +746,13 @@ module OCC
                 end
               end
             when IR::GlobalRef
-              emit "  adrp x10, #{sym(instr.ptr.name)}@PAGE"
-              emit "  add  x10, x10, #{sym(instr.ptr.name)}@PAGEOFF"
+              if @mod.tls_globals.key?(instr.ptr.name)
+                emit_tls_addr(instr.ptr.name)
+                emit '  mov x10, x0'
+              else
+                emit "  adrp x10, #{sym(instr.ptr.name)}@PAGE"
+                emit "  add  x10, x10, #{sym(instr.ptr.name)}@PAGEOFF"
+              end
               if fp_val
                 emit '  str d9, [x10]'
               elsif instr.elem_size > 8
@@ -683,8 +783,19 @@ module OCC
           when IR::Temp
             emit_addr_from_fp('x9', slot_of(instr.src))
           when IR::GlobalRef
-            emit "  adrp x9, #{sym(instr.src.name)}@PAGE"
-            emit "  add  x9, x9, #{sym(instr.src.name)}@PAGEOFF"
+            if @mod.tls_globals.key?(instr.src.name)
+              emit_tls_addr(instr.src.name)
+              emit '  mov x9, x0'
+            elsif @mod.defined_funcs.include?(instr.src.name) ||
+                  @mod.globals.key?(instr.src.name)
+              # Locally defined symbol: direct page-relative address
+              emit "  adrp x9, #{sym(instr.src.name)}@PAGE"
+              emit "  add  x9, x9, #{sym(instr.src.name)}@PAGEOFF"
+            else
+              # External symbol (function or data): GOT-indirect address
+              emit "  adrp x9, #{sym(instr.src.name)}@GOTPAGE"
+              emit "  ldr  x9, [x9, #{sym(instr.src.name)}@GOTPAGEOFF]"
+            end
           end
           store_temp(instr.dst, 'x9')
 
@@ -768,6 +879,7 @@ module OCC
           end
           # Epilogue
           frame_sz = @frame_sz
+          emit '  mov sp, x29'
           if frame_sz <= 504
             emit "  ldp x29, x30, [sp], ##{frame_sz}"
           else
@@ -946,20 +1058,118 @@ module OCC
           return
         end
 
+        # ── GCC bit-manipulation builtins — emitted inline ───────────────────
+        if func_ref.is_a?(IR::GlobalRef)
+          case func_ref.name
+          when '__builtin_clz'
+            # 32-bit: count leading zeros of lower 32 bits
+            load_operand(args[0], 'x9')
+            emit '  clz w9, w9'
+            store_temp(instr.dst, 'x9')
+            return
+          when '__builtin_clzl', '__builtin_clzll'
+            load_operand(args[0], 'x9')
+            emit '  clz x9, x9'
+            store_temp(instr.dst, 'x9')
+            return
+          when '__builtin_ctz'
+            load_operand(args[0], 'x9')
+            emit '  rbit w9, w9'
+            emit '  clz  w9, w9'
+            store_temp(instr.dst, 'x9')
+            return
+          when '__builtin_ctzl', '__builtin_ctzll'
+            load_operand(args[0], 'x9')
+            emit '  rbit x9, x9'
+            emit '  clz  x9, x9'
+            store_temp(instr.dst, 'x9')
+            return
+          when '__builtin_popcount', '__builtin_popcountl', '__builtin_popcountll'
+            load_operand(args[0], 'x9')
+            emit '  fmov d9, x9'
+            emit '  cnt  v9.8b, v9.8b'
+            emit '  addv b9, v9.8b'
+            emit '  fmov w9, s9'
+            store_temp(instr.dst, 'x9')
+            return
+          when '__builtin_bswap32'
+            load_operand(args[0], 'x9')
+            emit '  rev w9, w9'
+            store_temp(instr.dst, 'x9')
+            return
+          when '__builtin_bswap64'
+            load_operand(args[0], 'x9')
+            emit '  rev x9, x9'
+            store_temp(instr.dst, 'x9')
+            return
+          when '__builtin_ia32_bsf32', '__builtin_ia32_bsf64'
+            # x86 bit-scan forward — same as ctz on ARM64
+            load_operand(args[0], 'x9')
+            emit '  rbit x9, x9'
+            emit '  clz  x9, x9'
+            store_temp(instr.dst, 'x9')
+            return
+          when '__builtin_add_overflow'
+            load_operand(args[0], 'x9')
+            load_operand(args[1], 'x10')
+            load_operand(args[2], 'x11')
+            emit '  adds x9, x9, x10'
+            emit '  str  x9, [x11]'
+            emit '  cset x9, cs'      # unsigned carry = overflow
+            store_temp(instr.dst, 'x9')
+            return
+          when '__builtin_sub_overflow'
+            load_operand(args[0], 'x9')
+            load_operand(args[1], 'x10')
+            load_operand(args[2], 'x11')
+            emit '  subs x9, x9, x10'
+            emit '  str  x9, [x11]'
+            emit '  cset x9, cc'      # carry clear = unsigned borrow
+            store_temp(instr.dst, 'x9')
+            return
+          when '__builtin_mul_overflow'
+            load_operand(args[0], 'x9')
+            load_operand(args[1], 'x10')
+            load_operand(args[2], 'x11')
+            emit '  mul  x12, x9, x10'
+            emit '  umulh x9, x9, x10'   # high 64 bits; nonzero = overflow
+            emit '  str  x12, [x11]'
+            emit '  cmp  x9, #0'
+            emit '  cset x9, ne'
+            store_temp(instr.dst, 'x9')
+            return
+          when '__builtin_alloca'
+            # Allocate `size` bytes on the stack; align up to 16 bytes
+            load_operand(args[0], 'x9')
+            emit '  add  x9, x9, #15'
+            emit '  and  x9, x9, #-16'
+            emit '  sub  sp, sp, x9'
+            emit '  mov  x9, sp'
+            store_temp(instr.dst, 'x9')
+            return
+          when '__builtin_assume_aligned'
+            # Alignment hint only — return the pointer unchanged
+            load_operand(args[0], 'x9')
+            store_temp(instr.dst, 'x9')
+            return
+          when '__builtin_prefetch'
+            # Memory prefetch hint — no-op on ARM64 (prfm requires literal hint)
+            return
+          end
+        end
+
         # Variadic functions: named args in x0..x{N-1}, variadic args on stack
         named_count = func_ref.is_a?(IR::GlobalRef) ?
                         @mod.variadic_funcs[func_ref.name] : nil
         variadic = !named_count.nil?
 
         if variadic
-          # Put named args in registers
           named_args = args.first(named_count)
           var_args   = args.drop(named_count)
-          int_idx = 0
-          named_args.each do |a|
-            load_operand(a, ARG_REGS[int_idx])
-            int_idx += 1
-          end
+          stack_sz   = 0
+
+          # Push variadic args to the stack FIRST so that any TLS bootstrap calls
+          # inside load_operand don't clobber named-arg registers (x0..xN) already set.
           if var_args.any?
             stack_sz = align16(var_args.length * 8)
             emit_sp_sub(stack_sz)
@@ -968,6 +1178,14 @@ module OCC
               emit "  str x9, [sp, ##{i * 8}]"
             end
           end
+
+          # Load named args into x0..x{N-1} after variadic stack is committed
+          int_idx = 0
+          named_args.each do |a|
+            load_operand(a, ARG_REGS[int_idx])
+            int_idx += 1
+          end
+
           emit "  bl #{sym(func_ref.name)}"
           emit_sp_add(stack_sz) if var_args.any?
         else
@@ -1166,7 +1384,10 @@ module OCC
           slot = slot_of(op)
           emit_slot_load(reg, slot)
         when IR::GlobalRef
-          if @mod.func_names.include?(op.name)
+          if @mod.tls_globals.key?(op.name)
+            # Thread-local variable: use TLV descriptor access
+            emit_tls_load(op.name, reg)
+          elsif @mod.func_names.include?(op.name)
             if @mod.defined_funcs.include?(op.name)
               # Locally-defined function: direct PC-relative address
               emit "  adrp #{reg}, #{sym(op.name)}@PAGE"
@@ -1214,53 +1435,114 @@ module OCC
       end
 
       def emit_struct_copy(src, dst, size)
+        # For large structs, call memcpy rather than emitting hundreds of inline
+        # ldp/stp pairs. Calling convention: x9=src, x10=dst at all call sites.
+        if size > 256
+          emit "  mov x0, #{dst}"
+          emit "  mov x1, #{src}"
+          emit_mov_imm('x2', size)
+          emit "  bl #{sym('memcpy')}"
+          return
+        end
+
         offset = 0
-        while offset + 16 <= size
-          emit "  ldp x11, x12, [#{src}, ##{offset}]"
-          emit "  stp x11, x12, [#{dst}, ##{offset}]"
+        remaining = size
+        src_base = src
+        dst_base = dst
+
+        while remaining >= 16
+          # ldp signed offset must be in [-512, 504] aligned to 8. When we're
+          # about to exceed this range, bump the base registers forward.
+          if offset > 488
+            emit "  add x13, #{src_base}, ##{offset}"
+            emit "  add x14, #{dst_base}, ##{offset}"
+            src_base = 'x13'
+            dst_base = 'x14'
+            offset = 0
+          end
+          emit "  ldp x11, x12, [#{src_base}, ##{offset}]"
+          emit "  stp x11, x12, [#{dst_base}, ##{offset}]"
           offset += 16
+          remaining -= 16
         end
-        if offset + 8 <= size
-          emit "  ldr x11, [#{src}, ##{offset}]"
-          emit "  str x11, [#{dst}, ##{offset}]"
+        # For the tail, ldr/str unsigned offset supports up to 32760 for 64-bit,
+        # but after bumping we may have a large leftover offset too. Bump if needed.
+        if offset > 255
+          emit "  add x13, #{src_base}, ##{offset}"
+          emit "  add x14, #{dst_base}, ##{offset}"
+          src_base = 'x13'
+          dst_base = 'x14'
+          offset = 0
+        end
+        if remaining >= 8
+          emit "  ldr x11, [#{src_base}, ##{offset}]"
+          emit "  str x11, [#{dst_base}, ##{offset}]"
           offset += 8
+          remaining -= 8
         end
-        if offset + 4 <= size
-          emit "  ldr w11, [#{src}, ##{offset}]"
-          emit "  str w11, [#{dst}, ##{offset}]"
+        if remaining >= 4
+          emit "  ldr w11, [#{src_base}, ##{offset}]"
+          emit "  str w11, [#{dst_base}, ##{offset}]"
           offset += 4
+          remaining -= 4
         end
-        if offset + 2 <= size
-          emit "  ldrh w11, [#{src}, ##{offset}]"
-          emit "  strh w11, [#{dst}, ##{offset}]"
+        if remaining >= 2
+          emit "  ldrh w11, [#{src_base}, ##{offset}]"
+          emit "  strh w11, [#{dst_base}, ##{offset}]"
           offset += 2
+          remaining -= 2
         end
-        if offset < size
-          emit "  ldrb w11, [#{src}, ##{offset}]"
-          emit "  strb w11, [#{dst}, ##{offset}]"
+        if remaining > 0
+          emit "  ldrb w11, [#{src_base}, ##{offset}]"
+          emit "  strb w11, [#{dst_base}, ##{offset}]"
         end
       end
 
-      # Fill size bytes at [dst] with val_reg (for constant zero-init of large structs).
+      # Fill size bytes at [dst] with the low byte of val_reg.
       def emit_struct_fill(val_reg, dst, size)
+        # For large zero-fills, call memset rather than emitting inline stores.
+        if size > 256
+          emit "  mov x0, #{dst}"
+          emit "  mov x1, #{val_reg}"
+          emit_mov_imm('x2', size)
+          emit "  bl #{sym('memset')}"
+          return
+        end
+
         offset = 0
-        while offset + 16 <= size
-          emit "  stp #{val_reg}, #{val_reg}, [#{dst}, ##{offset}]"
+        remaining = size
+        dst_base = dst
+        while remaining >= 16
+          if offset > 488
+            emit "  add x14, #{dst_base}, ##{offset}"
+            dst_base = 'x14'
+            offset = 0
+          end
+          emit "  stp #{val_reg}, #{val_reg}, [#{dst_base}, ##{offset}]"
           offset += 16
+          remaining -= 16
         end
-        if offset + 8 <= size
-          emit "  str #{val_reg}, [#{dst}, ##{offset}]"
+        if offset > 255
+          emit "  add x14, #{dst_base}, ##{offset}"
+          dst_base = 'x14'
+          offset = 0
+        end
+        if remaining >= 8
+          emit "  str #{val_reg}, [#{dst_base}, ##{offset}]"
           offset += 8
+          remaining -= 8
         end
-        if offset + 4 <= size
-          emit "  str w#{val_reg[1..]}, [#{dst}, ##{offset}]"
+        if remaining >= 4
+          emit "  str w#{val_reg[1..]}, [#{dst_base}, ##{offset}]"
           offset += 4
+          remaining -= 4
         end
-        if offset + 2 <= size
-          emit "  strh w#{val_reg[1..]}, [#{dst}, ##{offset}]"
+        if remaining >= 2
+          emit "  strh w#{val_reg[1..]}, [#{dst_base}, ##{offset}]"
           offset += 2
+          remaining -= 2
         end
-        emit "  strb w#{val_reg[1..]}, [#{dst}, ##{offset}]" if offset < size
+        emit "  strb w#{val_reg[1..]}, [#{dst_base}, ##{offset}]" if remaining > 0
       end
 
       def collect_temp_count(func)
@@ -1296,6 +1578,22 @@ module OCC
           emit_mov_x16(n)
           emit '  add sp, sp, x16'
         end
+      end
+
+      # Load a 64-bit immediate into any register using movz/movk.
+      def emit_mov_imm(reg, val)
+        chunks = [val & 0xFFFF, (val >> 16) & 0xFFFF, (val >> 32) & 0xFFFF, (val >> 48) & 0xFFFF]
+        first = true
+        chunks.each_with_index do |c, i|
+          next if c.zero? && !first
+          if first
+            emit "  movz #{reg}, ##{c}#{i > 0 ? ", lsl ##{i * 16}" : ''}"
+            first = false
+          else
+            emit "  movk #{reg}, ##{c}, lsl ##{i * 16}"
+          end
+        end
+        emit "  movz #{reg}, #0" if first
       end
 
       # Load a 64-bit immediate into x16 using movz/movk.

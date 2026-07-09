@@ -47,6 +47,14 @@ module OCC
     '_Noreturn'       => :kw__Noreturn,
     '_Static_assert'  => :kw__Static_assert,
     '_Thread_local'   => :kw__Thread_local,
+    '__typeof__'      => :kw__typeof__,
+    '__typeof'        => :kw__typeof,
+    'typeof'          => :kw__typeof__,
+    '__builtin_offsetof' => :kw__builtin_offsetof,
+    'asm'             => :kw_asm,
+    '__asm__'         => :kw_asm,
+    '__asm'           => :kw_asm,
+    '__int128'        => :kw__int128,
     '__occ_constructor' => :kw_occ_constructor
   }.freeze
 
@@ -64,7 +72,9 @@ module OCC
       when :char_lit   then "char(#{value[:value].inspect})"
       when :string_lit then "string(#{value[:value].inspect})"
       when :ident      then "ident(#{value})"
-      else "#{type}(#{value})"
+      else
+        kw = type.to_s.delete_prefix('kw_')
+        kw == type.to_s ? "#{type}(#{value})" : kw
       end
     end
   end

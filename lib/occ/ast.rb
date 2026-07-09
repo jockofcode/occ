@@ -197,6 +197,20 @@ module OCC
       def initialize(type_spec:, **kw) = (super(**kw); @type_spec = type_spec)
     end
 
+    # GCC statement expression: ({ stmts... }) — evaluates to value of last expression
+    class StmtExpr < Node
+      attr_accessor :body  # AST::CompoundStmt
+      def initialize(body:, **kw) = (super(**kw); @body = body)
+    end
+
+    # __builtin_offsetof(type, member.field...)
+    class BuiltinOffsetof < Node
+      attr_accessor :type_spec, :member_chain, :sizeof_val  # sizeof_val set by semantic pass
+      def initialize(type_spec:, member_chain:, **kw)
+        super(**kw); @type_spec = type_spec; @member_chain = member_chain
+      end
+    end
+
     class CallExpr < Node
       attr_accessor :callee, :args
       def initialize(callee:, args:, **kw) = (super(**kw); @callee = callee; @args = args)
@@ -222,15 +236,19 @@ module OCC
     # ── Type specifiers (AST-level, not the full type objects) ──────────────────
 
     class TypeSpec < Node
-      attr_accessor :storage, :qualifiers, :type_keywords, :tag_decl, :typedef_name
+      attr_accessor :storage, :qualifiers, :type_keywords, :tag_decl, :typedef_name,
+                    :typeof_operand, :typeof_is_type
       def initialize(storage: nil, qualifiers: [], type_keywords: [],
-                     tag_decl: nil, typedef_name: nil, **kw)
+                     tag_decl: nil, typedef_name: nil,
+                     typeof_operand: nil, typeof_is_type: false, **kw)
         super(**kw)
-        @storage       = storage
-        @qualifiers    = qualifiers
-        @type_keywords = type_keywords
-        @tag_decl      = tag_decl
-        @typedef_name  = typedef_name
+        @storage        = storage
+        @qualifiers     = qualifiers
+        @type_keywords  = type_keywords
+        @tag_decl       = tag_decl
+        @typedef_name   = typedef_name
+        @typeof_operand = typeof_operand
+        @typeof_is_type = typeof_is_type
       end
     end
 

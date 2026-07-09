@@ -231,9 +231,18 @@ module OCC
       t1 = t1.unqualified
       t2 = t2.unqualified
 
+      # Pointer arithmetic: pointer ± integer → pointer
+      return t1 if t1.is_a?(PointerType) && t2.integer?
+      return t2 if t2.is_a?(PointerType) && t1.integer?
+      # Pointer difference: pointer - pointer → ptrdiff_t (LONG)
+      return LONG if t1.is_a?(PointerType) && t2.is_a?(PointerType)
+
       return LONGDOUBLE if [t1, t2].any? { |t| t == LONGDOUBLE }
       return DOUBLE     if [t1, t2].any? { |t| t == DOUBLE }
       return FLOAT      if [t1, t2].any? { |t| t == FLOAT }
+
+      # Non-integer non-pointer: bail out (guard before calling signed? below)
+      return t1 unless t1.respond_to?(:signed?) && t2.respond_to?(:signed?)
 
       t1 = integer_promote(t1)
       t2 = integer_promote(t2)
@@ -288,7 +297,7 @@ module OCC
 
       case kws_set
       when ['void']                         then VOID
-      when ['bool']                         then BOOL
+      when ['bool'], ['_Bool']              then BOOL
       when ['char']                         then CHAR
       when ['char', 'signed']               then SCHAR
       when ['char', 'unsigned']             then UCHAR
@@ -310,6 +319,8 @@ module OCC
       when ['float']                        then FLOAT
       when ['double']                       then DOUBLE
       when ['double', 'long']               then LONGDOUBLE
+      when ['__int128'], ['__int128', 'signed'] then LONGLONG
+      when ['__int128', 'unsigned']         then ULONGLONG
       else
         # Fallback: if typedef_name is set, use INT as placeholder;
         # the semantic analyser resolves typedef names via the symbol table.
