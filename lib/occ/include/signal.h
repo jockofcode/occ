@@ -8,6 +8,40 @@ typedef sighandler_t sig_t;
 typedef int sig_atomic_t;
 
 /* Standard signals */
+#if defined(__APPLE__)
+#define SIGHUP    1
+#define SIGINT    2
+#define SIGQUIT   3
+#define SIGILL    4
+#define SIGTRAP   5
+#define SIGABRT   6
+#define SIGEMT    7
+#define SIGFPE    8
+#define SIGKILL   9
+#define SIGBUS    10
+#define SIGSEGV   11
+#define SIGSYS    12
+#define SIGPIPE   13
+#define SIGALRM   14
+#define SIGTERM   15
+#define SIGURG    16
+#define SIGSTOP   17
+#define SIGTSTP   18
+#define SIGCONT   19
+#define SIGCHLD   20
+#define SIGTTIN   21
+#define SIGTTOU   22
+#define SIGIO     23
+#define SIGXCPU   24
+#define SIGXFSZ   25
+#define SIGVTALRM 26
+#define SIGPROF   27
+#define SIGWINCH  28
+#define SIGINFO   29
+#define SIGUSR1   30
+#define SIGUSR2   31
+#define NSIG      32
+#else
 #define SIGHUP    1
 #define SIGINT    2
 #define SIGQUIT   3
@@ -39,6 +73,7 @@ typedef int sig_atomic_t;
 #define SIGPWR    30
 #define SIGSYS    31
 #define NSIG      32
+#endif
 
 /* Special handler values */
 #define SIG_DFL ((sighandler_t)0)
@@ -46,7 +81,11 @@ typedef int sig_atomic_t;
 #define SIG_ERR ((sighandler_t)(-1))
 
 /* sigset_t */
+#if defined(__APPLE__)
+typedef unsigned int sigset_t;
+#else
 typedef unsigned long sigset_t;
+#endif
 
 /* sigval — used inside siginfo_t */
 union sigval {
@@ -96,14 +135,27 @@ extern int sigpending(sigset_t *set);
 extern int sigsuspend(const sigset_t *mask);
 
 /* alternate signal stack */
+#if defined(__APPLE__)
+typedef struct {
+    void  *ss_sp;
+    size_t ss_size;
+    int    ss_flags;
+} stack_t;
+#else
 typedef struct {
     void  *ss_sp;
     int    ss_flags;
     size_t ss_size;
 } stack_t;
+#endif
 
+#if defined(__APPLE__)
+#define MINSIGSTKSZ 32768
+#define SIGSTKSZ    131072
+#else
 #define MINSIGSTKSZ 2048
 #define SIGSTKSZ    8192
+#endif
 #define SS_DISABLE  4
 
 extern int sigaltstack(const stack_t *ss, stack_t *oss);
@@ -116,6 +168,19 @@ extern int sigaltstack(const stack_t *ss, stack_t *oss);
 #define SI_MESGQ    0x10005
 #define SI_KERNEL   0x10006
 
+#if defined(__APPLE__)
+#define SA_ONSTACK    0x0001
+#define SA_RESTART    0x0002
+#define SA_RESETHAND  0x0004
+#define SA_NOCLDSTOP  0x0008
+#define SA_NODEFER    0x0010
+#define SA_NOCLDWAIT  0x0020
+#define SA_SIGINFO    0x0040
+
+#define SIG_BLOCK   1
+#define SIG_UNBLOCK 2
+#define SIG_SETMASK 3
+#else
 #define SA_NOCLDSTOP  1
 #define SA_NOCLDWAIT  2
 #define SA_SIGINFO    4
@@ -127,5 +192,6 @@ extern int sigaltstack(const stack_t *ss, stack_t *oss);
 #define SIG_BLOCK   0
 #define SIG_UNBLOCK 1
 #define SIG_SETMASK 2
+#endif
 
 #endif /* _OCC_SIGNAL_H */

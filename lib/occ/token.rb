@@ -55,7 +55,8 @@ module OCC
     '__asm__'         => :kw_asm,
     '__asm'           => :kw_asm,
     '__int128'        => :kw__int128,
-    '__occ_constructor' => :kw_occ_constructor
+    '__occ_constructor' => :kw_occ_constructor,
+    '__occ_packed' => :kw_occ_packed
   }.freeze
 
   # A single lexical token.

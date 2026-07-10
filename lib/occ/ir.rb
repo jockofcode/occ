@@ -71,6 +71,13 @@ module OCC
       def to_s = "#{@dst} = addr_of #{@src}"
     end
 
+    # dst = current stack pointer
+    class StackPointer < Instruction
+      attr_reader :dst
+      def initialize(dst) = (@dst = dst)
+      def to_s = "#{@dst} = stack_pointer"
+    end
+
     # dst = gep ptr, index  (get element pointer)
     class Gep < Instruction
       attr_reader :dst, :ptr, :index, :elem_size
@@ -271,6 +278,20 @@ module OCC
       def jump_to(block)
         emit(Jump.new(block.label)) unless @block&.terminated?
         switch_to(block)
+      end
+
+      def with_local_scope
+        saved_locals = @locals
+        saved_local_ctypes = @local_ctypes
+        saved_static_locals = @static_locals
+        @locals = @locals.dup
+        @local_ctypes = @local_ctypes.dup
+        @static_locals = @static_locals.dup
+        yield
+      ensure
+        @locals = saved_locals
+        @local_ctypes = saved_local_ctypes
+        @static_locals = saved_static_locals
       end
 
       # ── External declarations ────────────────────────────────────────────────
@@ -523,6 +544,12 @@ module OCC
         when AST::FloatLiteral then expr.raw.to_f
         when AST::StringLiteral
           { kind: :string, value: expr.value }
+        when AST::SizeofType
+          expr.sizeof_val
+        when AST::SizeofExpr
+          expr.sizeof_val
+        when AST::BuiltinOffsetof
+          expr.sizeof_val
         when AST::Identifier
           if @enum_constants.key?(expr.name)
             @enum_constants[expr.name]
@@ -557,17 +584,32 @@ module OCC
           when :minus  then l - r
           when :star   then l * r
           when :slash  then r != 0 ? l / r : nil
+          when :percent then r != 0 ? l % r : nil
           when :lshift then l << r
           when :rshift then l >> r
           when :amp    then l & r
           when :pipe   then l | r
           when :caret  then l ^ r
+          when :eq     then l == r ? 1 : 0
+          when :neq    then l != r ? 1 : 0
+          when :lt     then l < r ? 1 : 0
+          when :leq    then l <= r ? 1 : 0
+          when :gt     then l > r ? 1 : 0
+          when :geq    then l >= r ? 1 : 0
+          when :logical_and then (l != 0 && r != 0) ? 1 : 0
+          when :logical_or  then (l != 0 || r != 0) ? 1 : 0
           end
+        when AST::TernaryOp
+          cond = eval_const_init(expr.cond, allow_ref: allow_ref)
+          return nil unless cond.is_a?(Numeric)
+          eval_const_init(cond != 0 ? expr.then_expr : expr.else_expr, allow_ref: allow_ref)
         when Hash
           if expr[:kind] == :initializer_list
             { kind: :initializer_list,
               items: (expr[:items] || []).map { |item|
-                { designators: item[:designators] || [],
+                { designators: (item[:designators] || []).map { |designator|
+                    designator[0] == :index ? [:index, eval_const_init(designator[1], allow_ref: false)] : designator
+                  },
                   value: eval_const_init(item[:value], allow_ref: true) }
               } }
           end
@@ -610,8 +652,9 @@ module OCC
 
       def build_stmt(node)
         case node
-        when AST::CompoundStmt  then node.items.each { |item| build_block_item(item) }
+        when AST::CompoundStmt  then with_local_scope { node.items.each { |item| build_block_item(item) } }
         when AST::ExprStmt      then build_expr(node.expr) if node.expr
+        when AST::AsmStmt       then build_asm(node)
         when AST::ReturnStmt    then build_return(node)
         when AST::IfStmt        then build_if(node)
         when AST::WhileStmt     then build_while(node)
@@ -801,10 +844,12 @@ module OCC
           end
           # Then apply explicit initializers
           items.each_with_index do |item, seq_idx|
-            # Resolve target field (designated or sequential)
-            field = if item[:designators]&.any? { |d| d[0] == :field }
-                      fname = item[:designators].reverse.find { |d| d[0] == :field }&.last
-                      ctype.fields.find { |f| f[:name] == fname }
+            # Resolve the field at this aggregate level. Nested designators are
+            # consumed one aggregate at a time, e.g. `.as.string = { ... }`.
+            designators = item[:designators] || []
+            field_idx = designators.index { |d| d[0] == :field }
+            field = if field_idx
+                      ctype.fields.find { |f| f[:name] == designators[field_idx].last }
                     else
                       ctype.fields[seq_idx]
                     end
@@ -816,7 +861,15 @@ module OCC
                      emit(Binary.new(t, :plus, base_ptr, Const.new(field[:offset])))
                      t
                    end
-            if item[:value].is_a?(Hash) && item[:value][:kind] == :initializer_list
+
+            remaining_designators = field_idx ? designators[(field_idx + 1)..] : []
+            if remaining_designators && !remaining_designators.empty?
+              build_initializer_list(
+                fptr,
+                { kind: :initializer_list, items: [{ designators: remaining_designators, value: item[:value] }] },
+                field[:type]
+              )
+            elsif item[:value].is_a?(Hash) && item[:value][:kind] == :initializer_list
               build_initializer_list(fptr, item[:value], field[:type])
             elsif field[:bit_width]
               val = build_expr(item[:value])
@@ -830,6 +883,10 @@ module OCC
         elsif ctype.is_a?(OCC::Types::ArrayType)
           elem_ct = ctype.element
           esz     = elem_ct.size rescue 8
+          if ctype.count
+            total = ctype.count * esz
+            emit(Store.new(base_ptr, Const.new(0), ctype, total)) if total > 0
+          end
           items.each_with_index do |item, seq_idx|
             next unless item[:value]
             idx = if item[:designators]&.any? { |d| d[0] == :index }
@@ -850,6 +907,21 @@ module OCC
           # Scalar or unknown: store first value directly
           val = build_expr(items.first[:value]) if items.first
           emit(Store.new(base_ptr, val)) if val
+        end
+      end
+
+      def build_asm(node)
+        return unless node.template.match?(/\bmov\b.*%0.*\b(?:sp|rsp)\b/)
+
+        node.outputs.each do |out|
+          next unless out[:constraint].start_with?('=')
+
+          addr = lvalue_addr(out[:expr])
+          sp = new_temp
+          emit(StackPointer.new(sp))
+          ct = out[:expr].respond_to?(:ctype) ? out[:expr].ctype : nil
+          sz = ct.respond_to?(:size) ? (ct.size rescue 8) : 8
+          emit(Store.new(addr, sp, ct, sz))
         end
       end
 
@@ -949,39 +1021,41 @@ module OCC
       end
 
       def build_for(node)
-        cond_block = new_block(new_label('for_cond'))
-        body_block = new_block(new_label('for_body'))
-        incr_block = new_block(new_label('for_incr'))
-        end_block  = new_block(new_label('for_end'))
+        with_local_scope do
+          cond_block = new_block(new_label('for_cond'))
+          body_block = new_block(new_label('for_body'))
+          incr_block = new_block(new_label('for_incr'))
+          end_block  = new_block(new_label('for_end'))
 
-        saved_break = @break_target
-        saved_cont  = @cont_target
-        @break_target = end_block.label
-        @cont_target  = incr_block.label
+          saved_break = @break_target
+          saved_cont  = @cont_target
+          @break_target = end_block.label
+          @cont_target  = incr_block.label
 
-        build_block_item(node.init) if node.init
-        jump_to(cond_block)
+          build_block_item(node.init) if node.init
+          jump_to(cond_block)
 
-        switch_to(cond_block)
-        if node.cond
-          cond_val = build_expr(node.cond)
-          emit(CondJump.new(cond_val, body_block.label, end_block.label))
-        else
-          emit(Jump.new(body_block.label))
+          switch_to(cond_block)
+          if node.cond
+            cond_val = build_expr(node.cond)
+            emit(CondJump.new(cond_val, body_block.label, end_block.label))
+          else
+            emit(Jump.new(body_block.label))
+          end
+
+          switch_to(body_block)
+          build_stmt(node.body)
+          jump_to(incr_block) unless @block.terminated?
+
+          switch_to(incr_block)
+          build_expr(node.update) if node.update
+          jump_to(cond_block)
+
+          switch_to(end_block)
+
+          @break_target = saved_break
+          @cont_target  = saved_cont
         end
-
-        switch_to(body_block)
-        build_stmt(node.body)
-        jump_to(incr_block) unless @block.terminated?
-
-        switch_to(incr_block)
-        build_expr(node.update) if node.update
-        jump_to(cond_block)
-
-        switch_to(end_block)
-
-        @break_target = saved_break
-        @cont_target  = saved_cont
       end
 
       def build_switch(node)
@@ -1901,16 +1975,21 @@ module OCC
 
       # ── Member access ────────────────────────────────────────────────────────
 
+      def member_container_ctype(node)
+        ctype = node.expr.ctype
+        return nil unless ctype
+        if node.arrow
+          ctype = OCC::Types::PointerType.new(ctype.element) if ctype.is_a?(OCC::Types::ArrayType)
+          ctype = ctype.base if ctype.is_a?(OCC::Types::PointerType)
+        end
+        ctype = ctype.unqualified if ctype.respond_to?(:unqualified)
+        ctype
+      end
+
       # Returns an operand holding the address of the named field.
       def build_member_addr(node)
-        struct_ctype = node.expr.ctype
+        struct_ctype = member_container_ctype(node)
         return Const.new(0) unless struct_ctype
-
-        # For ->, dereference the pointer to get the struct type.
-        if node.arrow
-          struct_ctype = struct_ctype.base if struct_ctype.is_a?(OCC::Types::PointerType)
-        end
-        struct_ctype = struct_ctype.unqualified if struct_ctype.respond_to?(:unqualified)
         return Const.new(0) unless struct_ctype.is_a?(OCC::Types::StructType) && struct_ctype.complete?
 
         field = struct_ctype.fields.find { |f| f[:name] == node.member }
@@ -1988,10 +2067,8 @@ module OCC
       # at group_byte + floor(bit_offset/8) with an adjusted bit position within
       # that aligned load unit.
       def bitfield_info(node)
-        ctype = node.expr.ctype
+        ctype = member_container_ctype(node)
         return nil unless ctype
-        ctype = ctype.base if node.arrow && ctype.is_a?(OCC::Types::PointerType)
-        ctype = ctype.unqualified if ctype.respond_to?(:unqualified)
         return nil unless ctype.is_a?(OCC::Types::StructType) && ctype.complete?
         field = ctype.fields.find { |f| f[:name] == node.member }
         return nil unless field && field[:bit_width]
@@ -2014,10 +2091,8 @@ module OCC
 
       # Return the byte size of a named field, or 8 on failure.
       def member_field_size(node)
-        ctype = node.expr.ctype
+        ctype = member_container_ctype(node)
         return 8 unless ctype
-        ctype = ctype.base if node.arrow && ctype.is_a?(OCC::Types::PointerType)
-        ctype = ctype.unqualified if ctype.respond_to?(:unqualified)
         return 8 unless ctype.is_a?(OCC::Types::StructType) && ctype.complete?
         field = ctype.fields.find { |f| f[:name] == node.member }
         field ? field[:type].size : 8

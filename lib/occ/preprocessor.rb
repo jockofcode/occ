@@ -743,6 +743,9 @@ module OCC
               if (name == '__attribute__' || name == '__attribute') &&
                  args.first.to_s.strip.match?(/^\(\s*constructor\s*\)$/)
                 result << '__occ_constructor'
+              elsif (name == '__attribute__' || name == '__attribute') &&
+                    args.first.to_s.strip.match?(/^\(\s*packed\b.*\)$/)
+                result << '__occ_packed'
               else
                 replacement = expand_function_macro(macro, args, name, expanding: expanding)
                 result << replacement

@@ -199,6 +199,11 @@ module OCC
         item[:designators].find { |d| d[0] == :field }&.last
       end
 
+      def item_index_designator(item)
+        return nil unless item.is_a?(Hash) && item[:designators]&.any?
+        item[:designators].find { |d| d[0] == :index }
+      end
+
       # Recursively assign labels to string items in a compound initializer (mutates items).
       def collect_compound_strings(init_node, prefix)
         result = {}
@@ -222,18 +227,35 @@ module OCC
         bare = type.respond_to?(:unqualified) ? type.unqualified : type
         if bare.is_a?(OCC::Types::ArrayType)
           elem_type = bare.element
-          items.each do |item|
+          elem_values = {}
+          cursor = 0
+          (items || []).each do |item|
             raw = item_raw_value(item)
+            designators = item.is_a?(Hash) ? (item[:designators] || []) : []
+            index_pos = designators.index { |d| d[0] == :index }
+            idx = if index_pos
+                    designators[index_pos][1]
+                  else
+                    cursor
+                  end
+            next unless idx.is_a?(Integer)
+
+            remaining = index_pos ? designators[(index_pos + 1)..] : []
+            raw = { kind: :initializer_list, items: [{ designators: remaining, value: raw }] } if remaining && !remaining.empty?
+            elem_values[idx] = raw
+            cursor = idx + 1
+          end
+
+          limit = bare.count || ((elem_values.keys.max || -1) + 1)
+          limit.times do |idx|
+            raw = elem_values[idx]
             if raw.is_a?(Hash) && raw[:kind] == :initializer_list
               emit_compound_init_data(elem_type, raw[:items], strings)
+            elsif raw.nil?
+              emit "  .zero #{type_byte_size(elem_type)}"
             else
               emit_compound_field_value(raw, elem_type, strings)
             end
-          end
-          # Zero-fill to declared array size
-          if bare.count && bare.count > items.length
-            remaining = (bare.count - items.length) * type_byte_size(elem_type)
-            emit "  .zero #{remaining}" if remaining > 0
           end
         elsif bare.is_a?(OCC::Types::StructType)
           emit_struct_init_data(bare, items, strings)
@@ -270,11 +292,14 @@ module OCC
         field_values = {}
         cursor = 0
         (items || []).each do |item|
-          raw   = item_raw_value(item)
-          fname = item_field_name(item)
-          if fname
-            idx = field_by_name[fname.to_s]
+          raw = item_raw_value(item)
+          designators = item.is_a?(Hash) ? (item[:designators] || []) : []
+          field_pos = designators.index { |d| d[0] == :field }
+          if field_pos
+            idx = field_by_name[designators[field_pos].last.to_s]
             if idx
+              remaining = designators[(field_pos + 1)..]
+              raw = { kind: :initializer_list, items: [{ designators: remaining, value: raw }] } if remaining && !remaining.empty?
               field_values[idx] = raw
               cursor = idx + 1
             end
@@ -797,6 +822,10 @@ module OCC
               emit "  ldr  x9, [x9, #{sym(instr.src.name)}@GOTPAGEOFF]"
             end
           end
+          store_temp(instr.dst, 'x9')
+
+        when IR::StackPointer
+          emit '  mov x9, sp'
           store_temp(instr.dst, 'x9')
 
         when IR::Gep

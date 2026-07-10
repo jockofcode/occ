@@ -75,10 +75,22 @@ extern int   optind, opterr, optopt;
 extern int   getopt(int argc, char *const argv[], const char *optstring);
 
 /* sysconf constants */
+#if defined(__APPLE__)
+#define _SC_ARG_MAX           1
+#define _SC_CHILD_MAX         2
+#define _SC_CLK_TCK           3
+#define _SC_NGROUPS_MAX       4
+#define _SC_OPEN_MAX          5
+#define _SC_PAGESIZE          29
+#define _SC_PAGE_SIZE         _SC_PAGESIZE
+#define _SC_NPROCESSORS_CONF  57
+#define _SC_NPROCESSORS_ONLN  58
+#else
 #define _SC_CLK_TCK          2
 #define _SC_NGROUPS_MAX      4
 #define _SC_PAGESIZE         30
 #define _SC_PAGE_SIZE        _SC_PAGESIZE
 #define _SC_NPROCESSORS_ONLN 84
+#endif
 
 #endif /* _OCC_UNISTD_H */

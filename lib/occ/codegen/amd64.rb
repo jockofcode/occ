@@ -374,6 +374,10 @@ module OCC
             store_temp(instr.dst, '%rax')
           end
 
+        when IR::StackPointer
+          emit '  movq %rsp, %rax'
+          store_temp(instr.dst, '%rax')
+
         when IR::Load
           if instr.ptr.is_a?(IR::Temp) && @alloca_slots.include?(instr.ptr.id)
             if @fp_alloca_slots.include?(instr.ptr.id)

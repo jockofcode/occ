@@ -259,6 +259,8 @@ module OCC
         node.sizeof_val || resolve_sizeof_type(node.type_spec)
       when AST::SizeofExpr
         node.sizeof_val
+      when AST::BuiltinOffsetof
+        node.sizeof_val || eval_builtin_offsetof(node)
       else nil
       end
     rescue StandardError
@@ -426,7 +428,7 @@ module OCC
       @struct_tags[tag] = st if tag
 
       if spec.fields
-        pack       = current_pack   # nil = natural alignment; Integer = max field alignment
+        pack       = spec.packed ? [current_pack, 1].compact.min : current_pack
         st.pack    = pack
         offset     = 0      # current byte offset within struct
         bit_offset = 0      # current bit offset within the current storage unit
@@ -550,6 +552,7 @@ module OCC
         val = 0
         et.enumerators = {}
         spec.enumerators.each do |e|
+          analyze_expr(e.value) if e.value
           explicit = e.value ? (eval_const_expr(e.value) || (e.value.is_a?(AST::IntLiteral) ? e.value.integer_value : nil)) : nil
           val = explicit || val
           et.enumerators[e.name] = val
@@ -571,6 +574,8 @@ module OCC
         @symbols.pop_scope
       when AST::ExprStmt
         analyze_expr(node.expr) if node.expr
+      when AST::AsmStmt
+        node.outputs.each { |out| analyze_expr(out[:expr]) if out[:expr] }
       when AST::ReturnStmt
         if node.value
           vt = analyze_expr(node.value)
@@ -845,7 +850,10 @@ module OCC
 
     def type_of_member(node)
       t = analyze_expr(node.expr)
-      t = t.base if node.arrow && t.is_a?(Types::PointerType)
+      if node.arrow
+        t = Types::PointerType.new(t.element) if t.is_a?(Types::ArrayType)
+        t = t.base if t.is_a?(Types::PointerType)
+      end
       t = t.unqualified if t.respond_to?(:unqualified)
       if t.is_a?(Types::StructType) && t.complete?
         field = t.fields.find { |f| f[:name] == node.member }

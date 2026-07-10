@@ -62,6 +62,13 @@ module OCC
       def initialize(expr:, **kw) = (super(**kw); @expr = expr)
     end
 
+    class AsmStmt < Node
+      attr_accessor :template, :outputs
+      def initialize(template:, outputs:, **kw)
+        super(**kw); @template = template; @outputs = outputs
+      end
+    end
+
     class IfStmt < Node
       attr_accessor :cond, :then_body, :else_body
       def initialize(cond:, then_body:, else_body: nil, **kw)
@@ -253,9 +260,9 @@ module OCC
     end
 
     class StructSpec < Node
-      attr_accessor :keyword, :tag, :fields
-      def initialize(keyword:, tag: nil, fields: nil, **kw)
-        super(**kw); @keyword = keyword; @tag = tag; @fields = fields
+      attr_accessor :keyword, :tag, :fields, :packed
+      def initialize(keyword:, tag: nil, fields: nil, packed: false, **kw)
+        super(**kw); @keyword = keyword; @tag = tag; @fields = fields; @packed = packed
       end
     end
 

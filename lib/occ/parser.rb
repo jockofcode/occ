@@ -238,6 +238,12 @@ module OCC
     def parse_struct_or_union
       l = loc
       keyword = advance.type   # :kw_struct or :kw_union
+      packed = false
+
+      while cur?(:kw_occ_packed)
+        packed = true
+        advance
+      end
 
       tag = cur?(:ident) ? advance.value : nil
 
@@ -249,7 +255,12 @@ module OCC
         expect(:rbrace)
       end
 
-      AST::StructSpec.new(keyword: keyword, tag: tag, fields: fields, location: l)
+      while cur?(:kw_occ_packed)
+        packed = true
+        advance
+      end
+
+      AST::StructSpec.new(keyword: keyword, tag: tag, fields: fields, packed: packed, location: l)
     end
 
     def parse_struct_declaration
@@ -712,13 +723,38 @@ module OCC
       expect(:rparen)
     end
 
-    # Parse and discard an asm statement: asm [volatile] ("..." : ...) ;
-    # The entire asm body is consumed and emitted as a no-op.
+    # Parse an asm statement. Most inline asm remains a no-op, but recognize the
+    # CRuby/Darwin stack-pointer idiom:
+    #   __asm__ __volatile__("mov\t%0, sp" : "=r" (*(p)))
     def parse_asm_statement
+      l = loc
       advance  # consume 'asm'
       match(:kw_volatile)  # optional volatile qualifier
       match(:kw_goto)      # optional goto qualifier
       expect(:lparen)
+      template = nil
+      if cur?(:string_lit)
+        parts = []
+        while cur?(:string_lit)
+          parts << advance.value[:value]
+        end
+        template = parts.join
+      end
+
+      outputs = []
+      if match(:colon) && !cur?(:colon) && !cur?(:rparen)
+        loop do
+          break unless cur?(:string_lit)
+
+          constraint = advance.value[:value]
+          expect(:lparen)
+          expr = parse_assignment_expr
+          expect(:rparen)
+          outputs << { constraint: constraint, expr: expr }
+          break unless match(:comma)
+        end
+      end
+
       depth = 1
       while depth > 0 && !cur.eof?
         depth += 1 if cur?(:lparen)
@@ -728,7 +764,12 @@ module OCC
       end
       expect(:rparen)
       expect(:semicolon)
-      AST::ExprStmt.new(expr: nil, location: @prev_loc)
+
+      if template&.match?(/\bmov\b.*%0.*\b(?:sp|rsp)\b/) && outputs.any?
+        AST::AsmStmt.new(template: template, outputs: outputs, location: l)
+      else
+        AST::ExprStmt.new(expr: nil, location: l)
+      end
     end
 
     def parse_pragma_pack(l = loc)
