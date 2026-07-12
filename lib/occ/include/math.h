@@ -58,6 +58,8 @@ extern double log2(double x);
 extern double log10(double x);
 extern double log1p(double x);
 extern double logb(double x);
+extern double nan(const char *tagp);
+extern float nanf(const char *tagp);
 
 /* Power */
 extern double pow(double x, double y);

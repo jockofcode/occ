@@ -115,15 +115,6 @@ module OCC
                                                    body: '(*((ptr)) == (old) ? ((*((ptr)) = (new_val)), 1) : 0)' }
       @macros['__sync_val_compare_and_swap']  = { kind: :function, params: ['ptr', 'old', 'new_val'], variadic: false,
                                                    body: '(*((ptr)) == (old) ? ((*((ptr)) = (new_val)), (old)) : *((ptr)))' }
-      @macros['__sync_fetch_and_add']  = { kind: :function, params: ['ptr', 'val'], variadic: false,
-                                            body: '((*((ptr))) += (val))' }
-      @macros['__sync_fetch_and_sub']  = { kind: :function, params: ['ptr', 'val'], variadic: false,
-                                            body: '((*((ptr))) -= (val))' }
-      @macros['__sync_lock_test_and_set'] = { kind: :function, params: ['ptr', 'val'], variadic: false,
-                                               body: '((*((ptr))) = (val))' }
-      @macros['__sync_lock_release']   = { kind: :function, params: ['ptr'], variadic: false,
-                                            body: '((*((ptr))) = 0)' }
-      @macros['__sync_synchronize']    = { kind: :function, params: [], variadic: false, body: '' }
       # GCC __atomic_* builtins — non-atomic fallback (single-threaded semantics)
       @macros['__atomic_load_n']       = { kind: :function, params: ['ptr', 'ord'], variadic: false,
                                             body: '(*(ptr))' }

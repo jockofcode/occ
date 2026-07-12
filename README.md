@@ -8,7 +8,7 @@ occ is a complete C compiler pipeline — preprocessor, lexer, parser, semantic 
 
 The project is a learning exercise in compiler construction. It is not production-ready but successfully compiles and runs real-world C libraries including Lua 5.5, zlib, SQLite, and more.
 
-**Status:** Phases 1–11 complete. 414 tests, 0 failures. All 13 third-party libraries pass.
+**Status:** Phases 1–13 are broadly complete. Current development is focused on Phase 11 Tier 4: CRuby 3.4 `miniruby` bring-up on macOS/ARM64. See [CURRENT_STATUS.md](CURRENT_STATUS.md) for the latest verified tests and active blocker.
 
 ## Pipeline
 

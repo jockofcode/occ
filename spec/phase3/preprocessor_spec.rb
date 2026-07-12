@@ -68,6 +68,25 @@ RSpec.describe OCC::Preprocessor do
     end
   end
 
+  describe 'predefined compiler builtins' do
+    it 'preserves __sync_synchronize for backend barrier lowering' do
+      result = preprocess('void f(void) { __sync_synchronize(); }')
+      expect(result).to include('__sync_synchronize()')
+    end
+
+    it 'preserves __sync lock builtins for backend atomic lowering' do
+      result = preprocess('int f(int *p) { __sync_lock_release(p); return __sync_lock_test_and_set(p, 1); }')
+      expect(result).to include('__sync_lock_release(p)')
+      expect(result).to include('__sync_lock_test_and_set(p, 1)')
+    end
+
+    it 'preserves __sync fetch-add/sub builtins for backend atomic lowering' do
+      result = preprocess('int f(int *p) { return __sync_fetch_and_add(p, 1) + __sync_fetch_and_sub(p, 2); }')
+      expect(result).to include('__sync_fetch_and_add(p, 1)')
+      expect(result).to include('__sync_fetch_and_sub(p, 2)')
+    end
+  end
+
   # ── Conditional compilation ───────────────────────────────────────────────────
 
   describe '#ifdef / #ifndef' do

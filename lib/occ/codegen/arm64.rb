@@ -139,6 +139,12 @@ module OCC
             ref_target = sym(init[:name])
             ref_target += " + #{init[:offset]}" if init[:offset] && init[:offset] != 0
             emit "  .quad #{ref_target}"
+          elsif init.is_a?(Hash) && init[:kind] == :label_ref
+            emit '.section __DATA,__data'
+            emit ".globl #{sym(name)}" unless is_static
+            emit '.p2align 3'
+            emit "#{sym(name)}:"
+            emit "  .quad #{func_local_for(init[:func], init[:label])}"
           else
             # Integer scalar: always emit as .quad so GlobalRef 8-byte loads work correctly.
             emit '.section __DATA,__data'
@@ -410,6 +416,8 @@ module OCC
             ref_target = sym(val[:name])
             ref_target += " + #{val[:offset]}" if val[:offset] && val[:offset] != 0
             emit "  .quad #{ref_target}"
+          when :label_ref
+            emit "  .quad #{func_local_for(val[:func], val[:label])}"
           else
             emit "  .zero #{fsz}"
           end
@@ -436,6 +444,7 @@ module OCC
         @alloca_ctypes = {}       # temp_id => ctype (for correct-width loads)
         @fp_alloca_slots = Set.new # alloca slots holding fp values
         @fp_temps      = Set.new  # temp IDs that hold fp (double/float) values
+        @temp_ctypes   = {}       # temp_id => inferred C type
         @float_pool    = []   # [{label:, value:}] for literal-pool fp constants
         @cond_skip_seq = 0    # unique suffix for CondJump skip labels
 
@@ -455,6 +464,7 @@ module OCC
         end
 
         # Type-propagation pass to identify FP-valued temps
+        compute_temp_ctypes(func)
         compute_fp_temps(func)
 
         # Compute frame size accounting for oversized alloca slots (arrays, structs)
@@ -541,6 +551,7 @@ module OCC
       end
 
       def func_local(label) = "L#{@func.name}_#{label}"
+      def func_local_for(func, label) = "L#{func}_#{label}"
 
       # ── FP helpers ───────────────────────────────────────────────────────────
 
@@ -556,6 +567,86 @@ module OCC
 
       def fp_operand?(op)
         fp_temp?(op) || (op.is_a?(IR::Const) && op.value.is_a?(Float))
+      end
+
+      def bare_ctype(ct)
+        ct.respond_to?(:unqualified) ? ct.unqualified : ct
+      end
+
+      def unsigned_integer_ctype?(ct)
+        ct = bare_ctype(ct)
+        ct.is_a?(OCC::Types::IntegerType) && !ct.signed?
+      end
+
+      def bool_ctype?(ct)
+        bare_ctype(ct).is_a?(OCC::Types::BoolType)
+      end
+
+      def ctype_for_operand(op)
+        case op
+        when IR::Temp
+          @temp_ctypes[op.id]
+        when IR::GlobalRef
+          (@mod.globals[op.name] || @mod.tls_globals[op.name])&.fetch(:type, nil)
+        end
+      end
+
+      def pointer_target_ctype(op)
+        ct = bare_ctype(ctype_for_operand(op))
+        ct.base if ct.is_a?(OCC::Types::PointerType)
+      end
+
+      def ctype_byte_size(ct)
+        ct = bare_ctype(ct)
+        return ct.size if ct.respond_to?(:size)
+
+        8
+      rescue StandardError
+        8
+      end
+
+      def temp_type_from_instr(instr)
+        return instr.type if instr.respond_to?(:type) && instr.type
+
+        case instr
+        when IR::Alloca
+          OCC::Types::PointerType.new(instr.ctype)
+        when IR::AddrOf
+          src_ct = case instr.src
+                   when IR::Temp then @alloca_ctypes[instr.src.id] || @temp_ctypes[instr.src.id]
+                   when IR::GlobalRef then (@mod.globals[instr.src.name] || @mod.tls_globals[instr.src.name])&.fetch(:type, nil)
+                   end
+          OCC::Types::PointerType.new(src_ct) if src_ct
+        when IR::Gep
+          ctype_for_operand(instr.ptr)
+        when IR::Copy
+          ctype_for_operand(instr.src)
+        when IR::Unary
+          ctype_for_operand(instr.src)
+        end
+      end
+
+      def compute_temp_ctypes(func)
+        func.params.each_with_index do |p, idx|
+          @temp_ctypes[idx] = p[:type] if p[:type]
+        end
+
+        changed = true
+        while changed
+          changed = false
+          func.blocks.each do |bb|
+            bb.instrs.each do |instr|
+              next unless instr.respond_to?(:dst)
+
+              ct = temp_type_from_instr(instr)
+              next unless ct
+              next if @temp_ctypes[instr.dst.id] == ct
+
+              @temp_ctypes[instr.dst.id] = ct
+              changed = true
+            end
+          end
+        end
       end
 
       # Build the FP-temp set via dataflow over all blocks.
@@ -621,7 +712,8 @@ module OCC
           else
             # Integer temp used in FP context — convert
             emit_slot_load('x9', slot)
-            emit "  scvtf #{dreg}, x9"
+            conv = unsigned_integer_ctype?(ctype_for_operand(op)) ? 'ucvtf' : 'scvtf'
+            emit "  #{conv} #{dreg}, x9"
           end
         when IR::GlobalRef
           emit "  adrp x9, #{sym(op.name)}@PAGE"
@@ -876,6 +968,10 @@ module OCC
         when IR::Jump
           emit "  b #{func_local(instr.target)}"
 
+        when IR::IndirectJump
+          load_operand(instr.target, 'x9')
+          emit '  br x9'
+
         when IR::CondJump
           load_operand(instr.cond, 'x9')
           # Use cbz to a local skip label + unconditional b for the true branch.
@@ -922,15 +1018,22 @@ module OCC
             # FP → FP: float→double widening or no-op
             load_fp_operand(instr.src, 'd9')
             store_fp_temp(instr.dst, 'd9')
+          elsif bool_ctype?(instr.type)
+            load_operand(instr.src, 'x9')
+            emit '  cmp x9, #0'
+            emit '  cset x9, ne'
+            store_temp(instr.dst, 'x9')
           elsif fp_operand?(instr.src) && !fp_ctype?(instr.type)
             # FP → integer truncation
             load_fp_operand(instr.src, 'd9')
-            emit '  fcvtzs x9, d9'
+            conv = unsigned_integer_ctype?(instr.type) ? 'fcvtzu' : 'fcvtzs'
+            emit "  #{conv} x9, d9"
             store_temp(instr.dst, 'x9')
           elsif !fp_operand?(instr.src) && fp_ctype?(instr.type)
             # integer → FP conversion
             load_operand(instr.src, 'x9')
-            emit '  scvtf d9, x9'
+            conv = unsigned_integer_ctype?(ctype_for_operand(instr.src)) ? 'ucvtf' : 'scvtf'
+            emit "  #{conv} d9, x9"
             store_fp_temp(instr.dst, 'd9')
           else
             # int → int: truncate/extend to target width
@@ -1043,6 +1146,14 @@ module OCC
       end
 
       def emit_fp_binary(instr) # rubocop:disable Metrics/MethodLength
+        if instr.op == :percent
+          load_fp_operand(instr.left, 'd0')
+          load_fp_operand(instr.right, 'd1')
+          emit "  bl #{sym('fmod')}"
+          store_fp_temp(instr.dst, 'd0')
+          return
+        end
+
         load_fp_operand(instr.left,  'd9')
         load_fp_operand(instr.right, 'd10')
 
@@ -1070,10 +1181,48 @@ module OCC
           emit '  fcmp d9, d10'; emit '  cset x9, ge'
           store_temp(instr.dst, 'x9'); return
         else
-          emit '  fadd d9, d9, d10'  # fallback
+          raise CompileError, "unsupported ARM64 FP binary op: #{instr.op}"
         end
 
         store_fp_temp(instr.dst, 'd9')
+      end
+
+      def emit_sync_lock_release(args)
+        load_operand(args[0], 'x10')
+        emit '  mov w9, #0'
+        case ctype_byte_size(pointer_target_ctype(args[0]))
+        when 1 then emit '  stlrb w9, [x10]'
+        when 2 then emit '  stlrh w9, [x10]'
+        when 4 then emit '  stlr w9, [x10]'
+        else        emit '  stlr x9, [x10]'
+        end
+      end
+
+      def emit_sync_lock_test_and_set(instr)
+        args = instr.args
+        load_operand(args[0], 'x10')
+        load_operand(args[1], 'x9')
+        case ctype_byte_size(pointer_target_ctype(args[0]))
+        when 1 then emit '  swpalb w9, w0, [x10]'
+        when 2 then emit '  swpalh w9, w0, [x10]'
+        when 4 then emit '  swpal w9, w0, [x10]'
+        else        emit '  swpal x9, x0, [x10]'
+        end
+        store_temp(instr.dst, 'x0')
+      end
+
+      def emit_sync_fetch_add_sub(instr, subtract: false)
+        args = instr.args
+        load_operand(args[0], 'x10')
+        load_operand(args[1], 'x9')
+        emit '  neg x9, x9' if subtract
+        case ctype_byte_size(pointer_target_ctype(args[0]))
+        when 1 then emit '  ldaddalb w9, w0, [x10]'
+        when 2 then emit '  ldaddalh w9, w0, [x10]'
+        when 4 then emit '  ldaddal w9, w0, [x10]'
+        else        emit '  ldaddal x9, x0, [x10]'
+        end
+        store_temp(instr.dst, 'x0')
       end
 
       def emit_call(instr)
@@ -1183,6 +1332,21 @@ module OCC
             return
           when '__builtin_prefetch'
             # Memory prefetch hint — no-op on ARM64 (prfm requires literal hint)
+            return
+          when '__sync_synchronize'
+            emit '  dmb ish'
+            return
+          when '__sync_lock_release'
+            emit_sync_lock_release(args)
+            return
+          when '__sync_lock_test_and_set'
+            emit_sync_lock_test_and_set(instr)
+            return
+          when '__sync_fetch_and_add'
+            emit_sync_fetch_add_sub(instr)
+            return
+          when '__sync_fetch_and_sub'
+            emit_sync_fetch_add_sub(instr, subtract: true)
             return
           end
         end
@@ -1374,14 +1538,14 @@ module OCC
       end
 
       # Width-appropriate load from a stack slot into x10.
-      # Uses x28 as scratch when the slot exceeds the instruction's immediate limit.
+      # Uses caller-saved x16 as scratch when the slot exceeds the instruction's immediate limit.
       def emit_alloca_load(slot, sz, signed)
         max_imm = 4095 * [sz, 8].min
         if slot <= max_imm
           base = "[x29, ##{slot}]"
         else
-          emit_addr_from_fp('x28', slot)
-          base = '[x28]'
+          emit_addr_from_fp('x16', slot)
+          base = '[x16]'
         end
         case sz
         when 1 then emit(signed ? "  ldrsb x10, #{base}" : "  ldrb w10, #{base}")
@@ -1455,6 +1619,10 @@ module OCC
         when IR::StringRef
           emit "  adrp #{reg}, l_str_#{op.id}@PAGE"
           emit "  add  #{reg}, #{reg}, l_str_#{op.id}@PAGEOFF"
+        when IR::LabelRef
+          label = func_local_for(op.func, op.label)
+          emit "  adrp #{reg}, #{label}@PAGE"
+          emit "  add  #{reg}, #{reg}, #{label}@PAGEOFF"
         end
       end
 
@@ -1578,7 +1746,7 @@ module OCC
         ids = Set.new
         func.blocks.each do |bb|
           bb.instrs.each do |i|
-            %i[dst src left right ptr value cond].each do |field|
+            %i[dst src left right ptr value cond target].each do |field|
               next unless i.respond_to?(field)
               v = i.send(field)
               ids << v.id if v.is_a?(IR::Temp)

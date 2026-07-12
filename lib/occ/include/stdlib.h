@@ -28,6 +28,7 @@ extern int   setenv(const char *name, const char *value, int overwrite);
 extern int   unsetenv(const char *name);
 extern int   putenv(char *string);
 extern int   system(const char *command);
+extern char *realpath(const char *restrict path, char *restrict resolved_path);
 
 /* Number conversion */
 extern int    atoi(const char *s);

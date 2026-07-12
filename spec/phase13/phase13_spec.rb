@@ -34,7 +34,8 @@ RSpec.describe 'Phase 13: GCC Extension Compatibility' do
   end
 
   def preprocess_text(src)
-    pp = OCC::Preprocessor.new(src, '<test>')
+    include_path = File.expand_path('../../lib/occ/include', __dir__)
+    pp = OCC::Preprocessor.new(src, '<test>', include_paths: [include_path])
     pp.process
   end
 
@@ -61,6 +62,94 @@ RSpec.describe 'Phase 13: GCC Extension Compatibility' do
   end
 
   # ── Statement expressions ─────────────────────────────────────────────────
+
+  describe 'inline asm stack pointer output' do
+    include_context 'native tools available'
+
+    it 'stores the current stack pointer for CRuby-style machine stack probes' do
+      src = <<~C
+        #include <stdio.h>
+        void save_sp(unsigned long *p) {
+          __asm__ __volatile__("mov\\t%0, sp" : "=r" (*(p)));
+        }
+        int main(void) {
+          unsigned long sp = 0;
+          save_sp(&sp);
+          printf("%d\\n", sp != 0);
+          return 0;
+        }
+      C
+
+      result = compile_and_run(src)
+
+      expect(result[:status]).to eq(0)
+      expect(result[:stdout].strip).to eq('1')
+    end
+  end
+
+  describe 'Darwin signal ABI constants' do
+    include_context 'native tools available'
+
+    it 'installs a SIGCHLD handler with sigaction' do
+      src = <<~C
+        #include <signal.h>
+        #include <stdio.h>
+        int main(void) {
+          struct sigaction act;
+          struct sigaction old;
+          act.sa_handler = SIG_IGN;
+          sigemptyset(&act.sa_mask);
+          act.sa_flags = 0;
+          printf("%d\\n", sigaction(SIGCHLD, &act, &old) == 0);
+          sigaction(SIGCHLD, &old, 0);
+          return 0;
+        }
+      C
+
+      result = compile_and_run(src)
+
+      expect(result[:status]).to eq(0)
+      expect(result[:stdout].strip).to eq('1')
+    end
+  end
+
+  describe 'Darwin sysconf constants' do
+    include_context 'native tools available'
+
+    it 'resolves _SC_PAGESIZE to a valid page size' do
+      src = <<~C
+        #include <stdio.h>
+        #include <unistd.h>
+        int main(void) {
+          long page_size = sysconf(_SC_PAGESIZE);
+          printf("%d\\n", page_size > 0);
+          return 0;
+        }
+      C
+
+      result = compile_and_run(src)
+
+      expect(result[:status]).to eq(0)
+      expect(result[:stdout].strip).to eq('1')
+    end
+  end
+
+  describe 'stdlib pointer-return declarations' do
+    it 'declares realpath as returning char pointer' do
+      src = <<~C
+        #include <stdlib.h>
+        char *f(const char *path, char *resolved) {
+          return realpath(path, resolved);
+        }
+      C
+
+      mod = build_ir(src)
+      func = mod.functions.find { |fn| fn.name == 'f' }
+      call = func.blocks.flat_map(&:instrs).find { |i| i.is_a?(OCC::IR::Call) }
+
+      expect(call.type).to be_a(OCC::Types::PointerType)
+    end
+  end
 
   describe 'statement expressions ({ ... })' do
     it 'parses ({ expr; }) as a StmtExpr AST node' do
@@ -247,6 +336,42 @@ RSpec.describe 'Phase 13: GCC Extension Compatibility' do
         # ASSERT
         expect(result[:status]).to eq(0)
         expect(result[:stdout].strip).to eq('8 12')
+      end
+
+      it 'supports packed flexible-array offsetof in enum constants' do
+        # ARRANGE
+        src = <<~C
+          #include <limits.h>
+          #include <stddef.h>
+          #include <stdio.h>
+          #define FLEX_ARY_LEN
+          struct __attribute__((packed)) E {
+            int type;
+            void *iseq;
+            unsigned int start;
+            unsigned int end;
+            unsigned int cont;
+            unsigned int sp;
+          };
+          struct __attribute__((packed)) T {
+            unsigned int size;
+            struct E entries[FLEX_ARY_LEN];
+          };
+          int main(void) {
+            enum {
+              entry_size = sizeof(struct E),
+              entry_off = offsetof(struct T, entries),
+              entries_max = (INT_MAX - offsetof(struct T, entries)) / sizeof(struct E)
+            };
+            printf("%d %d %d %ld\\n", entry_size, entry_off, entries_max, (long)sizeof(struct T));
+            return 0;
+          }
+        C
+        # ACT
+        result = compile_and_run(src)
+        # ASSERT
+        expect(result[:status]).to eq(0)
+        expect(result[:stdout].strip).to eq('28 4 76695844 4')
       end
     end
   end
@@ -457,6 +582,145 @@ RSpec.describe 'Phase 13: GCC Extension Compatibility' do
         result = compile_and_run(src)
         # ASSERT
         expect(result[:stdout].strip).to eq('42')
+      end
+    end
+  end
+
+  # ── Block scoping ────────────────────────────────────────────────────────
+
+  describe 'block-scoped declarations' do
+    describe 'integration', :integration do
+      include_context 'native tools available'
+
+      it 'restores an outer parameter binding after an inner declaration shadows it' do
+        # ARRANGE
+        src = <<~C
+          #include <stdio.h>
+          int first_char(const unsigned char *source, int use_inner) {
+            if (use_inner) {
+              const unsigned char *source = (const unsigned char *)"bad";
+              (void)source;
+            }
+            return source[0];
+          }
+          int main(void) {
+            printf("%c\\n", first_char((const unsigned char *)"ok", 1));
+            return 0;
+          }
+        C
+        # ACT
+        result = compile_and_run(src)
+        # ASSERT
+        expect(result[:stdout].strip).to eq('o')
+      end
+    end
+  end
+
+  # ── Nested aggregate designators ─────────────────────────────────────────
+
+  describe 'nested aggregate designators' do
+    describe 'integration', :integration do
+      include_context 'native tools available'
+
+      it 'initializes nested union fields one designator level at a time' do
+        # ARRANGE
+        src = <<~C
+          #include <stdbool.h>
+          #include <stdint.h>
+          #include <stdio.h>
+          #include <string.h>
+          typedef struct lex_mode {
+            enum { DEF, STR } mode;
+            union {
+              struct {
+                size_t nesting;
+                bool interpolation;
+                bool label_allowed;
+                uint8_t incrementor;
+                uint8_t terminator;
+                uint8_t breakpoints[7];
+              } string;
+            } as;
+            struct lex_mode *prev;
+          } lex_mode_t;
+          static void push(lex_mode_t *dst, lex_mode_t src) { *dst = src; }
+          int main(void) {
+            lex_mode_t local = {
+              .mode = STR,
+              .as.string = {
+                .nesting = 0,
+                .interpolation = true,
+                .label_allowed = false,
+                .incrementor = 0,
+                .terminator = 39
+              }
+            };
+            uint8_t *breakpoints = local.as.string.breakpoints;
+            memcpy(breakpoints, "\\r\\n\\\\\\0\\0\\0", sizeof(local.as.string.breakpoints));
+            if (local.as.string.terminator != 0) breakpoints[3] = local.as.string.terminator;
+            if (local.as.string.interpolation) breakpoints[4] = 35;
+            lex_mode_t copied;
+            push(&copied, local);
+            printf("%u %d %u %u\\n", copied.as.string.terminator, copied.as.string.interpolation, copied.as.string.breakpoints[3], copied.as.string.breakpoints[4]);
+            return 0;
+          }
+        C
+        # ACT
+        result = compile_and_run(src)
+        # ASSERT
+        expect(result[:stdout].strip).to eq('39 1 39 35')
+      end
+
+      it 'emits sparse global array designators at their enum index' do
+        # ARRANGE
+        src = <<~C
+          #include <stdio.h>
+          typedef enum { A = 1, B, C, D } token_t;
+          typedef struct { int left; int right; } powers_t;
+          powers_t table[8] = { [C] = { 50, 51 } };
+          int main(void) {
+            printf("%d %d %d %d\\n", table[A].left, table[B].left, table[C].left, table[D].left);
+            return 0;
+          }
+        C
+        # ACT
+        result = compile_and_run(src)
+        # ASSERT
+        expect(result[:stdout].strip).to eq('0 0 50 0')
+      end
+
+      it 'evaluates constant ternaries inside global struct designators' do
+        # ARRANGE
+        src = <<~C
+          #include <stdint.h>
+          #include <stdio.h>
+          #include <string.h>
+          struct builtin {
+            const void *func_ptr;
+            const int argc;
+            const int index;
+            const char *name;
+          };
+          #define BUILTIN(_i, _name, _fname, _arity) { \\
+            .name = _i < 0 ? 0 : #_name, \\
+            .func_ptr = (void *)(uintptr_t)_fname, \\
+            .argc = _arity, \\
+            .index = _i \\
+          }
+          void fn(void) {}
+          static const struct builtin table[] = {
+            BUILTIN(0, alpha, fn, 1),
+            BUILTIN(-1, NULL, 0, 0)
+          };
+          int main(void) {
+            printf("%d %s %d\\n", table[0].index, table[0].name, table[1].index);
+            return strcmp(table[0].name, "alpha");
+          }
+        C
+        # ACT
+        result = compile_and_run(src)
+        # ASSERT
+        expect(result[:stdout].strip).to eq('0 alpha -1')
       end
     end
   end

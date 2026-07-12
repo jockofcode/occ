@@ -67,6 +67,30 @@ RSpec.describe OCC::IR do
     end
   end
 
+  # ── Switch ───────────────────────────────────────────────────────────────────
+
+  describe 'switch statement' do
+    it 'collects case labels nested in a compound block directly under switch' do
+      mod = build_ir(<<~C)
+        enum { OP_END = 1, OP_EXACT1 = 2 };
+        int f(unsigned char *p) {
+          while (1) {
+            switch (*p++) {
+              {
+                case OP_END: return 1;
+                case OP_EXACT1: return 2;
+              }
+            }
+          }
+        }
+      C
+      func = function_named(mod, 'f')
+
+      expect(func.blocks.map(&:label).grep(/\Aswitch_case/).length).to eq(2)
+      expect(all_instrs(func).grep(OCC::IR::CondJump).length).to be >= 2
+    end
+  end
+
   # ── Return ────────────────────────────────────────────────────────────────────
 
   describe 'return statement' do
@@ -129,6 +153,25 @@ RSpec.describe OCC::IR do
       func = function_named(mod, 'f')
       loads = all_instrs(func).select { |i| i.is_a?(OCC::IR::Load) }
       expect(loads).not_to be_empty
+    end
+
+    it 'keeps stack slots for declarations after a terminator but before a label' do
+      mod = build_ir(<<~C)
+        extern long g(void);
+        long f(int c) {
+          if (c) goto slow;
+          return 1;
+          long v;
+        slow:
+          v = g();
+          return v;
+        }
+      C
+      func = function_named(mod, 'f')
+
+      expect(all_instrs(func).grep(OCC::IR::Alloca).length).to be >= 2
+      stores_to_alloca = all_instrs(func).grep(OCC::IR::Store).select { |i| i.ptr.is_a?(OCC::IR::Temp) }
+      expect(stores_to_alloca).not_to be_empty
     end
   end
 

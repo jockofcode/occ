@@ -140,6 +140,22 @@ module OCC
               emit "  .quad #{ref_target}"
               emit '.section .text'
             end
+          elsif init.is_a?(Hash) && init[:kind] == :label_ref
+            if @macos
+              emit '.section __DATA,__data'
+              emit ".globl #{sym(name)}"
+              emit '.p2align 3'
+              emit "#{sym(name)}:"
+              emit "  .quad #{func_local_for(init[:func], init[:label])}"
+              emit '.section __TEXT,__text,regular,pure_instructions'
+            else
+              emit '.section .data'
+              emit ".globl #{name}"
+              emit '.align 8'
+              emit "#{name}:"
+              emit "  .quad #{func_local_for(init[:func], init[:label])}"
+              emit '.section .text'
+            end
           elsif @macos
             # Integer scalar: emit as .quad so GlobalRef 8-byte loads work correctly.
             emit '.section __DATA,__data'
@@ -295,6 +311,14 @@ module OCC
 
       def fp_operand?(op)
         fp_temp?(op) || (op.is_a?(IR::Const) && op.value.is_a?(Float))
+      end
+
+      def bare_ctype(ct)
+        ct.respond_to?(:unqualified) ? ct.unqualified : ct
+      end
+
+      def bool_ctype?(ct)
+        bare_ctype(ct).is_a?(OCC::Types::BoolType)
       end
 
       # Build the FP-temp set via dataflow over all blocks.
@@ -524,6 +548,10 @@ module OCC
         when IR::Jump
           emit "  jmp #{func_local(instr.target)}"
 
+        when IR::IndirectJump
+          load_operand(instr.target, '%rax')
+          emit '  jmp *%rax'
+
         when IR::CondJump
           load_operand(instr.cond, '%rax')
           emit '  testq %rax, %rax'
@@ -555,6 +583,12 @@ module OCC
             # FP → FP: float→double widening or no-op
             load_fp_operand(instr.src, '%xmm8')
             store_fp_temp(instr.dst, '%xmm8')
+          elsif bool_ctype?(instr.type)
+            load_operand(instr.src, '%rax')
+            emit '  testq %rax, %rax'
+            emit '  setne %al'
+            emit '  movzbq %al, %rax'
+            store_temp(instr.dst, '%rax')
           elsif fp_operand?(instr.src) && !fp_ctype?(instr.type)
             # FP → integer truncation
             load_fp_operand(instr.src, '%xmm8')
@@ -815,6 +849,8 @@ module OCC
           emit "  movq #{sym(op.name)}(%rip), #{reg}"
         when IR::StringRef
           emit "  leaq L_str_#{op.id}(%rip), #{reg}"
+        when IR::LabelRef
+          emit "  leaq #{func_local_for(op.func, op.label)}(%rip), #{reg}"
         end
       end
 
@@ -852,7 +888,7 @@ module OCC
         temps = Set.new
         func.blocks.each do |bb|
           bb.instrs.each do |i|
-            %i[dst src left right ptr value cond].each do |field|
+            %i[dst src left right ptr value cond target].each do |field|
               next unless i.respond_to?(field)
               v = i.send(field)
               temps << v.id if v.is_a?(IR::Temp)
@@ -863,6 +899,7 @@ module OCC
       end
 
       def align16(n) = (n + 15) / 16 * 16
+      def func_local_for(func, label) = ".L#{func}_#{label}"
     end
   end
 end

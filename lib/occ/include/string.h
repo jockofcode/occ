@@ -9,6 +9,8 @@ extern void *memmove(void *dest, const void *src, size_t n);
 extern void *memset(void *s, int c, size_t n);
 extern int   memcmp(const void *s1, const void *s2, size_t n);
 extern void *memchr(const void *s, int c, size_t n);
+extern void *memmem(const void *haystack, size_t haystacklen,
+                    const void *needle, size_t needlelen);
 
 /* String copy */
 extern char *strcpy(char *dest, const char *src);

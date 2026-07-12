@@ -134,6 +134,17 @@ RSpec.describe 'Phase 10: Headers, Language Extensions, and FP Codegen' do
       expect { compile_to_asm(src) }.not_to raise_error
     end
 
+    it '#include <string.h> declares memmem as returning a pointer' do
+      asm = compile_to_asm(<<~C)
+        #include <string.h>
+        void *f(const char *s) { return memmem(s, 6, "VT", 2); }
+      C
+
+      expect(asm).to match(/bl _?memmem/)
+      expect(asm).to match(/str x0/)
+      expect(asm).not_to include('sxtw x0, w0')
+    end
+
     it '#include <stdlib.h> makes malloc and free available' do
       src = <<~C
         #include <stdlib.h>
@@ -148,6 +159,16 @@ RSpec.describe 'Phase 10: Headers, Language Extensions, and FP Codegen' do
         double f(double x) { return sqrt(x) + sin(x); }
       C
       expect { compile_to_asm(src) }.not_to raise_error
+    end
+
+    it '#include <math.h> declares nan as returning double' do
+      asm = compile_to_asm(<<~C)
+        #include <math.h>
+        double f(void) { return nan(""); }
+      C
+
+      expect(asm).to match(/bl _?nan/)
+      expect(asm).to match(/str d0|movsd/)
     end
 
     it '#include <math.h> provides INFINITY and NAN macros' do
@@ -174,6 +195,24 @@ RSpec.describe 'Phase 10: Headers, Language Extensions, and FP Codegen' do
         int f(void) { return setjmp(env); }
       C
       expect { compile_to_asm(src) }.not_to raise_error
+    end
+
+    it 'matches Darwin ARM64 jmp_buf ABI sizes' do
+      src = <<~C
+        #include <stdio.h>
+        #include <setjmp.h>
+        int main(void) {
+        #if defined(__APPLE__) && defined(__aarch64__)
+          printf("%zu %zu\\n", sizeof(jmp_buf), sizeof(sigjmp_buf));
+        #else
+          printf("skip\\n");
+        #endif
+          return 0;
+        }
+      C
+      result = compile_and_run(src)
+      expected = RUBY_PLATFORM.include?('darwin') && RUBY_PLATFORM.include?('arm64') ? "192 196\n" : "skip\n"
+      expect(result[:stdout]).to eq(expected)
     end
 
     it '#include <signal.h> declares signal() and SIG constants' do
@@ -741,6 +780,54 @@ RSpec.describe 'Phase 10: Headers, Language Extensions, and FP Codegen' do
       C
       result = compile_and_run(src)
       expect(result[:stdout].strip).to eq('found=34')
+    end
+
+    it 'declares Darwin underscore setjmp entry points' do
+      src = <<~C
+        #include <setjmp.h>
+        #include <stdio.h>
+        static jmp_buf buf;
+        void thrower(void) {
+            _longjmp(buf, 17);
+        }
+        int main(void) {
+            int v = _setjmp(buf);
+            if (v == 0) {
+                thrower();
+            }
+            printf("caught=%d\\n", v);
+            return 0;
+        }
+      C
+      result = compile_and_run(src)
+      expect(result[:stdout].strip).to eq('caught=17')
+    end
+  end
+
+  describe 'small aggregate returns', :slow do
+    include_context 'native tools available'
+
+    it 'returns a two-word struct in registers' do
+      src = <<~C
+        #include <stdio.h>
+        struct Pair {
+            long a;
+            long b;
+        };
+        struct Pair make_pair(long a, long b) {
+            struct Pair p;
+            p.a = a;
+            p.b = b;
+            return p;
+        }
+        int main(void) {
+            struct Pair p = make_pair(11, 22);
+            printf("%ld %ld\\n", p.a, p.b);
+            return 0;
+        }
+      C
+      result = compile_and_run(src)
+      expect(result[:stdout]).to eq("11 22\n")
     end
   end
 

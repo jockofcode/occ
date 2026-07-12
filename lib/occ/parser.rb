@@ -550,9 +550,15 @@ module OCC
         AST::ContinueStmt.new(location: l)
       when :kw_goto
         advance
-        lbl = expect(:ident).value
-        expect(:semicolon)
-        AST::GotoStmt.new(label: lbl, location: l)
+        if match(:star)
+          expr = parse_expr
+          expect(:semicolon)
+          AST::IndirectGotoStmt.new(expr: expr, location: l)
+        else
+          lbl = expect(:ident).value
+          expect(:semicolon)
+          AST::GotoStmt.new(label: lbl, location: l)
+        end
       when :kw_case
         advance
         val = parse_assignment_expr
@@ -924,6 +930,9 @@ module OCC
         advance; AST::UnaryOp.new(op: :bit_not, operand: parse_cast_expr, location: l)
       when :exclaim
         advance; AST::UnaryOp.new(op: :logical_not, operand: parse_cast_expr, location: l)
+      when :logical_and
+        advance
+        AST::LabelAddr.new(name: expect(:ident).value, location: l)
       when :kw_sizeof
         advance
         if cur?(:lparen) && cast_lookahead?

@@ -111,6 +111,11 @@ module OCC
       def initialize(label:, **kw) = (super(**kw); @label = label)
     end
 
+    class IndirectGotoStmt < Node
+      attr_accessor :expr
+      def initialize(expr:, **kw) = (super(**kw); @expr = expr)
+    end
+
     class LabelStmt < Node
       attr_accessor :name, :stmt
       def initialize(name:, stmt:, **kw) = (super(**kw); @name = name; @stmt = stmt)
@@ -154,6 +159,11 @@ module OCC
     end
 
     class Identifier < Node
+      attr_accessor :name
+      def initialize(name:, **kw) = (super(**kw); @name = name)
+    end
+
+    class LabelAddr < Node
       attr_accessor :name
       def initialize(name:, **kw) = (super(**kw); @name = name)
     end

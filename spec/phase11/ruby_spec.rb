@@ -190,6 +190,28 @@ RSpec.describe 'Phase 11: CRuby 3.4 miniruby (Tier 4)', :thirdparty do
     end
   end
 
+  def disable_unsupported_config(build_dir)
+    config_paths = [
+      File.join(build_dir, 'include', 'ruby', 'internal', 'config.h'),
+      *Dir.glob(File.join(build_dir, '.ext', 'include', '*', 'ruby', 'config.h')),
+      *Dir.glob(File.join(build_dir, '**', 'config.h')),
+    ].uniq
+
+    config_paths.each do |path|
+      next unless File.file?(path)
+
+      text = File.read(path)
+      next unless text.include?('HAVE_INT128_T') ||
+                  text.include?('SIZEOF_INT128_T') ||
+                  text.include?('USE_RJIT')
+
+      text = text.gsub(/^#define HAVE_INT128_T\b.*$/, '/* #undef HAVE_INT128_T */')
+      text = text.gsub(/^#define SIZEOF_INT128_T\b.*$/, '/* #undef SIZEOF_INT128_T */')
+      text = text.gsub(/^#define USE_RJIT\b.*$/, '#define USE_RJIT 0')
+      File.write(path, text)
+    end
+  end
+
   it 'compiles miniruby and runs basic scripts', :slow do
     require_git!
     skip 'autoconf not available' unless system('which autoconf > /dev/null 2>&1')
@@ -205,6 +227,10 @@ RSpec.describe 'Phase 11: CRuby 3.4 miniruby (Tier 4)', :thirdparty do
 
       # ── 2. Run ./configure with system toolchain ───────────────────────
       run_configure(build_dir)
+      # Configure probes the host clang, which supports __int128. occ currently
+      # parses __int128 as a 64-bit placeholder, so keep CRuby on its non-int128
+      # fallback paths until real 128-bit lowering exists.
+      disable_unsupported_config(build_dir)
 
       # ── 3. Generate parser and other generated files via make ─────────
       # parse.c/lex.c from parse.y; id.h/id.c; probes.h; insns_info.inc/node_name.inc from tools
@@ -346,9 +372,26 @@ RSpec.describe 'Phase 11: CRuby 3.4 miniruby (Tier 4)', :thirdparty do
 
       # ── 7. Smoke tests ────────────────────────────────────────────────
       # Helper: run a one-liner in miniruby, check exit status and stdout.
+      miniruby_env = {
+        'RUBYOPT' => nil,
+        'RUBYLIB' => nil,
+        'GEM_HOME' => nil,
+        'GEM_PATH' => nil,
+        'BUNDLE_BIN_PATH' => nil,
+        'BUNDLE_GEMFILE' => nil,
+        'BUNDLER_ORIG_BUNDLE_BIN_PATH' => nil,
+        'BUNDLER_ORIG_BUNDLE_GEMFILE' => nil,
+        'BUNDLER_ORIG_GEM_HOME' => nil,
+        'BUNDLER_ORIG_GEM_PATH' => nil,
+        'BUNDLER_ORIG_MANPATH' => nil,
+        'BUNDLER_ORIG_PATH' => nil,
+        'BUNDLER_ORIG_RB_USER_INSTALL' => nil,
+        'BUNDLER_ORIG_RUBYLIB' => nil,
+        'BUNDLER_ORIG_RUBYOPT' => nil,
+      }
       mr = ->(code, expected, label = nil) {
         label ||= code.length > 60 ? "#{code[0, 57]}..." : code
-        out, err, st = Open3.capture3(miniruby_bin, '-e', code)
+        out, err, st = Open3.capture3(miniruby_env, miniruby_bin, '-e', code)
         expect(st.exitstatus).to eq(0),
           "#{label}: non-zero exit (binary: #{miniruby_bin})\n#{err.slice(0, 2000)}"
         expect(out.strip).to eq(expected.strip), label

@@ -604,6 +604,8 @@ module OCC
         analyze_stmt(node.stmt)
       when AST::LabelStmt
         analyze_stmt(node.stmt)
+      when AST::IndirectGotoStmt
+        analyze_expr(node.expr)
       when AST::BreakStmt, AST::ContinueStmt, AST::GotoStmt
         nil  # no-op
       when AST::StaticAssert
@@ -641,6 +643,7 @@ module OCC
               when AST::StringLiteral then Types::PointerType.new(Types::CHAR)
               when AST::CharLiteral   then Types::INT
               when AST::Identifier    then type_of_identifier(node)
+              when AST::LabelAddr     then Types::PointerType.new(Types::VOID)
               when AST::BinaryOp      then type_of_binop(node)
               when AST::UnaryOp       then type_of_unary(node)
               when AST::Assign        then type_of_assign(node)
@@ -957,6 +960,20 @@ module OCC
                          { name: 'suc', type: Types::INT },
                          { name: 'fail', type: Types::INT }])
       %w[__atomic_compare_exchange_n].each { |n| @symbols.define(n, type: atomic_cas_fn, kind: :func) }
+
+      # Legacy GCC full memory barrier builtin.
+      @symbols.define('__sync_synchronize', type: Types::FunctionType.new(Types::VOID, []), kind: :func)
+      @symbols.define('__sync_lock_release', type: Types::FunctionType.new(Types::VOID, [{ name: 'ptr', type: void_p }]), kind: :func)
+      @symbols.define('__sync_lock_test_and_set',
+                      type: Types::FunctionType.new(Types::ULONG, [{ name: 'ptr', type: void_p },
+                                                                   { name: 'val', type: Types::ULONG }]),
+                      kind: :func)
+      %w[__sync_fetch_and_add __sync_fetch_and_sub].each do |name|
+        @symbols.define(name,
+                        type: Types::FunctionType.new(Types::ULONG, [{ name: 'ptr', type: void_p },
+                                                                     { name: 'val', type: Types::ULONG }]),
+                        kind: :func)
+      end
 
       # setjmp/longjmp family — jmp_buf decays to int* in function params
       jmp_buf_ptr = Types::PointerType.new(Types::INT)

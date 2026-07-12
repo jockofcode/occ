@@ -9,6 +9,7 @@ module OCC
     Const     = Struct.new(:value) { def to_s = value.to_s }
     GlobalRef = Struct.new(:name)  { def to_s = "@#{name}" }
     StringRef = Struct.new(:id)    { def to_s = "str_#{id}" }
+    LabelRef  = Struct.new(:func, :label) { def to_s = "&&#{func}:#{label}" }
 
     # All instructions carry an optional type annotation.
     class Instruction
@@ -103,6 +104,13 @@ module OCC
       def to_s = "jmp #{@target}"
     end
 
+    # indirect jump through an address-valued expression (GNU computed goto)
+    class IndirectJump < Instruction
+      attr_reader :target
+      def initialize(target) = (@target = target)
+      def to_s = "ijmp #{@target}"
+    end
+
     # cjmp cond, true_label, false_label
     class CondJump < Instruction
       attr_reader :cond, :true_label, :false_label
@@ -142,7 +150,7 @@ module OCC
       end
 
       def <<(instr) = @instrs << instr
-      def terminated? = @instrs.last.is_a?(Jump) || @instrs.last.is_a?(CondJump) || @instrs.last.is_a?(Return)
+      def terminated? = @instrs.last.is_a?(Jump) || @instrs.last.is_a?(IndirectJump) || @instrs.last.is_a?(CondJump) || @instrs.last.is_a?(Return)
 
       def to_s
         lines = ["#{@label}:"]
@@ -530,6 +538,7 @@ module OCC
 
       # Evaluate a simple constant initializer.
       # Returns Integer, Float, { kind: :string, value: "..." }, { kind: :ref, name: "..." },
+      # { kind: :label_ref, func: "...", label: "..." },
       # or { kind: :initializer_list, items: [...] } for compound initializers.
       # Sign-extend a char literal byte value, matching signed-char platforms.
       def char_lit_int(str)
@@ -544,6 +553,8 @@ module OCC
         when AST::FloatLiteral then expr.raw.to_f
         when AST::StringLiteral
           { kind: :string, value: expr.value }
+        when AST::LabelAddr
+          { kind: :label_ref, func: @func&.name, label: expr.name } if allow_ref && @func
         when AST::SizeofType
           expr.sizeof_val
         when AST::SizeofExpr
@@ -665,6 +676,9 @@ module OCC
         when AST::ContinueStmt  then emit(Jump.new(@cont_target))  if @cont_target
         when AST::LabelStmt     then build_label_stmt(node)
         when AST::GotoStmt      then emit(Jump.new(node.label))
+        when AST::IndirectGotoStmt
+          target = build_expr(node.expr)
+          emit(IndirectJump.new(target))
         when AST::CaseStmt
           # C allows case labels nested inside compound statements within a switch.
           # If this label was registered in the current switch's case_map (by
@@ -734,7 +748,10 @@ module OCC
           end
 
           slot  = new_temp
-          emit(Alloca.new(slot, ctype || 'int'))
+          # Alloca defines frame layout, not executable control flow. Keep it
+          # even if the declaration appears after a terminator but before a
+          # label that can be reached by goto (CRuby's int_pow does this).
+          @block << Alloca.new(slot, ctype || 'int')
           @locals[d[:name]] = slot
           @local_ctypes[d[:name]] = ctype if ctype
 
@@ -765,6 +782,7 @@ module OCC
               end
             else
               val = build_expr(d[:init])
+              val = cast_to_bool(val) if bool_type?(ctype)
               # For struct-typed locals, pass the byte size so the codegen emits a
               # proper struct copy (ldp/stp) rather than storing the source pointer.
               esz = if ctype.is_a?(OCC::Types::StructType) && ctype.complete?
@@ -934,7 +952,11 @@ module OCC
           if ret_ct && val_ct
             ret_inner = ret_ct.respond_to?(:unqualified) ? ret_ct.unqualified : ret_ct
             val_inner = val_ct.respond_to?(:unqualified) ? val_ct.unqualified : val_ct
-            if ret_inner.is_a?(OCC::Types::IntegerType) &&
+            if bool_type?(ret_inner)
+              cast_tmp = new_temp
+              emit(Cast.new(cast_tmp, val, ret_inner.to_s, ret_inner))
+              val = cast_tmp
+            elsif ret_inner.is_a?(OCC::Types::IntegerType) &&
                val_inner.is_a?(OCC::Types::IntegerType) &&
                ret_inner.size < val_inner.size &&
                ret_inner.size < 4  # only sub-int widths need explicit truncation
@@ -1089,6 +1111,8 @@ module OCC
           when AST::DefaultStmt
             default_block ||= new_block(new_label('switch_default'))
             scan_nested_cases(item.stmt, case_map)
+          else
+            scan_nested_cases(item, case_map)
           end
         end
 
@@ -1217,6 +1241,7 @@ module OCC
         when AST::FloatLiteral  then Const.new(node.raw.to_f)
         when AST::CharLiteral   then Const.new(char_lit_int(node.value))
         when AST::StringLiteral then @mod.add_string(node.value)
+        when AST::LabelAddr     then LabelRef.new(@func.name, node.name)
         when AST::Identifier    then build_ident(node)
         when AST::BinaryOp      then build_binop(node)
         when AST::UnaryOp       then build_unary(node)
@@ -1487,10 +1512,23 @@ module OCC
       end
 
       def maybe_truncate_narrow(val, ct)
+        return val unless ct
+        return cast_to_bool(val) if bool_type?(ct)
         return val unless ct.is_a?(OCC::Types::IntegerType) && ct.size < 4
         trunc = new_temp
         emit(Cast.new(trunc, val, ct.to_s, ct))
         trunc
+      end
+
+      def bool_type?(ct)
+        inner = ct.respond_to?(:unqualified) ? ct.unqualified : ct
+        inner.is_a?(OCC::Types::BoolType)
+      end
+
+      def cast_to_bool(val)
+        coerced = new_temp
+        emit(Cast.new(coerced, val, '_Bool', OCC::Types::BOOL))
+        coerced
       end
 
       def build_unary(node)
@@ -1751,7 +1789,9 @@ module OCC
           # Simple assignment to narrow integer types: the expression value must be
           # the stored (truncated) value, not the wide rhs (e.g. uint32_t = int64_t).
           tgt_inner = tgt_ct.respond_to?(:unqualified) ? tgt_ct.unqualified : tgt_ct
-          if tgt_inner.is_a?(OCC::Types::IntegerType) && tgt_inner.size < 8
+          if bool_type?(tgt_inner)
+            val = cast_to_bool(val)
+          elsif tgt_inner.is_a?(OCC::Types::IntegerType) && tgt_inner.size < 8
             trunc = new_temp
             emit(Cast.new(trunc, val, tgt_inner.to_s, tgt_inner))
             val = trunc

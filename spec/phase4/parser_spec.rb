@@ -160,6 +160,13 @@ RSpec.describe OCC::Parser do
       expect(items[1]).to be_a(OCC::AST::LabelStmt)
     end
 
+    it 'parses GNU indirect goto' do
+      items = body('void *p = &&done; goto *p; done: return;')
+      expect(items[0].declarators.first[:init]).to be_a(OCC::AST::LabelAddr)
+      expect(items[1]).to be_a(OCC::AST::IndirectGotoStmt)
+      expect(items[2]).to be_a(OCC::AST::LabelStmt)
+    end
+
     it 'parses an empty statement' do
       items = body(';')
       expect(items.first).to be_a(OCC::AST::ExprStmt)

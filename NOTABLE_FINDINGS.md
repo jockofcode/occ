@@ -182,6 +182,313 @@ Two related bugs affected global array variables (e.g., `static jmp_buf buf`):
 
 ---
 
+## `array->field` Must Decay the Array Before Member Access
+
+CRuby uses a macro shape like this in its compiler support code:
+
+```c
+#define DECL_ANCHOR(name) \
+  LINK_ANCHOR name[1] = {{{ISEQ_ELEMENT_ANCHOR,}, &name[0].anchor}}
+```
+
+Call sites then use `name->field`. In C, the `name` expression decays from "array of one `LINK_ANCHOR`" to "`LINK_ANCHOR *`" before the `->` operator is applied. occ originally treated the left side as the array type itself, so semantic analysis reported "member access on non-struct/union" and the IR fallback could produce bad addresses.
+
+**Fix:** Both semantic analysis and IR member-address lowering now treat `array->field` as `(&array[0])->field`: if the left side of `->` has array type, it first decays to a pointer to the element type, then dereferences to find the container struct type.
+
+Regression coverage lives in `spec/phase9/member_expr_spec.rb` and mirrors the `DECL_ANCHOR(name)` pattern.
+
+---
+
+## Missing libc Prototypes Can Truncate Pointer Returns
+
+During CRuby miniruby bring-up, `puts 1 + 1` could segfault during startup in `rb_check_realpath_internal`. The crash address looked like the low 32 bits of a valid path pointer, and the failing instruction chain mapped to this source pattern in Ruby's `file.c`:
+
+```c
+resolved = ospath_new(resolved_ptr, strlen(resolved_ptr), rb_filesystem_encoding());
+```
+
+Disassembly around the preceding call showed the real bug:
+
+```asm
+bl    _realpath
+sxtw  x0, w0
+str   x0, [x29, #...]
+```
+
+occ was treating `realpath()` as an undeclared function returning `int`, so ARM64 codegen normalized the apparent 32-bit return value and destroyed the real `char *` returned by libc. The truncated pointer was later passed to `strlen()`.
+
+**Fix:** Add the POSIX prototype to the bundled `stdlib.h`:
+
+```c
+extern char *realpath(const char *restrict path, char *restrict resolved_path);
+```
+
+Regression coverage lives in `spec/phase13/phase13_spec.rb` and asserts that a `realpath()` call is pointer-typed, preventing the `sxtw x0, w0` path from returning.
+
+---
+
+## Missing FP Return Prototypes Lose ARM64 `d0`
+
+CRuby initializes `Float::NAN` with `DBL2NUM(nan(""))` when the platform has a `nan(3)` function. occ's bundled `math.h` had `NAN` / `INFINITY` macros and many libm declarations, but it did not declare `nan()` itself.
+
+Without the prototype, occ treated `nan("")` as an implicit `int` call. On ARM64 the real double result is returned in `d0`, but the integer-return path reads `x0`; compiled Ruby therefore observed `Float::NAN` as `0.0`. That made `Float::NAN.nan?`, `0.0/0`, and the `basictest` NaN comparison block fail even though standalone `NAN` macro generation was correct.
+
+**Fix:** declare `double nan(const char *tagp)` and `float nanf(const char *tagp)` in the bundled `math.h`. The generated ARM64 assembly for `double f(void) { return nan(""); }` now calls `_nan` and stores/returns `d0`, and compiled `miniruby` reports real NaNs.
+
+Regression coverage lives in `spec/phase10/phase10_spec.rb`, and the fresh CRuby build passes the full `basictest` float section (`OK 80`).
+
+---
+
+## Missing `memmem` Prototype Breaks Short String Search
+
+CRuby's `rb_memsearch_ss` uses `memmem()` when configure finds it. occ's bundled `string.h` declared `memchr`, `memcpy`, `strstr`, and friends, but not `memmem()`.
+
+Without the prototype, OCC treated `memmem()` as an implicit `int` function. On ARM64 the real pointer result is returned in `x0`; the implicit-int path can corrupt that pointer before CRuby subtracts it from the haystack base. The result was that string-pattern search for patterns longer than one byte returned a negative non-`-1` value: `String#include?` could be true while `String#index` returned `nil`, and `String#gsub!` reported no match.
+
+**Fix:** declare `void *memmem(const void *haystack, size_t haystacklen, const void *needle, size_t needlelen)` in the bundled `string.h`.
+
+Regression coverage lives in `spec/phase10/phase10_spec.rb`, and the fresh CRuby build now passes string-pattern `index` / `gsub!` reducers plus the former `while/redo` basictest failure.
+
+---
+
+## `_Bool` Must Normalize to 0 or 1
+
+C requires assignment, cast, and return to `_Bool` to store `0` for zero values and `1` for all nonzero values. occ treated `_Bool` like an unsigned 8-bit integer and only masked the low byte. That preserved flag values like `8192` as truthy noncanonical values.
+
+CRuby exposed this through `BIGNUM_SIGN()`, which returns `bool` from a flag test. A positive Bignum sign flag was preserved as a raw bit rather than `1`, so code such as `(n > 0) != BIGNUM_SIGN(x)` became `1 != 8192` and selected subtraction where addition was required.
+
+**Fix:** IR now emits explicit bool casts when values flow into `_Bool` locals, assignments, and returns. ARM64 lowers those casts as `cmp x9, #0; cset x9, ne`, and AMD64 lowers them as `testq; setne; movzbq`.
+
+Regression coverage lives in `spec/phase7/codegen_spec.rb`, and compiled `miniruby` now passes the bignum comparison/addition/modulo reducers that depend on `BIGNUM_SIGN()`.
+
+---
+
+## ARM64 Scratch Registers Must Respect Callee-Saved ABI Rules
+
+On ARM64, `x19` through `x28` are callee-saved registers. Generated C functions must not use them as scratch registers unless the prologue saves them and the epilogue restores them.
+
+occ's large stack-slot load helper used `x28` when a local slot was beyond the immediate-offset range of the load instruction. That is unsafe in CRuby because VM execution and C callbacks can keep state in callee-saved registers across calls into compiled C functions.
+
+**Fix:** use caller-saved `x16` for the large-slot address fallback:
+
+```asm
+mov   x16, #0x...
+add   x16, x29, x16
+ldrsw x10, [x16]
+```
+
+Regression coverage lives in `spec/phase7/codegen_spec.rb` and asserts that a large local frame uses `x16` and does not mention `x28`.
+
+---
+
+## Do Not Advertise `__int128` Until It Is Real
+
+Ruby's `./configure` runs with clang, so it detects `HAVE_INT128_T`. occ could parse `__int128`, but currently maps it to a 64-bit placeholder type. That was enough to compile, but not enough to preserve CRuby semantics.
+
+The visible failure was Fixnum multiplication. CRuby selected the `DLONG int128_t` widening path for `rb_fix_mul_fix`, but OCC compiled the "128-bit" product as 64-bit. `21!` therefore wrapped to a negative Fixnum instead of promoting to Bignum, and later bignum tests cascaded from that bad value.
+
+**Fix:** the Phase 11 Ruby harness scrubs `HAVE_INT128_T` and `SIZEOF_INT128_T` from the generated Ruby config headers before compiling with OCC. This is a harness-level truth-in-advertising fix until real 128-bit lowering exists.
+
+Regression is covered by the Phase 11 Ruby build plus compiled-miniruby factorial reducers (`21!`, `40!`, and `fact(40) / fact(20)`).
+
+---
+
+## Do Not Enable RJIT in the OCC CRuby Harness
+
+Ruby's configure output can leave `USE_RJIT` enabled even when the OCC-built `miniruby` is not meant to exercise Ruby's JITs. That is unsafe for the current Phase 11 harness.
+
+With `USE_RJIT 1`, `vm.c:jit_compile()` is compiled into `rb_vm_exec`. It reads `ec->cfp->iseq` and immediately expands `ISEQ_BODY(iseq)` before checking whether YJIT or RJIT is actually enabled at runtime. C frames legitimately have `iseq == NULL`, so a C-to-Ruby callback can crash in the JIT shim even though the runtime JIT flags are false.
+
+**Fix:** the Phase 11 Ruby harness now scrubs generated Ruby config headers so `USE_RJIT` is forced to `0`, alongside the existing fake-`__int128` scrub. Fresh builds show:
+
+```c
+#define USE_YJIT 0
+#define USE_RJIT 0
+```
+
+This is a harness truth-in-advertising fix, not the final hash fix. After RJIT is disabled, the current hash reducer advances past `jit_compile()` and fails later in `vm_exec_core` with `ec->cfp` back on a C frame (`pc == NULL`, `iseq == NULL`) during dispatch.
+
+Current reducer:
+
+```ruby
+h = {}
+o = Object.new
+def o.hash
+  12345
+end
+h[o] = 99
+```
+
+Direct Ruby dispatch still works (`o.hash` returns `12345`); the remaining bug is specific to the recursive hash guard path (`rb_exec_recursive_outer_mid` -> `hash_recursive` -> `rb_funcallv` -> `vm_call0_body`).
+
+---
+
+## Darwin ARM64 `jmp_buf` Must Match System ABI
+
+CRuby maps its VM tag buffers to the platform `jmp_buf` and passes them directly to libc `setjmp` / `longjmp`. That means the bundled `setjmp.h` cannot use a merely "large enough" approximation; the type's size and element alignment are part of the ABI seen by CRuby's surrounding structs.
+
+On this host, clang reports:
+
+```c
+sizeof(jmp_buf) == 192
+sizeof(sigjmp_buf) == 196
+```
+
+OCC's previous fallback used `long[38]` for both types, which is 304 bytes with 8-byte alignment on Darwin ARM64. That changed the layout of CRuby structures containing `RUBY_JMP_BUF`, including VM tag-stack records used around exception and recursive-call boundaries.
+
+**Fix:** `lib/occ/include/setjmp.h` now uses the Darwin ARM64 system shape:
+
+```c
+typedef int jmp_buf[48];
+typedef int sigjmp_buf[49];
+```
+
+Regression coverage lives in `spec/phase10/phase10_spec.rb` and asserts the Darwin ARM64 sizes. This was a real ABI fix: the Phase 11 Ruby build remains green, and the object/array-key hash reducers now advance past the old `vm_exec_core` segfault. It is not the final hash fix, though; those reducers still lose the insertion and can later hit Ruby's stack consistency check.
+
+---
+
+## Recursive Hash Guard Can Escape the Original Update Frame
+
+The current CRuby hash reducer is no longer a plain table-insertion failure. For:
+
+```ruby
+class K
+  def hash
+    7
+  end
+end
+
+h = {}
+k = K.new
+h[k] = 42
+```
+
+the exact `rb_hash_aset` call enters `ar_update` with the expected update argument (`arg.arg == 0x55`, Ruby's immediate representation of `42`). lldb shows that execution does not resume at the instruction immediately after `bl _ar_do_hash` in that original `ar_update` frame. The failing path also does not reach `ar_add_direct_with_hash` with value `42`, and it does not hit `ar_force_convert_table` for that exact insertion.
+
+The behavior is specific to first-use hash computation through CRuby's recursive hash guard:
+
+- default `Object#hash` heap keys insert correctly
+- `h.compare_by_identity` makes the custom-key reducer pass
+- precomputing `k.hash` before `h[k] = 42` makes the reducer pass
+- fresh array keys fail the same way, while precomputing `k.hash` for the array makes insertion pass
+
+This points the next debugging pass at `rb_exec_recursive_outer_mid` / `rb_catch_protect` / `rb_throw_obj` and setjmp-style VM tag unwinding, not at `ar_add_direct_with_hash`. Declaring Darwin's `_setjmp` / `_longjmp` entry points in the bundled `setjmp.h` is now covered and keeps the header truthful, but it did not change this reducer.
+
+---
+
+## ARM64 FP Conversions Must Preserve Unsignedness
+
+ARM64 has separate signed and unsigned conversion instructions between integer and floating-point registers. The initial backend always used the signed forms:
+
+```asm
+scvtf d9, x9   ; signed integer -> double
+fcvtzs x9, d9  ; double -> signed integer
+```
+
+That is wrong for `unsigned long` / `uint64_t` values with bit 63 set. `scvtf` interprets those values as negative, while `fcvtzs` can saturate to the signed range instead of producing the correct unsigned result.
+
+**Fix:** The ARM64 backend now tracks inferred C types for temporaries and selects `ucvtf` for unsigned integer-to-FP conversion and `fcvtzu` for FP-to-unsigned-integer conversion. Signed conversions continue to use `scvtf` / `fcvtzs`.
+
+Regression coverage lives in `spec/phase7/codegen_spec.rb` and checks explicit casts plus unsigned integer temps used directly in FP expressions.
+
+---
+
+## ARM64 FP Binary Ops Should Fail Loudly When Unsupported
+
+The ARM64 FP binary emitter used to fall back to addition for any unsupported floating-point operation:
+
+```asm
+fadd d9, d9, d10
+```
+
+That made `double % double` silently compile as addition, because ARM64 has no hardware FP modulo instruction. The correct lowering needs a libm call.
+
+**Fix:** Floating-point `%` now loads operands into `d0`/`d1`, calls `fmod`, and stores the `d0` result. The generic unknown-op fallback now raises a compile error instead of emitting plausible but wrong arithmetic.
+
+Regression coverage lives in `spec/phase7/codegen_spec.rb` and checks that ARM64 FP modulo emits `bl _fmod` and does not emit the old `fadd` fallback.
+
+---
+
+## Barrier Builtins Must Survive Preprocessing
+
+`__sync_synchronize()` was originally modeled as a preprocessor macro with an empty body. That was acceptable for single-threaded smoke tests, but it made the frontend erase the only source-level signal that a full memory barrier was needed. Once erased, no backend could emit `dmb ish`.
+
+**Fix:** Stop defining `__sync_synchronize` as a macro. Semantic analysis now seeds it as a `void(void)` builtin, and the ARM64 backend lowers the call inline to:
+
+```asm
+dmb ish
+```
+
+The same rule now applies to `__sync_lock_release()` and `__sync_lock_test_and_set()`. They need backend visibility so ARM64 can emit release-store and atomic-swap instructions instead of plain stores:
+
+```asm
+stlr   w9, [x10]
+swpal  w9, w0, [x10]
+```
+
+`__sync_fetch_and_add()` and `__sync_fetch_and_sub()` follow the same pattern. On Apple Silicon, fetch-add can use LSE `ldaddal*`; fetch-sub is a negated addend followed by the same atomic fetch-add instruction:
+
+```asm
+ldaddal w9, w0, [x10]
+neg     x9, x9
+ldaddal w9, w0, [x10]
+```
+
+Regression coverage lives in `spec/phase3/preprocessor_spec.rb` to ensure these calls survive preprocessing, and in `spec/phase7/codegen_spec.rb` to ensure ARM64 emits the barrier / release-store / atomic-swap instructions instead of function calls.
+
+---
+
+## Third-Party Harnesses Need a Reference Compiler Check
+
+The linenoise VT100 emulator test can fail for host/environment reasons unrelated to occ. On this macOS host, the pinned linenoise test suite reports only 14/102 passing checks even when both `linenoise-example` and `linenoise_test` are compiled with clang. The failure mode is that the child process prints the prompt, but the harness does not observe typed-key echo/cursor movement.
+
+**Fix:** `spec/phase11/linenoise_spec.rb` first compiles and runs the same test with clang. If the reference build fails, the spec is marked pending with `linenoise VT100 harness fails with clang on this host`. occ is only blamed when the upstream harness passes with clang and fails with occ.
+
+---
+
+## Switch Case Labels Can Be Nested in Bare Compound Blocks
+
+CRuby's regex VM fallback (`USE_TOKEN_THREADED_VM=0`) expands its dispatch loop to a shape like:
+
+```c
+while (1) {
+    switch (*p++) {
+      {
+        case OP_END:
+          ...
+      }
+    }
+}
+```
+
+C permits `case` labels to appear inside nested statements within the nearest enclosing `switch`. occ already scanned nested cases inside case/default bodies, but it did not scan arbitrary top-level switch items. The result was a switch with no dispatch comparisons; `match_at` repeatedly evaluated `*p++` and eventually faulted at a guard page during regexp matching.
+
+**Fix:** `build_switch` now calls `scan_nested_cases` for non-case/default top-level switch items too. The generated `regexec.o` now compares the fetched opcode and branches into case bodies, and compiled `miniruby` passes `Regexp#===`, `String#=~`, and `Regexp#match?` reducers.
+
+Regression coverage lives in `spec/phase6/ir_spec.rb` with a nested-compound `switch (*p++)` shape.
+
+---
+
+## Alloca Is Frame Layout, Even After a Terminator
+
+CRuby's `numeric.c:int_pow` has this control-flow pattern:
+
+```c
+return LONG2NUM(z);
+
+VALUE v;
+bignum:
+    v = rb_big_pow(...);
+```
+
+The declaration is textually after a `return`, but the `bignum:` label is reachable by `goto`. occ's generic `emit` helper skips instructions after a terminated block, so it recorded `v` in the local map but dropped the `Alloca` instruction. Codegen then failed to recognize the temp as stack storage and treated its uninitialized slot as a pointer; in `10**30`, that pointer was the exponent value `30`, causing a store to address `0x1e`.
+
+**Fix:** local declarations append `Alloca` directly instead of going through the terminator-guarded `emit`. Initializer stores are still control-flow instructions and remain guarded, but frame layout now survives label-reachable declarations after terminators.
+
+Regression coverage lives in `spec/phase6/ir_spec.rb` and mirrors the `return; local; label:` pattern.
+
+---
+
 ## macOS Linker Splits Embedded-Null Strings in `__cstring` Section
 
 The `__TEXT,__cstring,cstring_literals` section on macOS enables **linker string merging**: the linker treats every entry as a null-terminated C string and may deduplicate or repack them. This means a string with an embedded null byte — like `"a\0b\0"` — is silently split at the first null. The linker stores only `{97, 0, 0}` (`"a"`) in the final binary; the tail `"b\0"` is discarded or relocated to a different address. Any code that reads past the first null byte gets wrong data.
