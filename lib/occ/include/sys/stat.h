@@ -4,6 +4,32 @@
 #include <sys/types.h>
 #include <time.h>
 
+#if defined(__APPLE__)
+struct stat {
+    int       st_dev;
+    unsigned short st_mode;
+    unsigned short st_nlink;
+    unsigned long st_ino;
+    unsigned int st_uid;
+    unsigned int st_gid;
+    int       st_rdev;
+    struct timespec st_atimespec;
+    struct timespec st_mtimespec;
+    struct timespec st_ctimespec;
+    struct timespec st_birthtimespec;
+    off_t     st_size;
+    blkcnt_t  st_blocks;
+    int       st_blksize;
+    unsigned int st_flags;
+    unsigned int st_gen;
+    int       st_lspare;
+    long      st_qspare[2];
+};
+
+#define st_atime st_atimespec.tv_sec
+#define st_mtime st_mtimespec.tv_sec
+#define st_ctime st_ctimespec.tv_sec
+#else
 struct stat {
     dev_t     st_dev;
     ino_t     st_ino;
@@ -22,6 +48,7 @@ struct stat {
     long      st_mtime;
     long      st_ctime;
 };
+#endif
 
 /* File type macros */
 #define S_IFMT   0170000

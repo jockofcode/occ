@@ -347,9 +347,9 @@ Regression coverage lives in `spec/phase10/phase10_spec.rb` and asserts the Darw
 
 ---
 
-## Recursive Hash Guard Can Escape the Original Update Frame
+## Recursive Hash Guard Pointed at a Bad Enum State Load
 
-The current CRuby hash reducer is no longer a plain table-insertion failure. For:
+The CRuby hash reducer was not a plain table-insertion failure. For:
 
 ```ruby
 class K
@@ -363,7 +363,9 @@ k = K.new
 h[k] = 42
 ```
 
-the exact `rb_hash_aset` call enters `ar_update` with the expected update argument (`arg.arg == 0x55`, Ruby's immediate representation of `42`). lldb shows that execution does not resume at the instruction immediately after `bl _ar_do_hash` in that original `ar_update` frame. The failing path also does not reach `ar_add_direct_with_hash` with value `42`, and it does not hit `ar_force_convert_table` for that exact insertion.
+the exact `rb_hash_aset` call enters `ar_update` with the expected update argument (`arg.arg == 0x55`, Ruby's immediate representation of `42`). lldb shows the Ruby `hash` callback returns the correct value (`0x0f`, Fixnum `7`) through `hash_recursive`, `exec_recursive_i`, `vm_catch_protect`, `rb_catch_protect`, and back into `exec_recursive`. A symbolic breakpoint pass also reaches `ar_update` -> `ar_do_hash` -> `any_hash` -> `obj_any_hash`.
+
+Before the enum-width fix, the failing exact insertion still did not reach `ar_add_direct_with_hash` with value `42`, and it did not hit `ar_force_convert_table`. The reducer printed the empty-hash diagnostic and then tripped Ruby's stack consistency check, so the remaining issue was in generated control flow / VM stack-state restoration after the first-use recursive hash calculation, not the Ruby `hash` method's return value and not the final table-add helper.
 
 The behavior is specific to first-use hash computation through CRuby's recursive hash guard:
 
@@ -372,7 +374,80 @@ The behavior is specific to first-use hash computation through CRuby's recursive
 - precomputing `k.hash` before `h[k] = 42` makes the reducer pass
 - fresh array keys fail the same way, while precomputing `k.hash` for the array makes insertion pass
 
-This points the next debugging pass at `rb_exec_recursive_outer_mid` / `rb_catch_protect` / `rb_throw_obj` and setjmp-style VM tag unwinding, not at `ar_add_direct_with_hash`. Declaring Darwin's `_setjmp` / `_longjmp` entry points in the bundled `setjmp.h` is now covered and keeps the header truthful, but it did not change this reducer.
+Native control coverage now includes a small protected function-pointer callback using `_setjmp` and a callback return to the original caller; that regression passes. Declaring Darwin's `_setjmp` / `_longjmp` entry points in the bundled `setjmp.h` is covered and keeps the header truthful, but this reducer required CRuby's VM callback/catch machinery to expose the enum-state load bug below.
+
+---
+
+## Enum Locals Need Width-Aware Stack Loads
+
+The CRuby hash reducer ultimately exposed an ARM64 load-width bug for enum locals. In `thread.c:exec_recursive`, CRuby uses:
+
+```c
+enum ruby_tag_type state;
+result = rb_catch_protect(p.list, exec_recursive_i, (VALUE)&p, &state);
+if (state != TAG_NONE) EC_JUMP_TAG(GET_EC(), state);
+```
+
+`rb_catch_protect` writes `state` through an `enum ruby_tag_type *`, so only the enum's 4-byte object representation is updated. occ allocated an 8-byte stack slot for the local and, because `EnumType` was not treated like an integer type in ARM64 alloca loads, later emitted a full-width load:
+
+```asm
+ldr x10, [x29, #0x1f0]
+cmp x10, #0
+```
+
+The stale high half made the value look like `0x100000000`, so `exec_recursive` wrongly called `rb_ec_tag_jump` even though the low 32 bits were `TAG_NONE`.
+
+**Fix:** ARM64 codegen now treats every C type reporting `integer?` as width-sensitive for load lowering, not just `IntegerType`. `EnumType(size=4, signed)` now loads with `ldrsw`, and `_Bool` remains a 1-byte unsigned integer-like type. The fresh compiled `miniruby` now inserts first-use custom and array hash keys correctly, and `basictest/test.rb` clears the hash section.
+
+Regression coverage lives in `spec/phase10/phase10_spec.rb` and forces the stale-high-half shape with an enum local cleared through an enum pointer.
+
+---
+
+## Darwin `ETIMEDOUT` Must Match the Host Errno Table
+
+After the hash fix, compiled `miniruby` reached `basictest`'s signal section and aborted in plain `sleep 0.1`:
+
+```text
+[BUG] pthread_cond_timedwait: Operation timed out (ENOSTR)
+```
+
+The native call was not failing strangely. On Darwin, `pthread_cond_timedwait` returns `60` for timeout, and `60` is `ETIMEDOUT`. occ's bundled `errno.h` still used Linux-like high errno values, where `ETIMEDOUT` was `110` and `ENOSTR` was `60`. CRuby's `native_cond_timedwait` checks:
+
+```c
+if (r != 0 && r != ETIMEDOUT) {
+    rb_bug_errno("pthread_cond_timedwait", r);
+}
+```
+
+so a normal timeout was misclassified as a fatal pthread error.
+
+**Fix:** `errno.h` now has a Darwin table under `__APPLE__`, including `EAGAIN == 35`, `ENOSTR == 99`, and `ETIMEDOUT == 60`. `pthread.h` also declares `pthread_cond_timedwait()` and includes `time.h` for `struct timespec`.
+
+Regression coverage lives in `spec/phase10/phase10_spec.rb`: one test checks the Darwin errno constants, and another initializes a pthread mutex/condition pair and verifies a real timed wait returns `ETIMEDOUT`.
+
+---
+
+## Darwin `struct stat` Layout Gates PATH Command Lookup
+
+Once sleep worked, compiled `miniruby` reached `basictest`'s system section and failed on:
+
+```ruby
+`echo foobar`
+```
+
+Absolute command execution worked (`/bin/echo`), and Ruby-level file checks found `/bin/echo`, but CRuby's `dln_find_exe_r("echo", PATH, ...)` returned no executable. That path does:
+
+```c
+if (stat(fbuf, &st) == 0 && S_ISREG(st.st_mode)) {
+    if (eaccess(fbuf, X_OK) == 0) return fbuf;
+}
+```
+
+The problem was the bundled generic `struct stat`: it put `st_mode` far from Darwin's real offset. On this host, clang reports `sizeof(struct stat) == 144` and `offsetof(struct stat, st_mode) == 4`; occ's old layout read junk for `st_mode`, so `S_ISREG` failed even for `/bin/echo`.
+
+**Fix:** `sys/stat.h` now uses a Darwin-specific `struct stat` layout with `st_mode` at offset 4, the timestamp fields in Darwin order, `st_size` at offset 96, and the trailing block/flag fields. It also defines the usual `st_atime` / `st_mtime` / `st_ctime` macros through the timespec fields.
+
+Regression coverage lives in `spec/phase10/phase10_spec.rb` and verifies `stat("/bin/echo")`, `S_ISREG(st.st_mode)`, executable bits, and `access("/bin/echo", X_OK)`. Fresh compiled `miniruby` now passes `` `echo ok` ``, `system("echo ok")`, `system("echo", "ok")`, and the full `basictest/test.rb`.
 
 ---
 

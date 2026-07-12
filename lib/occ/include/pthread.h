@@ -3,6 +3,7 @@
 
 #include <sys/types.h>
 #include <signal.h>
+#include <time.h>
 
 /* pthread_t is a pointer-sized opaque handle on macOS */
 typedef unsigned long pthread_t;
@@ -64,6 +65,8 @@ extern int pthread_mutex_unlock(pthread_mutex_t *m);
 extern int pthread_cond_init(pthread_cond_t *c, const pthread_condattr_t *a);
 extern int pthread_cond_destroy(pthread_cond_t *c);
 extern int pthread_cond_wait(pthread_cond_t *c, pthread_mutex_t *m);
+extern int pthread_cond_timedwait(pthread_cond_t *c, pthread_mutex_t *m,
+                                  const struct timespec *abstime);
 extern int pthread_cond_signal(pthread_cond_t *c);
 extern int pthread_cond_broadcast(pthread_cond_t *c);
 

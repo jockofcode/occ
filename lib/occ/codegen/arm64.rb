@@ -575,11 +575,16 @@ module OCC
 
       def unsigned_integer_ctype?(ct)
         ct = bare_ctype(ct)
-        ct.is_a?(OCC::Types::IntegerType) && !ct.signed?
+        integer_like_ctype?(ct) && !ct.signed?
       end
 
       def bool_ctype?(ct)
         bare_ctype(ct).is_a?(OCC::Types::BoolType)
+      end
+
+      def integer_like_ctype?(ct)
+        ct = bare_ctype(ct)
+        ct.respond_to?(:integer?) && ct.integer?
       end
 
       def ctype_for_operand(op)
@@ -762,7 +767,7 @@ module OCC
               # when a smaller type (int=4, short=2, char=1) was stored via a pointer.
               alloca_ct = @alloca_ctypes[instr.ptr.id]
               alloca_sz = @alloca_sizes[instr.ptr.id] || 8
-              if alloca_sz < 8 && alloca_ct.is_a?(OCC::Types::IntegerType)
+              if alloca_sz < 8 && integer_like_ctype?(alloca_ct)
                 signed = alloca_ct.signed?
                 emit_alloca_load(slot_of(instr.ptr), alloca_sz, signed)
               else
@@ -779,7 +784,7 @@ module OCC
               end
               store_fp_temp(instr.dst, 'd10')
             else
-              signed = instr.type.is_a?(OCC::Types::IntegerType) && instr.type.signed?
+              signed = integer_like_ctype?(instr.type) && instr.type.signed?
               case instr.elem_size
               when 1 then emit(signed ? '  ldrsb x10, [x9]' : '  ldrb w10, [x9]')
               when 2 then emit(signed ? '  ldrsh x10, [x9]' : '  ldrh w10, [x9]')

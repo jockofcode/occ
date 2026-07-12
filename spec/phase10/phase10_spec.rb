@@ -110,7 +110,7 @@ RSpec.describe 'Phase 10: Headers, Language Extensions, and FP Codegen' do
   describe 'standard headers compile without error' do
     %w[stdio.h string.h stdlib.h math.h ctype.h assert.h setjmp.h
        signal.h unistd.h errno.h fcntl.h time.h stdint.h stdbool.h
-       stddef.h limits.h float.h sys/types.h sys/stat.h].each do |header|
+       stddef.h limits.h float.h pthread.h sys/types.h sys/stat.h].each do |header|
       it "#include <#{header}> produces valid assembly" do
         src = "#include <#{header}>\nint main(void) { return 0; }\n"
         expect { compile_to_asm(src) }.not_to raise_error
@@ -224,12 +224,74 @@ RSpec.describe 'Phase 10: Headers, Language Extensions, and FP Codegen' do
       expect { compile_to_asm(src) }.not_to raise_error
     end
 
+    it 'uses Darwin errno values on macOS' do
+      src = <<~C
+        #include <errno.h>
+        int main(void) {
+        #if defined(__APPLE__)
+          return ETIMEDOUT == 60 && ENOSTR == 99 && EAGAIN == 35 ? 0 : 1;
+        #else
+          return ETIMEDOUT == 110 && ENOSTR == 60 && EAGAIN == 11 ? 0 : 1;
+        #endif
+        }
+      C
+      result = compile_and_run(src)
+      expect(result[:status]).to eq(0)
+    end
+
+    it 'recognizes pthread_cond_timedwait timeouts through ETIMEDOUT' do
+      src = <<~C
+        #include <errno.h>
+        #include <pthread.h>
+        #include <time.h>
+
+        int main(void) {
+          pthread_mutex_t mutex;
+          pthread_cond_t cond;
+          struct timespec timeout = {0, 0};
+          int r;
+
+          pthread_mutex_init(&mutex, 0);
+          pthread_cond_init(&cond, 0);
+          pthread_mutex_lock(&mutex);
+          r = pthread_cond_timedwait(&cond, &mutex, &timeout);
+          pthread_mutex_unlock(&mutex);
+
+          return r == ETIMEDOUT ? 0 : 1;
+        }
+      C
+      result = compile_and_run(src)
+      expect(result[:status]).to eq(0)
+    end
+
     it '#include <unistd.h> declares read, write, and close' do
       src = <<~C
         #include <unistd.h>
         int f(void) { return (int)write(1, "x", 1); }
       C
       expect { compile_to_asm(src) }.not_to raise_error
+    end
+
+    it 'matches Darwin stat layout for executable path lookup' do
+      src = <<~C
+        #include <sys/stat.h>
+        #include <unistd.h>
+
+        int main(void) {
+        #if defined(__APPLE__)
+          struct stat st;
+          if (stat("/bin/echo", &st) != 0) return 1;
+          if (!S_ISREG(st.st_mode)) return 2;
+          if ((st.st_mode & S_IXUSR) == 0) return 3;
+          if (access("/bin/echo", X_OK) != 0) return 4;
+          return 0;
+        #else
+          return 0;
+        #endif
+        }
+      C
+      result = compile_and_run(src)
+      expect(result[:status]).to eq(0)
     end
   end
 
@@ -801,6 +863,75 @@ RSpec.describe 'Phase 10: Headers, Language Extensions, and FP Codegen' do
       C
       result = compile_and_run(src)
       expect(result[:stdout].strip).to eq('caught=17')
+    end
+
+    it 'resumes the original caller after a protected function-pointer callback' do
+      src = <<~C
+        #include <setjmp.h>
+        #include <stdio.h>
+
+        typedef int (*callback_t)(void *);
+        static jmp_buf top;
+
+        int callback(void *data) {
+            int *value = (int *)data;
+            *value += 5;
+            return *value;
+        }
+
+        int protect(callback_t func, void *data, int *state) {
+            int tag = _setjmp(top);
+            if (tag) {
+                *state = tag;
+                return -1;
+            }
+            *state = 0;
+            return func(data);
+        }
+
+        int update(void) {
+            int state = 99;
+            int value = 7;
+            int result = protect(callback, &value, &state);
+            printf("after protect result=%d state=%d value=%d\\n", result, state, value);
+            return result + state + value;
+        }
+
+        int main(void) {
+            printf("sum=%d\\n", update());
+            return 0;
+        }
+      C
+      result = compile_and_run(src)
+      expect(result[:stdout]).to eq("after protect result=12 state=0 value=12\nsum=24\n")
+    end
+
+    it 'loads enum locals with their declared width after pointer writes' do
+      src = <<~C
+        #include <stdio.h>
+
+        enum tag_state {
+            TAG_NONE = 0,
+            TAG_RAISE = 1
+        };
+
+        void clear_state(enum tag_state *state) {
+            *state = TAG_NONE;
+        }
+
+        int main(void) {
+            enum tag_state state = (enum tag_state)0x100000000ULL;
+            clear_state(&state);
+            if (state != TAG_NONE) {
+                printf("bad=%llu\\n", (unsigned long long)state);
+                return 1;
+            }
+            printf("ok\\n");
+            return 0;
+        }
+      C
+      result = compile_and_run(src)
+      expect(result[:stdout]).to eq("ok\n")
     end
   end
 
