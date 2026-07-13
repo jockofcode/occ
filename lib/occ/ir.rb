@@ -1617,6 +1617,12 @@ module OCC
             new_val = maybe_truncate_narrow(new_val, ct) unless esz
             emit(Store.new(slot, new_val))
             new_val
+          elsif !esz && node.operand.is_a?(AST::MemberExpr) && (bf = bitfield_info(node.operand))
+            old = build_member(node.operand)
+            new_val = new_temp
+            emit(Binary.new(new_val, :plus, old, Const.new(1)))
+            emit_bitfield_rmw_store(node.operand, bf, new_val)
+            new_val
           else
             addr = lvalue_addr(node.operand)
             sz = ct ? (ct.size rescue 8) : 8
@@ -1645,6 +1651,12 @@ module OCC
             end
             new_val = maybe_truncate_narrow(new_val, ct) unless esz
             emit(Store.new(slot, new_val))
+            old
+          elsif !esz && node.operand.is_a?(AST::MemberExpr) && (bf = bitfield_info(node.operand))
+            old = build_member(node.operand)
+            new_val = new_temp
+            emit(Binary.new(new_val, :plus, old, Const.new(1)))
+            emit_bitfield_rmw_store(node.operand, bf, new_val)
             old
           else
             addr = lvalue_addr(node.operand)
@@ -1675,6 +1687,12 @@ module OCC
             new_val = maybe_truncate_narrow(new_val, ct) unless esz
             emit(Store.new(slot, new_val))
             new_val
+          elsif !esz && node.operand.is_a?(AST::MemberExpr) && (bf = bitfield_info(node.operand))
+            old = build_member(node.operand)
+            new_val = new_temp
+            emit(Binary.new(new_val, :minus, old, Const.new(1)))
+            emit_bitfield_rmw_store(node.operand, bf, new_val)
+            new_val
           else
             addr = lvalue_addr(node.operand)
             sz = ct ? (ct.size rescue 8) : 8
@@ -1703,6 +1721,12 @@ module OCC
             end
             new_val = maybe_truncate_narrow(new_val, ct) unless esz
             emit(Store.new(slot, new_val))
+            old
+          elsif !esz && node.operand.is_a?(AST::MemberExpr) && (bf = bitfield_info(node.operand))
+            old = build_member(node.operand)
+            new_val = new_temp
+            emit(Binary.new(new_val, :minus, old, Const.new(1)))
+            emit_bitfield_rmw_store(node.operand, bf, new_val)
             old
           else
             addr = lvalue_addr(node.operand)
@@ -2100,6 +2124,25 @@ module OCC
           emit(Load.new(dst, field_ptr, node.ctype, elem_sz))
           dst
         end
+      end
+
+      # Emit a bitfield read-modify-write store: load the storage unit, clear the field
+      # bits, insert the new value, and store the unit back.
+      def emit_bitfield_rmw_store(member_node, bf, val)
+        unit_ptr = build_member_addr(member_node)
+        old_unit = new_temp
+        emit(Load.new(old_unit, unit_ptr, nil, bf[:unit_size]))
+        mask        = (1 << bf[:bit_width]) - 1
+        clear_mask  = ~(mask << bf[:bit_offset]) & 0xFFFF_FFFF_FFFF_FFFF
+        cleared     = new_temp
+        emit(Binary.new(cleared, :amp, old_unit, Const.new(clear_mask)))
+        val_masked  = new_temp
+        emit(Binary.new(val_masked, :amp, val, Const.new(mask)))
+        val_shifted = new_temp
+        emit(Binary.new(val_shifted, :lshift, val_masked, Const.new(bf[:bit_offset])))
+        new_unit    = new_temp
+        emit(Binary.new(new_unit, :pipe, cleared, val_shifted))
+        emit(Store.new(unit_ptr, new_unit, nil, bf[:unit_size]))
       end
 
       # Return bitfield metadata {bit_offset:, bit_width:, unit_size:, byte_start:, signed:} or nil.

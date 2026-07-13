@@ -117,6 +117,31 @@ In `#if defined(FEATURE)`, the `defined()` operator must be evaluated **before**
 
 ---
 
+## Macro Expansion Markers Must Not Reach Stringification
+
+The preprocessor uses internal marker bytes to prevent macro tokens from being immediately re-expanded. CRuby's generated version macros exposed a leak through the common two-level stringification pattern:
+
+```c
+#define STRINGIZE(expr) STRINGIZE0(expr)
+#define STRINGIZE0(expr) #expr
+#define RUBY_VERSION STRINGIZE(RUBY_API_VERSION_MAJOR) "." ...
+```
+
+The outer macro expanded numeric object macros like `3`, but the internal frozen/blue marker bytes stayed attached. The inner `#expr` then stringified those bytes, so compiled `miniruby` reported values such as:
+
+```ruby
+"\x013\x02.\x014\x02.\x010\x02"
+[1, 51, 2, 46, 1, 52, 2, 46, 1, 48, 2]
+```
+
+That broke generated `rbconfig.rb` because the executable version string no longer matched the plain library version string.
+
+**Fix:** Strip internal macro marker bytes before function-like macro `#` stringification and `##` token-paste substitution. The markers are still useful while expansion is being controlled, but they are not C tokens and must not become observable source text.
+
+Regression coverage lives in `spec/phase3/preprocessor_spec.rb` and verifies the two-level `STRINGIZE(VERSION_MAJOR)` shape expands to plain `"3"` / `"4"` / `"0"` strings with no marker bytes.
+
+---
+
 ## Platform Detection at Runtime
 
 The compiler targets `:arm64_macos`, `:amd64_macos`, or `:amd64_linux` based on `uname -m` and `uname -s` at runtime. This allows the same Ruby codebase to produce native code on both Apple Silicon Macs and AMD64 Linux machines without any compile-time configuration.
@@ -451,6 +476,29 @@ Regression coverage lives in `spec/phase10/phase10_spec.rb` and verifies `stat("
 
 ---
 
+## Darwin `struct tm` Needs `tm_gmtoff` and `tm_zone`
+
+CRuby time tests exposed a real runtime crash in the compiled `miniruby`:
+
+```ruby
+Time.utc(2000, 1, 1).strftime("%Y%m%d")
+```
+
+The crash happened around `Time.utc` / `strftime`, and the bundled `time.h` was using the smaller generic POSIX-ish `struct tm` with fields only through `tm_isdst`. On Darwin, libc's `struct tm` has two additional tail fields:
+
+```c
+long tm_gmtoff;
+char *tm_zone;
+```
+
+On Apple Silicon this makes `sizeof(struct tm) == 56`, with `tm_gmtoff` at offset 40 and `tm_zone` at offset 48. Passing the shorter occ struct to libc routines such as `gmtime_r`, `localtime_r`, and `strftime` is an ABI mismatch: libc can write/read fields past the compiler's declared object layout.
+
+**Fix:** `lib/occ/include/time.h` now includes the Darwin tail fields under `__APPLE__`.
+
+Regression coverage lives in `spec/phase10/phase10_spec.rb`: one test asserts the Darwin layout offsets, and another performs a real `gmtime_r` -> `strftime` round-trip with a stack `struct tm`.
+
+---
+
 ## ARM64 FP Conversions Must Preserve Unsignedness
 
 ARM64 has separate signed and unsigned conversion instructions between integer and floating-point registers. The initial backend always used the signed forms:
@@ -561,6 +609,59 @@ The declaration is textually after a `return`, but the `bignum:` label is reacha
 **Fix:** local declarations append `Alloca` directly instead of going through the terminator-guarded `emit`. Initializer stores are still control-flow instructions and remain guarded, but frame layout now survives label-reachable declarations after terminators.
 
 Regression coverage lives in `spec/phase6/ir_spec.rb` and mirrors the `return; local; label:` pattern.
+
+---
+
+## Bitfield Post-Increment/Decrement Must Use the Minimum Unit Size
+
+The `++` and `--` operators on a bitfield struct member (e.g., `v.mday++`) have two distinct requirements that do not apply to plain field increments: (1) the load and store must use the minimum power-of-2 unit size that covers the bitfield's adjusted bit position within its byte, not the declared field type's size; and (2) the write must go through a read-modify-write that clears the field bits and inserts the new value without disturbing adjacent bitfields.
+
+CRuby's `struct vtm` exposed this with `v.mday++` and `v.yday++` inside `vtm_add_offset`:
+
+```c
+struct vtm {
+    VALUE year, subsecx, utc_offset, zone;
+    unsigned int yday:9; unsigned int mon:4;  unsigned int mday:5;
+    unsigned int hour:5; unsigned int min:6;  unsigned int sec:6;
+    unsigned int wday:3; unsigned int isdst:2; unsigned int tzmode:3; unsigned int tm_got:1;
+};
+```
+
+The first bitfield word (yday+mon+mday+hour+min) packs into bytes 32–35. `mday` sits at bit 13 (byte 33, adjusted bit 5), so `bitfield_info` correctly computes `unit_size=2` (bytes 33–34). The old pre/post-increment code in `build_unary` fell through to the generic non-slot path and used `ct.size rescue 8` — which gives 4 for the declared `unsigned int` type. That produced a 4-byte `ldr w` from byte 33 (reading bytes 33–36, including the first byte of the second bitfield word), added 1 to the raw 4-byte value, and wrote 4 bytes back. The carry ripple from bit 0 (yday's MSB, which is 1 for yday=364) through bit 1 (mon's bit 0) corrupted `mon` from 12 to 13, and the `yday++` 4-byte write changed `yday` from 364 to 109.
+
+The correct assembly for `v.mday++` (mday at bit 13, unit_size=2):
+1. Read `old = v.mday` via `ldrh w10, [base+33]` then `lsr + and` to extract 5 bits
+2. Compute `new = old + 1`
+3. RMW: `ldrh` load 2 bytes, `and` to clear bits 5–9, `and`+`lsl` to prepare new value, `orr`, `strh` to write back
+
+**Fix:** `build_unary` now detects `MemberExpr` operands and calls `bitfield_info` before falling to the generic path. When a bitfield is found, it reads via `build_member` (which does the proper unit-size load, shift, mask) and writes via `emit_bitfield_rmw_store`, a new helper that replicates the existing bitfield assignment RMW but is callable from the increment/decrement operators.
+
+Regression coverage lives in `spec/phase10/phase10_spec.rb` with both a simple 9-bit spanning-byte test and a full `struct vtm` simulation that exercises `v.mday++` and `v.yday++` with the exact day-rollover logic from CRuby.
+
+---
+
+## Darwin Clock IDs Differ from Linux
+
+OCC's bundled `time.h` originally declared:
+
+```c
+#define CLOCK_REALTIME  0
+#define CLOCK_MONOTONIC 1
+```
+
+`CLOCK_MONOTONIC` is `1` on Linux but `6` on Darwin. Passing `1` to Darwin's `clock_gettime` returns `EINVAL`, which CRuby's timing paths silently ignore or treat as a zero-elapsed time, causing test failures in `test_time.rb` that expect `clock_gettime(CLOCK_MONOTONIC)` to succeed.
+
+**Fix:** `lib/occ/include/time.h` now defines Darwin-correct values under the same header (no `__APPLE__` guard needed since these are numbers, not struct layouts):
+
+```c
+#define CLOCK_REALTIME           0
+#define CLOCK_MONOTONIC          6
+#define CLOCK_MONOTONIC_RAW      4
+#define CLOCK_PROCESS_CPUTIME_ID 12
+#define CLOCK_THREAD_CPUTIME_ID  16
+```
+
+Regression coverage lives in `spec/phase10/phase10_spec.rb` and verifies the numeric values via a compile-and-run test.
 
 ---
 

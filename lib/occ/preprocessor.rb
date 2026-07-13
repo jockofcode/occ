@@ -466,6 +466,10 @@ module OCC
       @macros[name] = { kind: :object, body: body }
     end
 
+    def strip_macro_markers(text)
+      text.to_s.gsub(/[#{FROZEN_START}#{FROZEN_END}#{BLUE_START}#{BLUE_END}]/, '')
+    end
+
     # ── #include ──────────────────────────────────────────────────────────────
 
     def process_include(rest, from_file, lineno)
@@ -912,7 +916,8 @@ module OCC
       loop do
         prev = body.dup
         body.gsub!(/([a-zA-Z_]\w*|[0-9]+)\s*##\s*([a-zA-Z_]\w*|[0-9]+)/) do
-          (raw_param_map[$1] || $1) + (raw_param_map[$2] || $2)
+          strip_macro_markers(raw_param_map[$1] || $1) +
+            strip_macro_markers(raw_param_map[$2] || $2)
         end
         break if body == prev
       end
@@ -921,7 +926,7 @@ module OCC
 
       # # stringification (must run before parameter substitution)
       macro[:params].each_with_index do |param, idx|
-        arg = args[idx] || ''
+        arg = strip_macro_markers(args[idx] || '')
         body.gsub!(/\#\s*#{Regexp.escape(param)}/) { arg.inspect }
       end
 

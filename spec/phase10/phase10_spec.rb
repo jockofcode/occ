@@ -293,6 +293,51 @@ RSpec.describe 'Phase 10: Headers, Language Extensions, and FP Codegen' do
       result = compile_and_run(src)
       expect(result[:status]).to eq(0)
     end
+
+    it 'matches Darwin struct tm layout used by libc time functions' do
+      src = <<~C
+        #include <stddef.h>
+        #include <time.h>
+
+        int main(void) {
+        #if defined(__APPLE__)
+          if (sizeof(struct tm) != 56) return 1;
+          if (offsetof(struct tm, tm_gmtoff) != 40) return 2;
+          if (offsetof(struct tm, tm_zone) != 48) return 3;
+          return 0;
+        #else
+          return 0;
+        #endif
+        }
+      C
+      result = compile_and_run(src)
+      expect(result[:status]).to eq(0)
+    end
+
+    it 'round-trips struct tm through gmtime_r and strftime on Darwin' do
+      src = <<~C
+        #include <stdio.h>
+        #include <string.h>
+        #include <time.h>
+
+        int main(void) {
+          char buf[16];
+          time_t t = 946684800;
+          struct tm tm;
+
+          if (!gmtime_r(&t, &tm)) return 1;
+          if (strftime(buf, sizeof(buf), "%Y%m%d", &tm) == 0) return 2;
+          if (strcmp(buf, "20000101") != 0) return 3;
+        #if defined(__APPLE__)
+          if (tm.tm_gmtoff != 0) return 4;
+          if (!tm.tm_zone) return 5;
+        #endif
+          return 0;
+        }
+      C
+      result = compile_and_run(src)
+      expect(result[:status]).to eq(0)
+    end
   end
 
   # ── Bitfield structs ─────────────────────────────────────────────────────────
@@ -697,6 +742,73 @@ RSpec.describe 'Phase 10: Headers, Language Extensions, and FP Codegen' do
       C
       result = compile_and_run(src)
       expect(result[:stdout].strip).to eq('1 42')
+    end
+
+    it 'handles a 9-bit bitfield (crosses byte boundary) correctly' do
+      src = <<~C
+        #include <stdio.h>
+        struct S { unsigned int yday : 9; unsigned int mon : 4; unsigned int mday : 5; };
+        int main(void) {
+            struct S s;
+            s.yday = 364;
+            s.mon  = 12;
+            s.mday = 30;
+            printf("%u %u %u\\n", s.yday, s.mon, s.mday);
+            s.yday = 365;
+            s.mday = 31;
+            printf("%u %u %u\\n", s.yday, s.mon, s.mday);
+            return 0;
+        }
+      C
+      result = compile_and_run(src)
+      expect(result[:stdout].strip).to eq("364 12 30\n365 12 31")
+    end
+
+    it 'handles a vtm-like multi-word bitfield struct (CRuby struct vtm pattern)' do
+      src = <<~C
+        #include <stdio.h>
+        typedef long VALUE;
+        struct vtm {
+            VALUE year; VALUE subsecx; VALUE utc_offset; VALUE zone;
+            unsigned int yday:9; unsigned int mon:4;  unsigned int mday:5;
+            unsigned int hour:5; unsigned int min:6;  unsigned int sec:6;
+            unsigned int wday:3; unsigned int isdst:2; unsigned int tzmode:3; unsigned int tm_got:1;
+        };
+        int main(void) {
+            struct vtm v;
+            v.year = 2015; v.subsecx = 0; v.utc_offset = 0; v.zone = 0;
+            v.yday = 364; v.mon = 12; v.mday = 30;
+            v.hour = 20;  v.min  = 0;  v.sec  = 0;
+            v.wday = 2; v.isdst = 0; v.tzmode = 0; v.tm_got = 0;
+            /* simulate adding 5 hours (crosses midnight) */
+            int hour = 5;
+            int day  = 0;
+            hour += v.hour;
+            if (24 <= hour) { hour -= 24; day = 1; }
+            v.hour = hour;
+            if (day == 1 && !(v.mon == 12 && v.mday == 31) && v.mday < 31) {
+                v.mday++;
+                if (v.yday != 0) v.yday++;
+            }
+            printf("%u %u %u %u\\n", v.yday, v.mon, v.mday, v.hour);
+            return 0;
+        }
+      C
+      result = compile_and_run(src)
+      expect(result[:stdout].strip).to eq('365 12 31 1')
+    end
+
+    it 'uses correct Darwin clock IDs (CLOCK_REALTIME=0, CLOCK_MONOTONIC=6)' do
+      src = <<~C
+        #include <stdio.h>
+        #include <time.h>
+        int main(void) {
+            printf("%d %d\\n", CLOCK_REALTIME, CLOCK_MONOTONIC);
+            return 0;
+        }
+      C
+      result = compile_and_run(src)
+      expect(result[:stdout].strip).to eq('0 6')
     end
   end
 

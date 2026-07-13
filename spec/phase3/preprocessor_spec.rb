@@ -47,6 +47,20 @@ RSpec.describe OCC::Preprocessor do
       result = preprocess(%{#define STR(x) #x\nchar *s = STR(hello);})
       expect(result).to include('"hello"')
     end
+
+    it 'does not leak macro expansion markers through two-level stringification' do
+      result = preprocess(<<~C)
+        #define STRINGIZE(expr) STRINGIZE0(expr)
+        #define STRINGIZE0(expr) #expr
+        #define VERSION_MAJOR 3
+        #define VERSION_MINOR 4
+        #define VERSION_TEENY 0
+        const char version[] = STRINGIZE(VERSION_MAJOR) "." STRINGIZE(VERSION_MINOR) "." STRINGIZE(VERSION_TEENY);
+      C
+
+      expect(result).to include('"3" "." "4" "." "0"')
+      expect(result.bytes).not_to include(1, 2, 3, 4)
+    end
   end
 
   # ── Predefined macros ─────────────────────────────────────────────────────────
