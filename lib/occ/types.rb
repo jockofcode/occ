@@ -76,6 +76,8 @@ module OCC
     ULONG      = IntegerType.new('unsigned long',  8, 8, 4, false).freeze
     LONGLONG   = IntegerType.new('long long',      8, 8, 5, true).freeze
     ULONGLONG  = IntegerType.new('unsigned long long', 8, 8, 5, false).freeze
+    INT128     = IntegerType.new('__int128',           16, 16, 6, true).freeze
+    UINT128    = IntegerType.new('unsigned __int128',  16, 16, 6, false).freeze
 
     # ── Floating-point types ───────────────────────────────────────────────────
 
@@ -276,6 +278,7 @@ module OCC
       when INT      then UINT
       when LONG     then ULONG
       when LONGLONG then ULONGLONG
+      when INT128   then UINT128
       else type
       end
     end
@@ -319,8 +322,8 @@ module OCC
       when ['float']                        then FLOAT
       when ['double']                       then DOUBLE
       when ['double', 'long']               then LONGDOUBLE
-      when ['__int128'], ['__int128', 'signed'] then LONGLONG
-      when ['__int128', 'unsigned']         then ULONGLONG
+      when ['__int128'], ['__int128', 'signed'] then INT128
+      when ['__int128', 'unsigned']         then UINT128
       else
         # Fallback: if typedef_name is set, use INT as placeholder;
         # the semantic analyser resolves typedef names via the symbol table.

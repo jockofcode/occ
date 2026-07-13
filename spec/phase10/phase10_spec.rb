@@ -810,6 +810,35 @@ RSpec.describe 'Phase 10: Headers, Language Extensions, and FP Codegen' do
       result = compile_and_run(src)
       expect(result[:stdout].strip).to eq('0 6')
     end
+
+    it 'constant-folds inline function calls in switch case labels (Ruby INT2FIX pattern)' do
+      src = <<~C
+        #include <stdio.h>
+        typedef unsigned long VALUE;
+        #define FIXNUM_FLAG 0x01UL
+        static inline VALUE MY_INT2FIX(long i) {
+            unsigned long j = (unsigned long)i;
+            unsigned long k = (j << 1) + FIXNUM_FLAG;
+            return (VALUE)k;
+        }
+        static VALUE reverse_cmp(VALUE cmp) {
+            switch (cmp) {
+                case MY_INT2FIX(+1): return MY_INT2FIX(-1);
+                case MY_INT2FIX(-1): return MY_INT2FIX(+1);
+            }
+            return cmp;
+        }
+        int main(void) {
+            /* reverse_cmp(INT2FIX(1)) should return INT2FIX(-1) and vice versa */
+            VALUE r1 = reverse_cmp(MY_INT2FIX(1));
+            VALUE rm = reverse_cmp(MY_INT2FIX(-1));
+            printf("%d %d\\n", r1 == MY_INT2FIX(-1) ? 1 : 0, rm == MY_INT2FIX(1) ? 1 : 0);
+            return 0;
+        }
+      C
+      result = compile_and_run(src)
+      expect(result[:stdout].strip).to eq('1 1')
+    end
   end
 
   # ── va_list / variadic helpers ───────────────────────────────────────────────
@@ -1113,6 +1142,83 @@ RSpec.describe 'Phase 10: Headers, Language Extensions, and FP Codegen' do
       C
       result = compile_and_run(src)
       expect(result[:stdout].strip).to eq('direct write')
+    end
+  end
+
+  describe 'array dimension with sizeof(local array) (numberof pattern)' do
+    it 'correctly sizes a local array declared with sizeof(another_local_array)' do
+      src = <<~C
+        #include <stdio.h>
+        #include <string.h>
+
+        #define numberof(a) ((int)(sizeof(a) / sizeof((a)[0])))
+
+        int main(void) {
+            long len = 10000;
+            long n, i, j, k, idx[10];
+            long rnds[numberof(idx)];
+            int memo_threshold;
+
+            n = 4;
+            memo_threshold = len / 32;
+
+            rnds[0] = 5000; rnds[1] = 4998; rnds[2] = 5001; rnds[3] = 4996;
+
+            if (n <= numberof(idx)) {
+                long sorted[numberof(idx)];
+                sorted[0] = idx[0] = rnds[0];
+                for (i = 1; i < n; i++) {
+                    k = rnds[i];
+                    for (j = 0; j < i; ++j) {
+                        if (k < sorted[j]) break;
+                        ++k;
+                    }
+                    memmove(&sorted[j+1], &sorted[j], sizeof(sorted[0])*(i-j));
+                    sorted[j] = idx[i] = k;
+                }
+            }
+
+            printf("%ld %ld %ld %ld %d\\n", idx[0], idx[1], idx[2], idx[3], memo_threshold);
+            return 0;
+        }
+      C
+      result = compile_and_run(src)
+      # idx values are the insertion-sort result; memo_threshold must be unmodified (312)
+      expect(result[:stdout].strip).to eq('5000 4998 5003 4996 312')
+    end
+  end
+
+  describe '__int128 / unsigned __int128 (128-bit integer type)' do
+    it 'correctly computes 128-bit multiplication and shift (mult_and_mix pattern)' do
+      src = <<~C
+        #include <stdio.h>
+        #include <stdint.h>
+        typedef unsigned __int128 uint128_t;
+        static const uint64_t prime1 = ((uint64_t)0x2e0bb864 << 32) | 0xe9ea7df5;
+        static const uint32_t prime2 = 0x830fcab9;
+        static uint64_t mult_and_mix(uint64_t m1, uint64_t m2) {
+            uint128_t r = (uint128_t)m1 * (uint128_t)m2;
+            return (uint64_t)(r >> 64) ^ (uint64_t)r;
+        }
+        int main(void) {
+            uint64_t m1 = 0x1234567890ABCDEFULL;
+            uint64_t m2 = 0x0FEDCBA987654321ULL;
+            printf("0x%llx\\n", (unsigned long long)mult_and_mix(m1, m2));
+            uint64_t key1 = 8ULL  + prime2;
+            uint64_t key2 = 16ULL + prime2;
+            printf("equal=%d\\n", mult_and_mix(key1, prime1) == mult_and_mix(key2, prime1));
+            uint128_t big = (uint128_t)0xFFFFFFFFFFFFFFFFULL * (uint128_t)0xFFFFFFFFFFFFFFFFULL;
+            printf("hi=0x%llx lo=0x%llx\\n",
+                   (unsigned long long)(uint64_t)(big >> 64),
+                   (unsigned long long)(uint64_t)big);
+            return 0;
+        }
+      C
+      result = compile_and_run(src)
+      lines = result[:stdout].strip.split("\n")
+      expect(lines[0]).to eq('0x2317228f498165bb')
+      expect(lines[1]).to eq('equal=0')
+      expect(lines[2]).to eq('hi=0xfffffffffffffffe lo=0x1')
     end
   end
 end

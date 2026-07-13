@@ -258,7 +258,14 @@ module OCC
       when AST::SizeofType
         node.sizeof_val || resolve_sizeof_type(node.type_spec)
       when AST::SizeofExpr
-        node.sizeof_val
+        if node.sizeof_val
+          node.sizeof_val
+        elsif node.operand.is_a?(AST::StringLiteral)
+          node.operand.value.length + 1
+        else
+          ot = analyze_expr(node.operand) rescue nil
+          sizeof_of_ctype(ot) if ot
+        end
       when AST::BuiltinOffsetof
         node.sizeof_val || eval_builtin_offsetof(node)
       else nil

@@ -101,6 +101,33 @@ extern double fmin(double x, double y);
 extern double fdim(double x, double y);
 extern double fma(double x, double y, double z);
 
+/* Next representable floating-point value */
+extern double nextafter(double x, double y);
+extern float  nextafterf(float x, float y);
+extern double nexttoward(double x, long double y);
+
+/* Remainder */
+extern double remainder(double x, double y);
+extern float  remainderf(float x, float y);
+extern double remquo(double x, double y, int *quo);
+
+/* Log1p / expm1 */
+extern double log1p(double x);
+extern float  log1pf(float x);
+extern double expm1(double x);
+extern float  expm1f(float x);
+
+/* Cbrt */
+extern double cbrt(double x);
+extern float  cbrtf(float x);
+
+/* Gamma / lgamma */
+extern double tgamma(double x);
+extern double lgamma(double x);
+extern double lgamma_r(double x, int *signp);
+extern float  tgammaf(float x);
+extern float  lgammaf(float x);
+
 /* Float versions */
 extern float sinf(float x);
 extern float cosf(float x);
@@ -134,6 +161,19 @@ extern double y1(double x);
 #define isinf(x)    (!isnan(x) && isnan((x) - (x)))
 #define isfinite(x) (!isinf(x) && !isnan(x))
 #define isnormal(x) (isfinite(x) && (x) != 0.0)
-#define signbit(x)  ((x) < 0.0)
+
+/* signbit: check the sign bit via a union cast, not comparison (comparison
+   treats -0.0 as equal to +0.0, so (x < 0.0) always returns false for -0.0) */
+static inline int _occ_signbit_d(double _x) {
+    union { double d; unsigned long long u; } _u;
+    _u.d = _x;
+    return (int)(_u.u >> 63);
+}
+static inline int _occ_signbit_f(float _x) {
+    union { float f; unsigned int u; } _u;
+    _u.f = _x;
+    return (int)(_u.u >> 31);
+}
+#define signbit(x) _occ_signbit_d((double)(x))
 
 #endif /* _OCC_MATH_H */

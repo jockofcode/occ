@@ -445,6 +445,7 @@ module OCC
         @fp_alloca_slots = Set.new # alloca slots holding fp values
         @fp_temps      = Set.new  # temp IDs that hold fp (double/float) values
         @temp_ctypes   = {}       # temp_id => inferred C type
+        @i128_temps    = Set.new  # temp IDs holding 128-bit (INT128/UINT128) values
         @float_pool    = []   # [{label:, value:}] for literal-pool fp constants
         @cond_skip_seq = 0    # unique suffix for CondJump skip labels
 
@@ -467,9 +468,22 @@ module OCC
         compute_temp_ctypes(func)
         compute_fp_temps(func)
 
+        # Identify 128-bit non-alloca temps; each needs 16 bytes instead of 8.
+        i128_extra = 0
+        func.blocks.each do |bb|
+          bb.instrs.each do |i|
+            next unless i.respond_to?(:dst)
+            next if @alloca_slots.include?(i.dst.id)
+            ct = @temp_ctypes[i.dst.id]
+            next unless ct.is_a?(OCC::Types::IntegerType) && ct.size == 16
+            @i128_temps << i.dst.id
+            i128_extra += 8   # extra 8 on top of the base 8 every temp gets
+          end
+        end
+
         # Compute frame size accounting for oversized alloca slots (arrays, structs)
         all_temps_count = collect_temp_count(func)
-        @frame_sz = align16(all_temps_count * 8 + alloca_extra + 16)   # +16 for fp/lr pair
+        @frame_sz = align16(all_temps_count * 8 + alloca_extra + i128_extra + 16)   # +16 for fp/lr pair
         frame_sz = @frame_sz
 
         name = sym(func.name)
@@ -580,6 +594,21 @@ module OCC
 
       def bool_ctype?(ct)
         bare_ctype(ct).is_a?(OCC::Types::BoolType)
+      end
+
+      def i128_ctype?(ct)
+        ct = bare_ctype(ct) if ct.respond_to?(:unqualified)
+        ct.is_a?(OCC::Types::IntegerType) && ct.size == 16
+      end
+
+      def i128_temp?(op)
+        op.is_a?(IR::Temp) && @i128_temps&.include?(op.id)
+      end
+
+      def i128_operand?(op)
+        i128_temp?(op) ||
+          (op.is_a?(IR::Temp) && @alloca_sizes&.[](op.id).to_i == 16 &&
+           @alloca_ctypes&.[](op.id).then { |ct| ct && i128_ctype?(ct) })
       end
 
       def integer_like_ctype?(ct)
@@ -744,6 +773,9 @@ module OCC
           if fp_operand?(instr.src)
             load_fp_operand(instr.src, 'd9')
             store_fp_temp(instr.dst, 'd9')
+          elsif i128_temp?(instr.src)
+            load_operand_128(instr.src, 'x9', 'x10')
+            store_temp_128(instr.dst, 'x9', 'x10')
           else
             load_operand(instr.src, 'x9')
             store_temp(instr.dst, 'x9')
@@ -767,13 +799,19 @@ module OCC
               # when a smaller type (int=4, short=2, char=1) was stored via a pointer.
               alloca_ct = @alloca_ctypes[instr.ptr.id]
               alloca_sz = @alloca_sizes[instr.ptr.id] || 8
-              if alloca_sz < 8 && integer_like_ctype?(alloca_ct)
+              if alloca_sz == 16 && i128_ctype?(alloca_ct)
+                # 128-bit alloca: load both halves into a 128-bit temp
+                slot = slot_of(instr.ptr)
+                emit_slot_load('x9', slot)
+                emit_slot_load('x10', slot + 8)
+                store_temp_128(instr.dst, 'x9', 'x10')
+              elsif alloca_sz < 8 && integer_like_ctype?(alloca_ct)
                 signed = alloca_ct.signed?
                 emit_alloca_load(slot_of(instr.ptr), alloca_sz, signed)
               else
                 emit_slot_load('x10', slot_of(instr.ptr))
               end
-              store_temp(instr.dst, 'x10')
+              store_temp(instr.dst, 'x10') unless alloca_sz == 16 && i128_ctype?(alloca_ct)
             end
           else
             load_operand(instr.ptr, 'x9')
@@ -783,6 +821,11 @@ module OCC
               else        emit '  ldr d10, [x9]'
               end
               store_fp_temp(instr.dst, 'd10')
+            elsif i128_ctype?(instr.type)
+              # x9 = pointer; load both halves into x11, x12
+              emit '  ldr x11, [x9]'
+              emit '  ldr x12, [x9, #8]'
+              store_temp_128(instr.dst, 'x11', 'x12')
             else
               signed = integer_like_ctype?(instr.type) && instr.type.signed?
               case instr.elem_size
@@ -797,9 +840,20 @@ module OCC
 
         when IR::Store
           if instr.ptr.is_a?(IR::Temp) && @alloca_slots.include?(instr.ptr.id)
-            if @fp_alloca_slots.include?(instr.ptr.id) || fp_operand?(instr.value)
+            alloca_ct = @alloca_ctypes[instr.ptr.id]
+            if alloca_ct && i128_ctype?(alloca_ct)
+              # 128-bit store: store both halves into the two adjacent slots
+              slot = slot_of(instr.ptr)
+              if i128_temp?(instr.value)
+                load_operand_128(instr.value, 'x9', 'x10')
+              else
+                load_operand(instr.value, 'x9')
+                emit '  mov x10, xzr'
+              end
+              emit_slot_store('x9', slot)
+              emit_slot_store('x10', slot + 8)
+            elsif @fp_alloca_slots.include?(instr.ptr.id) || fp_operand?(instr.value)
               load_fp_operand(instr.value, 'd9')
-              alloca_ct = @alloca_ctypes[instr.ptr.id]
               slot = slot_of(instr.ptr)
               if alloca_ct.respond_to?(:size) && alloca_ct.size == 4
                 # float (4-byte) slot: narrow to single before storing so &f reads correct bytes
@@ -1040,6 +1094,28 @@ module OCC
             conv = unsigned_integer_ctype?(ctype_for_operand(instr.src)) ? 'ucvtf' : 'scvtf'
             emit "  #{conv} d9, x9"
             store_fp_temp(instr.dst, 'd9')
+          elsif i128_ctype?(instr.type) && !i128_operand?(instr.src)
+            # integer → 128-bit: zero-extend (or sign-extend for signed __int128)
+            load_operand(instr.src, 'x9')
+            if instr.type.respond_to?(:signed?) && instr.type.signed?
+              emit '  asr x10, x9, #63'
+            else
+              emit '  mov x10, xzr'
+            end
+            store_temp_128(instr.dst, 'x9', 'x10')
+          elsif !i128_ctype?(instr.type) && i128_operand?(instr.src)
+            # 128-bit → integer: take the low 64 bits only
+            slot = slot_of(instr.src)
+            emit_slot_load('x9', slot)
+            ct = instr.type
+            if ct.is_a?(OCC::Types::IntegerType)
+              case ct.size
+              when 1 then emit(ct.signed? ? '  sxtb x9, w9' : '  and x9, x9, #0xff')
+              when 2 then emit(ct.signed? ? '  sxth x9, w9' : '  and x9, x9, #0xffff')
+              when 4 then emit(ct.signed? ? '  sxtw x9, w9' : '  ubfx x9, x9, #0, #32')
+              end
+            end
+            store_temp(instr.dst, 'x9')
           else
             # int → int: truncate/extend to target width
             load_operand(instr.src, 'x9')
@@ -1060,6 +1136,11 @@ module OCC
       end
 
       def emit_binary(instr) # rubocop:disable Metrics/MethodLength
+        # Handle 128-bit operations specially
+        if i128_ctype?(instr.type)
+          return emit_binary_128(instr)
+        end
+
         load_operand(instr.left,  'x9')
         load_operand(instr.right, 'x10')
 
@@ -1148,6 +1229,147 @@ module OCC
         end
 
         store_temp(instr.dst, 'x9')
+      end
+
+      def emit_binary_128(instr)
+        case instr.op
+        when :star
+          # 128-bit multiply: use mul (low 64) + umulh (high 64).
+          # If both operands are 128-bit temps, use their low halves for a 64×64→128 product.
+          # Full 128×128 would require additional umulh+adds terms, but CRuby only casts 64-bit
+          # values to 128-bit before multiplying, so the high halves are always zero.
+          if i128_operand?(instr.left)
+            load_operand_128(instr.left, 'x9', 'x11')
+          else
+            load_operand(instr.left, 'x9')
+          end
+          if i128_operand?(instr.right)
+            load_operand_128(instr.right, 'x10', 'x12')
+          else
+            load_operand(instr.right, 'x10')
+          end
+          emit '  umulh x11, x9, x10'   # high 64 bits of product
+          emit '  mul x9, x9, x10'      # low 64 bits of product
+          store_temp_128(instr.dst, 'x9', 'x11')
+        when :urshift
+          # 128-bit unsigned right shift
+          load_operand_128(instr.left, 'x9', 'x10')   # x9=lo, x10=hi
+          # Get shift amount (must be a constant for sane codegen)
+          shift_op = instr.right
+          if shift_op.is_a?(IR::Const)
+            n = shift_op.value.to_i & 127
+            if n == 0
+              store_temp_128(instr.dst, 'x9', 'x10')
+            elsif n == 64
+              # lo=hi, hi=0
+              emit '  mov x9, x10'
+              emit '  mov x10, xzr'
+              store_temp_128(instr.dst, 'x9', 'x10')
+            elsif n > 64
+              # lo=hi>>(n-64), hi=0
+              emit "  lsr x9, x10, ##{n - 64}"
+              emit '  mov x10, xzr'
+              store_temp_128(instr.dst, 'x9', 'x10')
+            else
+              # 0 < n < 64: lo=(hi<<(64-n))|(lo>>n), hi=hi>>n
+              emit "  lsr x11, x9, ##{n}"
+              emit "  orr x9, x11, x10, lsl ##{64 - n}"
+              emit "  lsr x10, x10, ##{n}"
+              store_temp_128(instr.dst, 'x9', 'x10')
+            end
+          else
+            load_operand(shift_op, 'x11')
+            # General case: shift by register (handle n<64, n==64, n>64)
+            emit '  and x11, x11, #127'
+            emit '  lsr x9, x9, x11'
+            emit '  neg x12, x11'
+            emit '  lsl x12, x10, x12'
+            emit '  orr x9, x9, x12'
+            emit '  lsr x10, x10, x11'
+            emit '  cmp x11, #64'
+            emit '  csel x9, x10, x9, hs'
+            emit '  csel x10, xzr, x10, hs'
+            store_temp_128(instr.dst, 'x9', 'x10')
+          end
+        when :rshift
+          # 128-bit signed right shift (arithmetic)
+          load_operand_128(instr.left, 'x9', 'x10')
+          shift_op = instr.right
+          n = shift_op.is_a?(IR::Const) ? shift_op.value.to_i & 127 : nil
+          if n&.== 64
+            emit '  mov x9, x10'
+            emit '  asr x10, x10, #63'
+          elsif n && n > 64
+            emit "  asr x9, x10, ##{[n - 64, 63].min}"
+            emit '  asr x10, x10, #63'
+          elsif n && n > 0
+            emit "  lsr x11, x9, ##{n}"
+            emit "  orr x9, x11, x10, lsl ##{64 - n}"
+            emit "  asr x10, x10, ##{n}"
+          end
+          store_temp_128(instr.dst, 'x9', 'x10') if n
+        when :amp
+          load_operand_128(instr.left, 'x9', 'x10')
+          if i128_operand?(instr.right)
+            load_operand_128(instr.right, 'x11', 'x12')
+          else
+            load_operand(instr.right, 'x11')
+            emit '  mov x12, xzr'
+          end
+          emit '  and x9, x9, x11'
+          emit '  and x10, x10, x12'
+          store_temp_128(instr.dst, 'x9', 'x10')
+        when :pipe
+          load_operand_128(instr.left, 'x9', 'x10')
+          if i128_operand?(instr.right)
+            load_operand_128(instr.right, 'x11', 'x12')
+          else
+            load_operand(instr.right, 'x11')
+            emit '  mov x12, xzr'
+          end
+          emit '  orr x9, x9, x11'
+          emit '  orr x10, x10, x12'
+          store_temp_128(instr.dst, 'x9', 'x10')
+        when :caret
+          load_operand_128(instr.left, 'x9', 'x10')
+          if i128_operand?(instr.right)
+            load_operand_128(instr.right, 'x11', 'x12')
+          else
+            load_operand(instr.right, 'x11')
+            emit '  mov x12, xzr'
+          end
+          emit '  eor x9, x9, x11'
+          emit '  eor x10, x10, x12'
+          store_temp_128(instr.dst, 'x9', 'x10')
+        when :plus
+          load_operand_128(instr.left, 'x9', 'x10')
+          if i128_operand?(instr.right)
+            load_operand_128(instr.right, 'x11', 'x12')
+          else
+            load_operand(instr.right, 'x11')
+            emit '  mov x12, xzr'
+          end
+          emit '  adds x9, x9, x11'
+          emit '  adc x10, x10, x12'
+          store_temp_128(instr.dst, 'x9', 'x10')
+        when :minus
+          load_operand_128(instr.left, 'x9', 'x10')
+          if i128_operand?(instr.right)
+            load_operand_128(instr.right, 'x11', 'x12')
+          else
+            load_operand(instr.right, 'x11')
+            emit '  mov x12, xzr'
+          end
+          emit '  subs x9, x9, x11'
+          emit '  sbc x10, x10, x12'
+          store_temp_128(instr.dst, 'x9', 'x10')
+        else
+          # Fall back to 64-bit for unknown 128-bit ops (shouldn't occur in practice)
+          load_operand(instr.left, 'x9')
+          load_operand(instr.right, 'x10')
+          emit '  add x9, x9, x10'
+          store_temp(instr.dst, 'x9')
+        end
       end
 
       def emit_fp_binary(instr) # rubocop:disable Metrics/MethodLength
@@ -1463,7 +1685,7 @@ module OCC
       def alloc_slot_for(temp)
         id = temp.id
         return @slot_map[id] if @slot_map.key?(id)
-        sz = @alloca_sizes&.[](id) || 8
+        sz = @alloca_sizes&.[](id) || (@i128_temps&.include?(id) ? 16 : 8)
         sz_aligned = (sz + 7) / 8 * 8  # advance slot_next by aligned size to avoid gaps
         @slot_next = ((@slot_next + 7) / 8 * 8)
         offset = @slot_next + 16   # +16 so first slot is at fp+16
@@ -1634,6 +1856,25 @@ module OCC
       def store_temp(temp, reg)
         slot = alloc_slot_for(temp)
         emit_slot_store(reg, slot)
+      end
+
+      # Load a 128-bit value from a temp's two stack slots into reg_lo and reg_hi.
+      def load_operand_128(op, reg_lo, reg_hi)
+        if op.is_a?(IR::Const)
+          load_operand(op, reg_lo)
+          emit "  mov #{reg_hi}, xzr"
+        else
+          slot = slot_of(op)
+          emit_slot_load(reg_lo, slot)
+          emit_slot_load(reg_hi, slot + 8)
+        end
+      end
+
+      # Store a 128-bit value (reg_lo, reg_hi) into a temp's two stack slots.
+      def store_temp_128(temp, reg_lo, reg_hi)
+        slot = alloc_slot_for(temp)
+        emit_slot_store(reg_lo, slot)
+        emit_slot_store(reg_hi, slot + 8)
       end
 
       def emit_struct_copy(src, dst, size)

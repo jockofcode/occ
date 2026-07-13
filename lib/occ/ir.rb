@@ -243,6 +243,7 @@ module OCC
         @switch_case_map      = nil  # current switch's case_map (for nested case labels)
         @switch_default_block = nil  # current switch's default block
         @enum_constants       = {}   # name => Integer (compile-time enum values)
+        @func_ast_defs        = {}   # name => AST::FunctionDef (for const-folding inline calls)
       end
 
       def build(tu)
@@ -312,6 +313,7 @@ module OCC
       end
 
       def build_function(fn)
+        @func_ast_defs[fn.name] = fn   # store for compile-time constant folding in case labels
         @temp_counter    = 0
         @label_counter   = 0
         @locals          = {}
@@ -1201,6 +1203,7 @@ module OCC
         when AST::UnaryOp
           v = eval_case_value(expr.operand)
           case expr.op
+          when :unary_plus  then v
           when :unary_minus then v ? -v : nil
           when :bit_not     then v.is_a?(Integer) ? ~v : nil
           else nil
@@ -1219,6 +1222,123 @@ module OCC
           when :lshift then l << r
           when :rshift then l >> r
           end
+        when AST::CallExpr
+          # Constant-fold calls to simple inline functions (e.g. RB_INT2FIX in Ruby headers).
+          # GCC/Clang allow inline function calls in case labels by constant-folding them.
+          func_name = expr.callee.is_a?(AST::Identifier) ? expr.callee.name : nil
+          return nil unless func_name
+          fn = @func_ast_defs[func_name]
+          return nil unless fn&.body
+          args = expr.args.map { |a| eval_case_value(a) }
+          return nil if args.any?(&:nil?)
+          eval_inline_func_body(fn, args)
+        else nil
+        end
+      end
+
+      # Evaluate a simple inline function body with constant arguments.
+      # Returns an Integer or nil if the body is too complex to evaluate.
+      def eval_inline_func_body(fn, const_args)
+        params = fn.params[:params]
+        return nil if params.length != const_args.length
+        env = {}
+        params.zip(const_args) { |p, v| env[p[:name]] = v if p[:name] }
+        eval_inline_stmts(fn.body.items, env)
+      rescue
+        nil
+      end
+
+      def eval_inline_stmts(items, env)
+        items.each do |item|
+          case item
+          when AST::Declaration
+            item.declarators.each do |d|
+              next unless d[:name]
+              val = d[:init] ? eval_inline_expr(d[:init], env) : 0
+              return nil if val.nil?
+              env[d[:name]] = val
+            end
+          when AST::ReturnStmt
+            return eval_inline_expr(item.value, env)
+          when AST::ExprStmt
+            # skip (void)0 assertions and other expression statements
+          else
+            return nil  # complex control flow — give up
+          end
+        end
+        nil
+      end
+
+      def eval_inline_expr(expr, env)
+        return nil unless expr
+        case expr
+        when AST::IntLiteral   then expr.integer_value
+        when AST::CharLiteral  then expr.value.ord
+        when AST::Identifier   then env.key?(expr.name) ? env[expr.name] : @enum_constants[expr.name]
+        when AST::Cast
+          v = eval_inline_expr(expr.expr, env)
+          return nil unless v
+          # Apply truncation for sized integer types. Use the raw type keywords since
+          # we don't have full type resolution in this context.
+          specs = expr.type_spec[:specs] rescue nil
+          if specs
+            kwds = specs.respond_to?(:type_keywords) ? specs.type_keywords : []
+            unsigned = kwds.include?(:unsigned) || (!kwds.include?(:signed) && kwds.include?(:long) &&
+                                                     specs.respond_to?(:storage) && specs.storage.nil?)
+            size_bits = if kwds.include?(:char)   then 8
+                        elsif kwds.include?(:short) then 16
+                        elsif kwds.include?(:int)   then 32
+                        elsif kwds.include?(:long)  then 64
+                        end
+            if size_bits
+              mask = (1 << size_bits) - 1
+              v &= mask
+              # Sign-extend if signed
+              if !unsigned && v >= (1 << (size_bits - 1))
+                v -= (1 << size_bits)
+              end
+            end
+          end
+          v
+        when AST::UnaryOp
+          v = eval_inline_expr(expr.operand, env)
+          return nil unless v
+          case expr.op
+          when :unary_plus  then v
+          when :unary_minus then -v
+          when :bit_not     then ~v
+          when :logical_not then v == 0 ? 1 : 0
+          else nil
+          end
+        when AST::BinaryOp
+          l = eval_inline_expr(expr.left, env)
+          r = eval_inline_expr(expr.right, env)
+          return nil unless l && r
+          case expr.op
+          when :plus    then l + r
+          when :minus   then l - r
+          when :star    then l * r
+          when :amp     then l & r
+          when :pipe    then l | r
+          when :caret   then l ^ r
+          when :lshift  then l << r
+          when :rshift  then l >> r
+          when :slash   then r != 0 ? l / r : nil
+          when :percent then r != 0 ? l % r : nil
+          else nil
+          end
+        when AST::TernaryOp
+          c = eval_inline_expr(expr.cond, env)
+          return nil if c.nil?
+          c != 0 ? eval_inline_expr(expr.then_expr, env) : eval_inline_expr(expr.else_expr, env)
+        when AST::CallExpr
+          func_name = expr.callee.is_a?(AST::Identifier) ? expr.callee.name : nil
+          return nil unless func_name
+          fn = @func_ast_defs[func_name]
+          return nil unless fn&.body
+          args = expr.args.map { |a| eval_inline_expr(a, env) }
+          return nil if args.any?(&:nil?)
+          eval_inline_func_body(fn, args)
         else nil
         end
       end

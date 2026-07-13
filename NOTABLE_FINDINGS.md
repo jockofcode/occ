@@ -688,3 +688,25 @@ def emit_string_constant(id, value)
   emit_blank
 end
 ```
+
+---
+
+## Inline Function Calls in Switch Case Labels (GCC/Clang Extension)
+
+**Context:** CRuby's `numeric.c` `fix_cmp` function uses `INT2FIX` (which expands to `RB_INT2FIX`, a `static inline` function) as case values:
+
+```c
+switch (cmp) {
+    case INT2FIX(+1): return INT2FIX(-1);
+    case INT2FIX(-1): return INT2FIX(+1);
+}
+return cmp;
+```
+
+**The problem:** Standard C requires case labels to be integer constant expressions. `static inline` function calls are not constant expressions in strict C, but GCC and Clang accept them by constant-folding the inline body at compile time. OCC's `eval_case_value` returned `nil` for function calls, so both case branches were silently dropped from the dispatch. `fix_cmp` always fell through to `return cmp`, meaning `fixnum <=> bignum` always returned the wrong sign.
+
+**Symptom:** `(1 <=> 2**100)` returned `1` in OCC's miniruby (should be `-1`). This broke `wlt(rb_time_magnify(TIMET2WV(known_leap_seconds_limit)), timew)` in `timegmw`, which should guard against calling `NUM2LONG(vtm->year)` on a huge bignum year. `Time.local(2^64, 2, 29)` raised `RangeError: bignum too big to convert into 'long'`.
+
+**Fix:** Store every function AST node in `@func_ast_defs` during `build_function`. When `eval_case_value` (and `eval_inline_expr`) encounters a `CallExpr`, look up the definition and evaluate the body by substituting constant arguments. A simple statement interpreter handles `Declaration` (variable assignments), `ReturnStmt`, and `ExprStmt` (void expressions to skip). Unary `+` was also added to `eval_case_value` since `INT2FIX(+1)` parses the `+` as a unary-plus node.
+
+**Spec added:** `spec/phase10/phase10_spec.rb` — "constant-folds inline function calls in switch case labels (Ruby INT2FIX pattern)".
