@@ -1221,4 +1221,29 @@ RSpec.describe 'Phase 10: Headers, Language Extensions, and FP Codegen' do
       expect(lines[2]).to eq('hi=0xfffffffffffffffe lo=0x1')
     end
   end
+
+  describe 'signbit macro for negative zero' do
+    it 'correctly detects the sign of negative zero and produces -Inf for 1.0/(-0.0)' do
+      src = <<~C
+        #include <stdio.h>
+        #include <math.h>
+        int main(void) {
+            printf("signbit(-0.0)=%d signbit(+0.0)=%d signbit(-1.0)=%d\\n",
+                   signbit(-0.0), signbit(+0.0), signbit(-1.0));
+            double neg_zero = -0.0;
+            double z = signbit(neg_zero) ? -1.0 : 1.0;
+            printf("sign_of_negzero=%g\\n", z);
+            /* nextafter(-minsubnorm, +Inf) should produce -0.0 */
+            double d = nextafter(-5e-324, 1.0/0.0);
+            printf("signbit(nextafter(-5e-324,Inf))=%d\\n", signbit(d));
+            return 0;
+        }
+      C
+      result = compile_and_run(src)
+      lines = result[:stdout].strip.split("\n")
+      expect(lines[0]).to eq('signbit(-0.0)=1 signbit(+0.0)=0 signbit(-1.0)=1')
+      expect(lines[1]).to eq('sign_of_negzero=-1')
+      expect(lines[2]).to eq('signbit(nextafter(-5e-324,Inf))=1')
+    end
+  end
 end
