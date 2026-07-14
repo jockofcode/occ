@@ -2,13 +2,44 @@
 
 require 'open3'
 require 'fileutils'
+require 'tmpdir'
 
 RSpec.describe 'Phase 11: sqlite 3.47.2 (Tier 3)', :thirdparty do
+  SQLITE_URL     = 'https://www.sqlite.org/2024/sqlite-amalgamation-3470200.zip'
+  SQLITE_ZIP_DIR = 'sqlite-amalgamation-3470200'
+
+  before(:all) { require_clang! }
+
+  # SQLite is distributed as an amalgamation zip rather than a git repo, so it
+  # can't be fetched with git_clone. Download the archive with curl, unzip it,
+  # and cache sqlite3.c/sqlite3.h in dir (skipping the download if present).
+  def fetch_sqlite_amalgamation(dir)
+    sqlite3_c = File.join(dir, 'sqlite3.c')
+    sqlite3_h = File.join(dir, 'sqlite3.h')
+    return if File.exist?(sqlite3_c) && File.exist?(sqlite3_h)
+
+    skip 'curl not available'  unless system('which curl > /dev/null 2>&1')
+    skip 'unzip not available' unless system('which unzip > /dev/null 2>&1')
+
+    FileUtils.mkdir_p(dir)
+    Dir.mktmpdir('occ_sqlite_dl_') do |tmp|
+      zip = File.join(tmp, 'sqlite.zip')
+      _out, err, st = Open3.capture3('curl', '-fsSL', '-o', zip, SQLITE_URL)
+      skip "failed to download sqlite amalgamation: #{err.strip}" unless st.success?
+
+      _out, err, st = Open3.capture3('unzip', '-q', '-o', zip, '-d', tmp)
+      skip "failed to unzip sqlite amalgamation: #{err.strip}" unless st.success?
+
+      extracted = File.join(tmp, SQLITE_ZIP_DIR)
+      FileUtils.cp(File.join(extracted, 'sqlite3.c'), sqlite3_c)
+      FileUtils.cp(File.join(extracted, 'sqlite3.h'), sqlite3_h)
+    end
+  end
+
   it 'compiles the sqlite amalgamation and passes basic SQL tests', :slow do
     dir = File.join(ThirdpartyHelper::CACHE_DIR, 'sqlite')
+    fetch_sqlite_amalgamation(dir)
     sqlite3_c = File.join(dir, 'sqlite3.c')
-
-    skip 'sqlite amalgamation not in tmp/thirdparty_cache/sqlite/' unless File.exist?(sqlite3_c)
 
     Dir.mktmpdir('occ_sqlite_') do |tmp|
       test_src = File.join(tmp, 'sqlite_test.c')

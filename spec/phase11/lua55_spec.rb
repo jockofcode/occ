@@ -4,7 +4,8 @@ require 'open3'
 require 'fileutils'
 
 RSpec.describe 'Phase 11: lua 5.5 (Tier 3)', :thirdparty do
-  LUA55_SRC_DIR = File.join(ThirdpartyHelper::CACHE_DIR, 'lua55', 'src')
+  LUA55_URL    = 'https://github.com/lua/lua'
+  LUA55_COMMIT = 'a5522f06d2679b8f18534fd6a9968f7eb539dc31'
 
   LUA55_SRCS = %w[
     lapi.c lcode.c lctype.c ldebug.c ldo.c ldump.c lfunc.c lgc.c linit.c
@@ -14,10 +15,12 @@ RSpec.describe 'Phase 11: lua 5.5 (Tier 3)', :thirdparty do
     lstrlib.c ltablib.c lutf8lib.c loadlib.c lua.c
   ].freeze
 
-  it 'builds the Lua interpreter from source', :slow do
-    skip 'lua55 source not cached' unless File.directory?(LUA55_SRC_DIR)
+  before(:all) { require_network! }
 
-    in_build_copy(LUA55_SRC_DIR, 'lua55') do |dir|
+  it 'builds the Lua interpreter from source', :slow do
+    src_dir = git_clone(LUA55_URL, LUA55_COMMIT, 'lua55')
+
+    in_build_copy(src_dir, 'lua55') do |dir|
       sources = LUA55_SRCS.map { |f| File.join(dir, f) }
       result = occ_compile(*sources,
                            output: './lua55',
@@ -84,7 +87,8 @@ RSpec.describe 'Phase 11: lua 5.5 (Tier 3)', :thirdparty do
       expect(run[:stdout].strip).to eq('string.pack float ok')
       expect_ran_ok(run)
 
-      tpack_src = File.join(ThirdpartyHelper::CACHE_DIR, 'lua_tests', 'testes', 'tpack.lua')
+      tests_dir = git_clone(LUA55_URL, LUA55_COMMIT, 'lua_tests')
+      tpack_src = File.join(tests_dir, 'testes', 'tpack.lua')
       if File.exist?(tpack_src)
         FileUtils.cp(tpack_src, './tpack.lua')
         run = shell('./lua55', 'tpack.lua')

@@ -24,9 +24,9 @@ typedef struct { long __sig; char __opaque[56];  } pthread_attr_t;
 typedef unsigned long pthread_key_t;
 typedef long          pthread_once_t;
 
-#define PTHREAD_MUTEX_INITIALIZER  {0}
-#define PTHREAD_COND_INITIALIZER   {0}
-#define PTHREAD_RWLOCK_INITIALIZER {0}
+#define PTHREAD_MUTEX_INITIALIZER  {0x32AAABA7, {0}}
+#define PTHREAD_COND_INITIALIZER   {0x3CB0B1BB, {0}}
+#define PTHREAD_RWLOCK_INITIALIZER {0x2DA8B3B4, {0}}
 #define PTHREAD_ONCE_INIT          0L
 #define PTHREAD_MUTEX_NORMAL       0
 #define PTHREAD_MUTEX_ERRORCHECK   1

@@ -159,8 +159,24 @@ RSpec.describe 'Phase 11: CRuby 3.4 miniruby (Tier 4)', :thirdparty do
     enc/us_ascii.c
     enc/unicode.c
     enc/utf_8.c
+    enc/utf_16be.c
+    enc/utf_16le.c
+    enc/utf_32be.c
+    enc/utf_32le.c
+    enc/euc_jp.c
+    enc/windows_31j.c
+    enc/shift_jis.c
+    enc/encdb.c
     enc/trans/newline.c
+    enc/trans/japanese_euc.c
+    enc/trans/japanese_sjis.c
+    enc/trans/japanese.c
+    enc/trans/utf_16_32.c
   ].freeze
+
+  # Transcoder .c files that are generated from .trans sources and need
+  # their Init functions called from Init_ext() in miniinit.c.
+  TRANS_INITS = %w[japanese_euc japanese_sjis japanese utf_16_32].freeze
 
   def autotools_available?
     system('which autoconf > /dev/null 2>&1') &&
@@ -234,7 +250,7 @@ RSpec.describe 'Phase 11: CRuby 3.4 miniruby (Tier 4)', :thirdparty do
 
       # ── 3. Generate parser and other generated files via make ─────────
       # parse.c/lex.c from parse.y; id.h/id.c; probes.h; insns_info.inc/node_name.inc from tools
-      system('make parse.c lex.c id.h id.c probes.h known_errors.inc insns.inc insns_info.inc optinsn.inc optunifs.inc vmtc.inc vm.inc node_name.inc vm_call_iseq_optimized.inc BASERUBY=ruby 2>/dev/null',
+      system('make parse.c lex.c id.h id.c probes.h known_errors.inc insns.inc insns_info.inc optinsn.inc optunifs.inc vmtc.inc vm.inc node_name.inc vm_call_iseq_optimized.inc encdb.h enc/jis/props.h BASERUBY=ruby 2>/dev/null',
              chdir: build_dir)
 
       # Generate prism template-derived headers (diagnostic.h, ast.h).
@@ -262,12 +278,14 @@ RSpec.describe 'Phase 11: CRuby 3.4 miniruby (Tier 4)', :thirdparty do
                chdir: build_dir)
       end
 
-      # Generate enc/trans/newline.c from newline.trans
-      newline_c = File.join(build_dir, 'enc/trans/newline.c')
-      unless File.exist?(newline_c)
-        FileUtils.mkdir_p(File.dirname(newline_c))
-        system("ruby tool/transcode-tblgen.rb -vo #{newline_c} enc/trans/newline.trans 2>/dev/null",
-               chdir: build_dir)
+      # Generate enc/trans/newline.c and other transcoder .c files from .trans sources.
+      FileUtils.mkdir_p(File.join(build_dir, 'enc/trans'))
+      (%w[newline] + TRANS_INITS).each do |name|
+        out_c = File.join(build_dir, "enc/trans/#{name}.c")
+        unless File.exist?(out_c)
+          system("ruby tool/transcode-tblgen.rb -vo #{out_c} enc/trans/#{name}.trans 2>/dev/null",
+                 chdir: build_dir)
+        end
       end
 
       # Generate miniprelude.c (included by mini_builtin.c which is included by miniinit.c).
@@ -286,6 +304,36 @@ RSpec.describe 'Phase 11: CRuby 3.4 miniruby (Tier 4)', :thirdparty do
       miniprelude_c = File.join(build_dir, 'miniprelude.c')
       unless File.exist?(miniprelude_c)
         system('make miniprelude.c BASERUBY=ruby 2>/dev/null', chdir: build_dir)
+      end
+
+      # Patch miniinit.c so:
+      # 1. Init_enc() calls Init_encdb() and the built-in encoding Init functions,
+      #    making Encoding::UTF_16BE etc. available without duplicate warnings.
+      # 2. Init_ext() calls Init functions for statically-linked transcoders so that
+      #    String#encode can find converters like UTF-8→EUC-JP and UTF-8→UTF-16.
+      miniinit_path = File.join(build_dir, 'miniinit.c')
+      if File.exist?(miniinit_path) && !File.read(miniinit_path).include?('Init_encdb')
+        enc_funcs = %w[utf_16be utf_16le utf_32be utf_32le euc_jp windows_31j shift_jis]
+        decl_lines = (enc_funcs.map { |f| "void Init_#{f}(void);" } + ['void Init_encdb(void);']).join("\n")
+        # Call Init_encdb first so dynamic encodings (Shift_JIS etc.) are registered as
+        # zeroed stubs before the Init_XXX calls fill in their implementations in-place.
+        call_lines = (['    Init_encdb();'] + enc_funcs.map { |f| "    Init_#{f}();" }).join("\n")
+
+        trans_decls = TRANS_INITS.map { |f| "void Init_#{f}(void);" }.join("\n")
+        trans_calls = TRANS_INITS.map { |f| "    Init_#{f}();" }.join("\n")
+
+        src = File.read(miniinit_path)
+        # Replace the original Init_enc body (5 rb_encdb_declare/alias lines) with
+        # the new calls.
+        src = src
+          .sub("void rb_encdb_declare(const char *name);\nint rb_encdb_alias(const char *alias, const char *orig);\nvoid\nInit_enc(void)\n{",
+               "#{decl_lines}\nvoid rb_encdb_declare(const char *name);\nint rb_encdb_alias(const char *alias, const char *orig);\nvoid\nInit_enc(void)\n{")
+          .sub("    rb_encdb_declare(\"ASCII-8BIT\");\n    rb_encdb_declare(\"US-ASCII\");\n    rb_encdb_declare(\"UTF-8\");\n    rb_encdb_alias(\"BINARY\", \"ASCII-8BIT\");\n    rb_encdb_alias(\"ASCII\", \"US-ASCII\");\n}",
+               "#{call_lines}\n}")
+          # Patch Init_ext() to call statically-linked transcoder Init functions.
+          .sub("/* miniruby does not support dynamic loading. */\nvoid\nInit_ext(void)\n{\n}",
+               "#{trans_decls}\n/* miniruby does not support dynamic loading. */\nvoid\nInit_ext(void)\n{\n#{trans_calls}\n}")
+        File.write(miniinit_path, src)
       end
 
       # Collect include paths that configure produces.
@@ -319,6 +367,10 @@ RSpec.describe 'Phase 11: CRuby 3.4 miniruby (Tier 4)', :thirdparty do
       obj_files = []
       compile_errors = []
 
+      # These enc files use OnigEncodingDefine which generates Init_XXX via ONIG_ENC_REGISTER.
+      enc_with_init = %w[utf_16be utf_16le utf_32be utf_32le euc_jp windows_31j shift_jis]
+        .map { |f| "enc/#{f}.c" }.to_set
+
       all_sources = MINIRUBY_SOURCES + PRISM_SOURCES + ENC_SOURCES
 
       all_sources.each do |src_name|
@@ -329,10 +381,13 @@ RSpec.describe 'Phase 11: CRuby 3.4 miniruby (Tier 4)', :thirdparty do
         obj_path = File.join(build_dir, obj_name)
         FileUtils.mkdir_p(File.dirname(obj_path))
 
+        flags = base_compile_flags
+        flags = flags + ['-DONIG_ENC_REGISTER=rb_enc_register'] if enc_with_init.include?(src_name)
+
         result = occ_compile(
           src_path,
           output: obj_path,
-          flags: base_compile_flags
+          flags: flags
         )
 
         if result[:status] == 0
