@@ -314,11 +314,12 @@ module OCC
 
       def build_function(fn)
         @func_ast_defs[fn.name] = fn   # store for compile-time constant folding in case labels
-        @temp_counter    = 0
-        @label_counter   = 0
-        @locals          = {}
-        @local_ctypes    = {}
-        @static_locals   = {}
+        @temp_counter        = 0
+        @label_counter       = 0
+        @locals              = {}
+        @local_ctypes        = {}
+        @static_locals       = {}
+        @static_local_counts = {}   # base_mangled => count, for uniquifying same-named statics in different scopes
         @func_ret_ctype  = fn.respond_to?(:resolved_return_type) ? fn.resolved_return_type : nil
 
         ret_type = fn.specifiers.type_keywords.first&.to_s || 'int'
@@ -730,7 +731,12 @@ module OCC
             # Static locals have static storage duration: emit as a global with a
             # mangled name so addresses persist across calls and there is no
             # collision with file-scope names or static locals in other functions.
-            mangled = "__static_#{@func.name}_#{d[:name]}"
+            # Multiple declarations with the same C name in different block scopes
+            # (e.g. repeated CONST_ID expansions) each need their own BSS slot.
+            base_mangled = "__static_#{@func.name}_#{d[:name]}"
+            idx = @static_local_counts[base_mangled] || 0
+            @static_local_counts[base_mangled] = idx + 1
+            mangled = idx == 0 ? base_mangled : "#{base_mangled}_#{idx}"
             init_val = d[:init] ? eval_const_init(d[:init], allow_ref: true) : nil
             @mod.add_global(mangled, ctype || 'int', init_val, static: true)
             @static_locals[d[:name]] = mangled

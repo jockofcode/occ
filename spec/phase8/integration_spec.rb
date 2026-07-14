@@ -205,6 +205,32 @@ RSpec.describe 'Phase 8: Integration' do
       result = compile_and_run(src)
       expect(result[:stdout].strip).to eq('7')
     end
+
+    it 'gives distinct storage to same-named static locals in different block scopes' do
+      src = <<~C
+        extern int printf(const char *fmt, ...);
+
+        static int intern(int *ptr, int val) {
+            while (!*ptr) { *ptr = val; }
+            return *ptr;
+        }
+
+        int test(void) {
+            int a, b, c;
+            do { static int id; a = intern(&id, 1); } while(0);
+            do { static int id; b = intern(&id, 2); } while(0);
+            do { static int id; c = intern(&id, 3); } while(0);
+            return a * 100 + b * 10 + c;
+        }
+
+        int main(void) {
+            printf("%d\\n", test());
+            return 0;
+        }
+      C
+      result = compile_and_run(src)
+      expect(result[:stdout].strip).to eq('123')
+    end
   end
 
   # ── -c flag: produce object file ─────────────────────────────────────────────

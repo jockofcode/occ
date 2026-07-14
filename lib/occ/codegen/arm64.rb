@@ -450,16 +450,13 @@ module OCC
         @cond_skip_seq = 0    # unique suffix for CondJump skip labels
 
         # Pre-scan: collect alloca temps, their sizes, and mark FP allocas
-        alloca_extra = 0  # extra bytes beyond 8 for oversized alloca temps
         func.blocks.each do |bb|
           bb.instrs.each do |i|
             next unless i.is_a?(IR::Alloca)
             @alloca_slots << i.dst.id
             sz = ctype_stack_size(i.ctype)
-            sz_aligned = (sz + 7) / 8 * 8  # round to 8-byte multiple for slot advancement
             @alloca_sizes[i.dst.id] = sz    # keep true size for load-width detection
             @alloca_ctypes[i.dst.id] = i.ctype
-            alloca_extra += [sz_aligned - 8, 0].max
             @fp_alloca_slots << i.dst.id if fp_ctype?(i.ctype)
           end
         end
@@ -469,7 +466,6 @@ module OCC
         compute_fp_temps(func)
 
         # Identify 128-bit non-alloca temps; each needs 16 bytes instead of 8.
-        i128_extra = 0
         func.blocks.each do |bb|
           bb.instrs.each do |i|
             next unless i.respond_to?(:dst)
@@ -477,13 +473,12 @@ module OCC
             ct = @temp_ctypes[i.dst.id]
             next unless ct.is_a?(OCC::Types::IntegerType) && ct.size == 16
             @i128_temps << i.dst.id
-            i128_extra += 8   # extra 8 on top of the base 8 every temp gets
           end
         end
 
-        # Compute frame size accounting for oversized alloca slots (arrays, structs)
-        all_temps_count = collect_temp_count(func)
-        @frame_sz = align16(all_temps_count * 8 + alloca_extra + i128_extra + 16)   # +16 for fp/lr pair
+        # Pre-compute all slot assignments using linear scan to maximise slot reuse,
+        # dramatically reducing frame sizes for complex functions.
+        precompute_slots(func)
         frame_sz = @frame_sz
 
         name = sym(func.name)
@@ -1992,17 +1987,158 @@ module OCC
         ids = Set.new
         func.blocks.each do |bb|
           bb.instrs.each do |i|
-            %i[dst src left right ptr value cond target].each do |field|
+            %i[dst src left right ptr value cond target index].each do |field|
               next unless i.respond_to?(field)
               v = i.send(field)
               ids << v.id if v.is_a?(IR::Temp)
             end
+            ids << i.func.id if i.is_a?(IR::Call) && i.func.is_a?(IR::Temp)
+            i.args.each { |a| ids << a.id if a.is_a?(IR::Temp) } if i.is_a?(IR::Call)
           end
         end
         ids.length
       end
 
       def align16(n) = (n + 15) / 16 * 16
+
+      # Compute first-definition and last-use BLOCK INDICES for every temp in func.
+      # Params are treated as defined at block index -1. Call args, indirect-call targets,
+      # and Gep index operands are included so no use is missed.
+      # Live ranges are extended through loop back edges so that slot reuse never causes
+      # a temp's value to be overwritten before the loop re-reads it.
+      def compute_live_ranges_for_reuse(func)
+        first_def = {}
+        last_use  = {}
+
+        func.params.each_with_index do |_, idx|
+          first_def[idx] = -1
+          last_use[idx]  = -1
+        end
+
+        func.blocks.each_with_index do |bb, block_idx|
+          bb.instrs.each do |instr|
+            used = []
+
+            %i[src left right ptr value cond index].each do |field|
+              next unless instr.respond_to?(field)
+              v = instr.send(field)
+              used << v.id if v.is_a?(IR::Temp)
+            end
+
+            if instr.is_a?(IR::Call)
+              used << instr.func.id if instr.func.is_a?(IR::Temp)
+              instr.args.each { |a| used << a.id if a.is_a?(IR::Temp) }
+            end
+
+            used << instr.target.id if instr.is_a?(IR::IndirectJump) && instr.target.is_a?(IR::Temp)
+
+            used.each do |id|
+              first_def[id] ||= block_idx
+              last_use[id] = block_idx
+            end
+
+            if instr.respond_to?(:dst) && instr.dst.is_a?(IR::Temp)
+              id = instr.dst.id
+              first_def[id] ||= block_idx
+              last_use[id] ||= block_idx
+            end
+          end
+        end
+
+        # Extend live ranges across loop back edges so that slot reuse within a loop
+        # body never causes a temp to be overwritten before the next iteration reads it.
+        blk_idx_map = {}
+        func.blocks.each_with_index { |bb, i| blk_idx_map[bb.label] = i }
+
+        func.blocks.each_with_index do |bb, src_idx|
+          bb.instrs.each do |instr|
+            targets = case instr
+            when IR::Jump     then [instr.target]
+            when IR::CondJump then [instr.true_label, instr.false_label]
+            else []
+            end
+            targets.each do |tgt|
+              tgt_idx = blk_idx_map[tgt]
+              next unless tgt_idx && tgt_idx <= src_idx  # back edge
+              loop_start = tgt_idx
+              loop_end   = src_idx
+              last_use.each_key do |id|
+                fd = first_def[id] || -1
+                lu = last_use[id]  || fd
+                last_use[id] = [lu, loop_end].max if fd <= loop_end && lu >= loop_start
+              end
+            end
+          end
+        end
+
+        [first_def, last_use]
+      end
+
+      # Pre-compute all stack slot assignments and @frame_sz using linear scan.
+      # Alloca and i128 temps get dedicated slots; regular 8-byte temps share slots
+      # when their live ranges do not overlap, reducing frame sizes significantly.
+      def precompute_slots(func)
+        # Alloca slots: dedicated (addresses may be taken)
+        alloca_cursor = 0
+        func.blocks.each do |bb|
+          bb.instrs.each do |instr|
+            next unless instr.is_a?(IR::Alloca)
+            id = instr.dst.id
+            sz = @alloca_sizes[id] || 8
+            sz_aligned = (sz + 7) / 8 * 8
+            alloca_cursor = (alloca_cursor + 7) / 8 * 8
+            @slot_map[id] = alloca_cursor + 16
+            alloca_cursor += sz_aligned
+          end
+        end
+        alloca_end = (alloca_cursor + 7) / 8 * 8
+
+        # i128 slots: dedicated (two adjacent 8-byte halves)
+        i128_cursor = alloca_end
+        func.blocks.each do |bb|
+          bb.instrs.each do |instr|
+            next unless instr.respond_to?(:dst) && instr.dst.is_a?(IR::Temp)
+            id = instr.dst.id
+            next unless @i128_temps.include?(id)
+            next if @slot_map.key?(id)
+            i128_cursor = (i128_cursor + 7) / 8 * 8
+            @slot_map[id] = i128_cursor + 16
+            i128_cursor += 16
+          end
+        end
+        i128_end = (i128_cursor + 7) / 8 * 8
+
+        # Regular 8-byte temps: linear scan with slot reuse
+        exclude      = @alloca_slots | @i128_temps
+        first_def, last_use = compute_live_ranges_for_reuse(func)
+        regular_ids  = first_def.keys.reject { |id| exclude.include?(id) }
+        sorted_ids   = regular_ids.sort_by { |id| first_def[id] || -1 }
+
+        free_slots = []
+        active     = []
+        num_slots  = 0
+
+        sorted_ids.each do |id|
+          start  = first_def[id] || -1
+          finish = last_use[id]  || start
+
+          expired, active = active.partition { |_, end_seq, _| end_seq < start }
+          expired.each { |_, _, slot| free_slots << slot }
+
+          slot_idx = if free_slots.empty?
+            s = num_slots; num_slots += 1; s
+          else
+            free_slots.shift
+          end
+
+          @slot_map[id] = i128_end + slot_idx * 8 + 16
+          active << [id, finish, slot_idx]
+        end
+
+        total_local = i128_end + num_slots * 8
+        @frame_sz   = align16(total_local + 16)
+        @slot_next  = total_local  # fallback for any unexpected alloc_slot_for call
+      end
 
       # Emit `sub sp, sp, #n` or `add sp, sp, #n` handling n > 4095 via x16.
       def emit_sp_sub(n)
