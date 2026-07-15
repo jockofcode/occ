@@ -179,6 +179,97 @@ RSpec.describe 'Phase 11: CRuby 3.4 miniruby (Tier 4)', :thirdparty do
   # their Init functions called from Init_ext() in miniinit.c.
   TRANS_INITS = %w[japanese_euc japanese_sjis japanese utf_16_32 iso2022].freeze
 
+  # ── Full ruby extensions ──────────────────────────────────────────────────
+
+  LIBYAML_REPO = 'https://github.com/yaml/libyaml.git'
+  LIBYAML_TAG  = '0.2.5'
+
+  # Extensions that compile without running extconf.rb, paired with their Init
+  # function name (nil = source file has no top-level Init of its own).
+  RUBY_EXT_SOURCES = {
+    'ext/stringio/stringio.c'                => 'Init_stringio',
+    'ext/strscan/strscan.c'                  => 'Init_strscan',
+    'ext/date/date_core.c'                   => 'Init_date_core',
+    'ext/date/date_parse.c'                  => nil,
+    'ext/date/date_strptime.c'               => nil,
+    'ext/date/date_strftime.c'               => nil,
+    'ext/zlib/zlib.c'                        => 'Init_zlib',
+    'ext/digest/digest.c'                    => 'Init_digest',
+    'ext/digest/bubblebabble/bubblebabble.c' => 'Init_bubblebabble',
+    'ext/digest/md5/md5.c'                   => nil,
+    'ext/digest/md5/md5init.c'               => 'Init_md5',
+    'ext/digest/sha1/sha1.c'                 => nil,
+    'ext/digest/sha1/sha1init.c'             => 'Init_sha1',
+    'ext/digest/sha2/sha2.c'                 => nil,
+    'ext/digest/sha2/sha2init.c'             => 'Init_sha2',
+    'ext/digest/rmd160/rmd160.c'             => nil,
+    'ext/digest/rmd160/rmd160init.c'         => 'Init_rmd160',
+    'ext/continuation/continuation.c'        => 'Init_continuation',
+    'ext/fcntl/fcntl.c'                      => 'Init_fcntl',
+    'ext/pathname/pathname.c'                => 'Init_pathname',
+    'ext/coverage/coverage.c'                => 'Init_coverage',
+    'ext/monitor/monitor.c'                  => 'Init_monitor',
+    'ext/pty/pty.c'                          => 'Init_pty',
+    'ext/objspace/objspace.c'                => 'Init_objspace',
+    'ext/objspace/object_tracing.c'          => nil,
+    'ext/objspace/objspace_dump.c'           => nil,
+    'ext/json/parser/parser.c'               => 'Init_parser',
+    'ext/json/generator/generator.c'         => 'Init_generator',
+  }.freeze
+
+  # io/console needs POSIX terminal defines that extconf.rb probes on macOS.
+  IO_CONSOLE_DEFINES = %w[-DHAVE_TERMIOS_H -DHAVE_RB_IO_DESCRIPTOR -DHAVE_RB_IO_PATH].freeze
+
+  # psych (YAML): source files relative to build_dir, plus init name.
+  PSYCH_SOURCES = {
+    'ext/psych/psych.c'            => 'Init_psych',
+    'ext/psych/psych_parser.c'     => nil,
+    'ext/psych/psych_emitter.c'    => nil,
+    'ext/psych/psych_to_ruby.c'    => nil,
+    'ext/psych/psych_yaml_tree.c'  => nil,
+  }.freeze
+
+  # fiddle (FFI): source files relative to build_dir, plus init name.
+  FIDDLE_SOURCES = {
+    'ext/fiddle/fiddle.c'          => 'Init_fiddle',
+    'ext/fiddle/closure.c'         => nil,
+    'ext/fiddle/conversions.c'     => nil,
+    'ext/fiddle/function.c'        => nil,
+    'ext/fiddle/handle.c'          => nil,
+    'ext/fiddle/memory_view.c'     => nil,
+    'ext/fiddle/pinned.c'          => nil,
+    'ext/fiddle/pointer.c'         => nil,
+  }.freeze
+
+  # openssl: all .c files in ext/openssl, need extconf.h generated first.
+  OPENSSL_INIT = 'Init_openssl'
+
+  # Returns the install prefix for libyaml (include/yaml.h lives there).
+  # Checks Homebrew locations first, then clones and builds from source.
+  def find_or_build_libyaml
+    homebrew_prefixes = %w[/opt/homebrew/opt/libyaml /usr/local/opt/libyaml]
+    homebrew = homebrew_prefixes.find { |d| File.exist?("#{d}/include/yaml.h") }
+    return homebrew if homebrew
+
+    src_dir     = git_clone(LIBYAML_REPO, LIBYAML_TAG, 'libyaml')
+    install_dir = File.join(ThirdpartyHelper::CACHE_DIR, 'libyaml_install')
+    return install_dir if File.exist?("#{install_dir}/include/yaml.h")
+
+    build_tmp = Dir.mktmpdir('occ_libyaml_')
+    begin
+      FileUtils.cp_r(Dir["#{src_dir}/*"], build_tmp)
+      system('bash autogen.sh > /dev/null 2>&1', chdir: build_tmp)
+      system("./configure --disable-shared --enable-static --prefix=#{install_dir} > /dev/null 2>&1",
+             chdir: build_tmp)
+      system('make > /dev/null 2>&1', chdir: build_tmp)
+      system('make install > /dev/null 2>&1', chdir: build_tmp)
+    ensure
+      FileUtils.rm_rf(build_tmp)
+    end
+
+    File.exist?("#{install_dir}/include/yaml.h") ? install_dir : nil
+  end
+
   def autotools_available?
     system('which autoconf > /dev/null 2>&1') &&
       system('which ./configure > /dev/null 2>&1 || true')
@@ -586,6 +677,215 @@ RSpec.describe 'Phase 11: CRuby 3.4 miniruby (Tier 4)', :thirdparty do
       mr.call 'puts (1..5).reduce{|acc,n| acc*n}',     '120'
       mr.call 'puts ["a","bb","ccc"].sort_by(&:length).inspect', '["a", "bb", "ccc"]'
       mr.call 'puts [1,2,3].flat_map{|n| [n,-n]}.inspect', '[1, -1, 2, -2, 3, -3]'
+
+      # ── 8. Resolve external library dependencies ───────────────────────
+      libyaml_prefix = find_or_build_libyaml
+
+      openssl_prefix = %w[
+        /opt/homebrew/opt/openssl@3
+        /opt/homebrew/opt/openssl
+        /usr/local/opt/openssl@3
+        /usr/local/opt/openssl
+      ].find { |d| File.exist?("#{d}/include/openssl/ssl.h") }
+
+      ffi_include = sdk_path.empty? ? nil : "#{sdk_path}/usr/include/ffi"
+      ffi_include = nil unless ffi_include && Dir.exist?(ffi_include)
+
+      # Extension-compile flags: same as base but without -DMINIRUBY,
+      # with -DEXTSTATIC so Init_* symbols are emitted unconditionally.
+      ext_base_flags = include_flags + framework_flags + [
+        '-c', '-DRUBY_EXPORT', '-DEXTSTATIC=1',
+        '-DDTRACE_PROBES_DISABLED=1',
+        '-DOPT_THREADED_CODE=3',
+        '-D_XOPEN_SOURCE',
+      ]
+
+      # ── 9. Compile C extensions with occ ──────────────────────────────
+      ext_obj_files   = []
+      ext_inits       = []
+      ext_errs        = []
+
+      compile_ext = lambda do |src_path, init_name, extra_flags: []|
+        obj_path = src_path.sub('.c', '.o')
+        FileUtils.mkdir_p(File.dirname(obj_path))
+        r = occ_compile(src_path, output: obj_path, flags: ext_base_flags + extra_flags)
+        if r[:status] == 0
+          ext_obj_files << obj_path
+          ext_inits << init_name if init_name
+        else
+          rel = src_path.sub("#{build_dir}/", '')
+          ext_errs << "#{rel}: #{r[:stderr].lines.first&.strip}"
+        end
+      end
+
+      # Core extensions
+      RUBY_EXT_SOURCES.each do |src_name, init_name|
+        src_path = File.join(build_dir, src_name)
+        next unless File.exist?(src_path)
+        compile_ext.call(src_path, init_name,
+                         extra_flags: ["-I#{File.dirname(src_path)}"])
+      end
+
+      # io/console
+      console_src = File.join(build_dir, 'ext/io/console/console.c')
+      if File.exist?(console_src)
+        compile_ext.call(console_src, 'Init_console',
+                         extra_flags: IO_CONSOLE_DEFINES + ["-I#{File.join(build_dir, 'ext/io/console')}"])
+      end
+
+      # psych (libyaml)
+      if libyaml_prefix
+        PSYCH_SOURCES.each do |src_name, init_name|
+          src_path = File.join(build_dir, src_name)
+          next unless File.exist?(src_path)
+          compile_ext.call(src_path, init_name,
+                           extra_flags: [
+                             "-I#{File.join(build_dir, 'ext/psych')}",
+                             "-I#{libyaml_prefix}/include",
+                           ])
+        end
+      end
+
+      # fiddle (libffi from SDK)
+      if ffi_include
+        FIDDLE_SOURCES.each do |src_name, init_name|
+          src_path = File.join(build_dir, src_name)
+          next unless File.exist?(src_path)
+          compile_ext.call(src_path, init_name,
+                           extra_flags: [
+                             "-I#{File.join(build_dir, 'ext/fiddle')}",
+                             "-I#{ffi_include}",
+                           ])
+        end
+      end
+
+      # openssl
+      if openssl_prefix
+        ossl_dir = File.join(build_dir, 'ext/openssl')
+        unless File.exist?("#{ossl_dir}/extconf.h")
+          system('ruby extconf.rb 2>/dev/null', chdir: ossl_dir)
+        end
+        if File.exist?("#{ossl_dir}/extconf.h")
+          Dir.glob("#{ossl_dir}/*.c").sort.each do |src_path|
+            compile_ext.call(src_path, nil,
+                             extra_flags: [
+                               "-I#{ossl_dir}",
+                               "-I#{openssl_prefix}/include",
+                               '-DRUBY_EXTCONF_H="extconf.h"',
+                             ])
+          end
+          ext_inits << OPENSSL_INIT
+        end
+      end
+
+      # Report any extension compile failures
+      if ext_errs.any?
+        fail "#{ext_errs.length} extension file(s) failed to compile:\n" \
+             "#{ext_errs.first(10).join("\n")}"
+      end
+
+      # ── 10. Generate miniinit_ruby.c with extension Init calls (Patch 3) ─
+      miniinit_src = File.read(miniinit_path)
+
+      ext_decls = ext_inits.map { |fn| "void #{fn}(void);" }.join("\n")
+      ext_calls  = ext_inits.map { |fn| "    #{fn}();" }.join("\n")
+
+      # Insert declarations just before the Init_ext function, then insert
+      # calls inside Init_ext's body (before its closing brace).
+      miniinit_ruby_src = miniinit_src
+        .sub(
+          /(?=\/\* miniruby does not support dynamic loading\. \*\/\nvoid\nInit_ext)/,
+          "#{ext_decls}\n"
+        )
+        .sub(
+          /(\/\* miniruby does not support dynamic loading\. \*\/\nvoid\nInit_ext\(void\)\n\{[^}]*)\}/m,
+          "\\1#{ext_calls}\n}"
+        )
+
+      miniinit_ruby_path = File.join(build_dir, 'miniinit_ruby.c')
+      File.write(miniinit_ruby_path, miniinit_ruby_src)
+
+      miniinit_ruby_obj = File.join(build_dir, 'miniinit_ruby.o')
+      r = occ_compile(miniinit_ruby_path, output: miniinit_ruby_obj,
+                      flags: ext_base_flags + ['-DEXTSTATIC=1'])
+      expect(r[:status]).to eq(0),
+        "miniinit_ruby.c compile failed:\n#{r[:stderr].slice(0, 2000)}"
+
+      # ── 11. Link full ruby binary ──────────────────────────────────────
+      ruby_objs = obj_files.reject { |f| f.end_with?('miniinit.o') } +
+                  [miniinit_ruby_obj] + ext_obj_files
+      ruby_bin  = File.join(build_dir, 'ruby')
+
+      link_flags = ['-lpthread', '-ldl', '-lm', '-liconv', '-lz',
+                    '-framework', 'CoreFoundation']
+      link_flags += ["-L#{libyaml_prefix}/lib", '-lyaml'] if libyaml_prefix
+      link_flags += ['-lffi']                              if ffi_include
+      link_flags += ["-L#{openssl_prefix}/lib", '-lssl', '-lcrypto'] if openssl_prefix
+
+      _, ruby_link_err, ruby_link_st = Open3.capture3(
+        'clang', *ruby_objs, '-o', ruby_bin, *link_flags
+      )
+      expect(ruby_link_st.exitstatus).to eq(0),
+        "ruby link failed:\n#{ruby_link_err.slice(0, 5000)}"
+
+      # ── 12. Full-ruby smoke tests ─────────────────────────────────────
+      ruby_env = miniruby_env.merge('RUBYLIB' => nil)
+      rb = ->(code, expected, label = nil) {
+        label ||= code.length > 60 ? "#{code[0, 57]}..." : code
+        out, err, st = Open3.capture3(ruby_env, ruby_bin, '-e', code)
+        expect(st.exitstatus).to eq(0),
+          "#{label}: non-zero exit\n#{err.slice(0, 2000)}"
+        expect(out.strip).to eq(expected.strip), label
+      }
+
+      # Sanity: same basic arithmetic works
+      rb.call 'puts 1 + 1',                   '2', 'ruby basic arithmetic'
+      rb.call 'puts "hello from occ ruby"',   'hello from occ ruby', 'ruby puts'
+
+      # StringIO
+      rb.call 'require "stringio"; s = StringIO.new; s.puts "hi"; puts s.string.chomp',
+              'hi', 'stringio'
+
+      # Date
+      rb.call 'require "date"; puts Date.new(2024, 3, 14).strftime("%Y-%m-%d")',
+              '2024-03-14', 'date strftime'
+
+      # Zlib roundtrip
+      rb.call 'require "zlib"; d = Zlib::Deflate.deflate("hello world"); ' \
+              'puts Zlib::Inflate.inflate(d)',
+              'hello world', 'zlib roundtrip'
+
+      # Digest
+      rb.call 'require "digest"; puts Digest::MD5.hexdigest("hello")',
+              '5d41402abc4b2a76b9719d911017c592', 'digest md5'
+      rb.call 'require "digest"; puts Digest::SHA256.hexdigest("").length',
+              '64', 'digest sha256 length'
+
+      # JSON
+      rb.call 'require "json"; h = JSON.parse(\'{"x":42}\'); puts h["x"]',
+              '42', 'json parse'
+      rb.call 'require "json"; puts JSON.generate({a: 1, b: [2, 3]})',
+              '{"a":1,"b":[2,3]}', 'json generate'
+
+      # StdLib (no external dep)
+      rb.call 'require "strscan"; s = StringScanner.new("hello world"); ' \
+              's.scan(/\w+/); puts s.pos',
+              '5', 'strscan'
+      rb.call 'require "pathname"; puts Pathname.new("/tmp/foo/bar").basename.to_s',
+              'bar', 'pathname'
+
+      if libyaml_prefix
+        rb.call 'require "psych"; h = Psych.safe_load("a: 1\nb: 2"); puts h["b"]',
+                '2', 'psych load'
+        rb.call 'require "psych"; puts Psych.dump({"x" => 99}).include?("x:")',
+                'true', 'psych dump'
+      end
+
+      if ffi_include
+        rb.call 'require "fiddle"; puts Fiddle::SIZEOF_INT',
+                '4', 'fiddle sizeof_int'
+      end
+
     ensure
       puts "Build dir kept at: #{build_dir}"
     end
