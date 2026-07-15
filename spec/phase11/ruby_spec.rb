@@ -172,11 +172,12 @@ RSpec.describe 'Phase 11: CRuby 3.4 miniruby (Tier 4)', :thirdparty do
     enc/trans/japanese_sjis.c
     enc/trans/japanese.c
     enc/trans/utf_16_32.c
+    enc/trans/iso2022.c
   ].freeze
 
   # Transcoder .c files that are generated from .trans sources and need
   # their Init functions called from Init_ext() in miniinit.c.
-  TRANS_INITS = %w[japanese_euc japanese_sjis japanese utf_16_32].freeze
+  TRANS_INITS = %w[japanese_euc japanese_sjis japanese utf_16_32 iso2022].freeze
 
   def autotools_available?
     system('which autoconf > /dev/null 2>&1') &&
@@ -217,12 +218,8 @@ RSpec.describe 'Phase 11: CRuby 3.4 miniruby (Tier 4)', :thirdparty do
       next unless File.file?(path)
 
       text = File.read(path)
-      next unless text.include?('HAVE_INT128_T') ||
-                  text.include?('SIZEOF_INT128_T') ||
-                  text.include?('USE_RJIT')
+      next unless text.include?('USE_RJIT')
 
-      text = text.gsub(/^#define HAVE_INT128_T\b.*$/, '/* #undef HAVE_INT128_T */')
-      text = text.gsub(/^#define SIZEOF_INT128_T\b.*$/, '/* #undef SIZEOF_INT128_T */')
       text = text.gsub(/^#define USE_RJIT\b.*$/, '#define USE_RJIT 0')
       File.write(path, text)
     end
@@ -243,9 +240,9 @@ RSpec.describe 'Phase 11: CRuby 3.4 miniruby (Tier 4)', :thirdparty do
 
       # ── 2. Run ./configure with system toolchain ───────────────────────
       run_configure(build_dir)
-      # Configure probes the host clang, which supports __int128. occ currently
-      # parses __int128 as a 64-bit placeholder, so keep CRuby on its non-int128
-      # fallback paths until real 128-bit lowering exists.
+      # OCC has full 128-bit integer support (two adjacent 8-byte slots, real
+      # mul+umulh), so HAVE_INT128_T is left enabled. USE_RJIT is forced off
+      # because the JIT shim reads iseq on C frames (iseq==NULL crash).
       disable_unsupported_config(build_dir)
 
       # ── 3. Generate parser and other generated files via make ─────────
@@ -311,28 +308,40 @@ RSpec.describe 'Phase 11: CRuby 3.4 miniruby (Tier 4)', :thirdparty do
       #    making Encoding::UTF_16BE etc. available without duplicate warnings.
       # 2. Init_ext() calls Init functions for statically-linked transcoders so that
       #    String#encode can find converters like UTF-8→EUC-JP and UTF-8→UTF-16.
+      #
+      # Each patch is guarded independently so re-running on a cached build dir
+      # only applies the patches that are still missing.
       miniinit_path = File.join(build_dir, 'miniinit.c')
-      if File.exist?(miniinit_path) && !File.read(miniinit_path).include?('Init_encdb')
-        enc_funcs = %w[utf_16be utf_16le utf_32be utf_32le euc_jp windows_31j shift_jis]
-        decl_lines = (enc_funcs.map { |f| "void Init_#{f}(void);" } + ['void Init_encdb(void);']).join("\n")
-        # Call Init_encdb first so dynamic encodings (Shift_JIS etc.) are registered as
-        # zeroed stubs before the Init_XXX calls fill in their implementations in-place.
-        call_lines = (['    Init_encdb();'] + enc_funcs.map { |f| "    Init_#{f}();" }).join("\n")
-
-        trans_decls = TRANS_INITS.map { |f| "void Init_#{f}(void);" }.join("\n")
-        trans_calls = TRANS_INITS.map { |f| "    Init_#{f}();" }.join("\n")
-
+      if File.exist?(miniinit_path)
         src = File.read(miniinit_path)
-        # Replace the original Init_enc body (5 rb_encdb_declare/alias lines) with
-        # the new calls.
-        src = src
-          .sub("void rb_encdb_declare(const char *name);\nint rb_encdb_alias(const char *alias, const char *orig);\nvoid\nInit_enc(void)\n{",
-               "#{decl_lines}\nvoid rb_encdb_declare(const char *name);\nint rb_encdb_alias(const char *alias, const char *orig);\nvoid\nInit_enc(void)\n{")
-          .sub("    rb_encdb_declare(\"ASCII-8BIT\");\n    rb_encdb_declare(\"US-ASCII\");\n    rb_encdb_declare(\"UTF-8\");\n    rb_encdb_alias(\"BINARY\", \"ASCII-8BIT\");\n    rb_encdb_alias(\"ASCII\", \"US-ASCII\");\n}",
-               "#{call_lines}\n}")
-          # Patch Init_ext() to call statically-linked transcoder Init functions.
-          .sub("/* miniruby does not support dynamic loading. */\nvoid\nInit_ext(void)\n{\n}",
-               "#{trans_decls}\n/* miniruby does not support dynamic loading. */\nvoid\nInit_ext(void)\n{\n#{trans_calls}\n}")
+
+        # Patch 1: Init_enc() — encoding registrations.
+        unless src.include?('Init_encdb')
+          enc_funcs = %w[utf_16be utf_16le utf_32be utf_32le euc_jp windows_31j shift_jis]
+          decl_lines = (enc_funcs.map { |f| "void Init_#{f}(void);" } + ['void Init_encdb(void);']).join("\n")
+          # Call Init_encdb first so dynamic encodings (Shift_JIS etc.) are registered as
+          # zeroed stubs before the Init_XXX calls fill in their implementations in-place.
+          call_lines = (['    Init_encdb();'] + enc_funcs.map { |f| "    Init_#{f}();" }).join("\n")
+          src = src
+            .sub("void rb_encdb_declare(const char *name);\nint rb_encdb_alias(const char *alias, const char *orig);\nvoid\nInit_enc(void)\n{",
+                 "#{decl_lines}\nvoid rb_encdb_declare(const char *name);\nint rb_encdb_alias(const char *alias, const char *orig);\nvoid\nInit_enc(void)\n{")
+            .sub("    rb_encdb_declare(\"ASCII-8BIT\");\n    rb_encdb_declare(\"US-ASCII\");\n    rb_encdb_declare(\"UTF-8\");\n    rb_encdb_alias(\"BINARY\", \"ASCII-8BIT\");\n    rb_encdb_alias(\"ASCII\", \"US-ASCII\");\n}",
+                 "#{call_lines}\n}")
+        end
+
+        # Patch 2: Init_ext() — statically-linked transcoder Init calls.
+        # EXTSTATIC=1 is set in ruby/config.h (from --with-static-linked-ext),
+        # so TRANS_INIT(name) expands to Init_trans_NAME rather than Init_NAME.
+        # Use gsub with regex so re-patching works as TRANS_INITS grows.
+        unless src.include?('Init_trans_iso2022')
+          trans_decls = TRANS_INITS.map { |f| "void Init_trans_#{f}(void);" }.join("\n")
+          trans_calls = TRANS_INITS.map { |f| "    Init_trans_#{f}();" }.join("\n")
+          src = src.gsub(
+            /(?:void Init_trans_\w+\(void\);\n)*\/\* miniruby does not support dynamic loading\. \*\/\nvoid\nInit_ext\(void\)\n\{[^}]*\}/m,
+            "#{trans_decls}\n/* miniruby does not support dynamic loading. */\nvoid\nInit_ext(void)\n{\n#{trans_calls}\n}"
+          )
+        end
+
         File.write(miniinit_path, src)
       end
 
@@ -358,7 +367,6 @@ RSpec.describe 'Phase 11: CRuby 3.4 miniruby (Tier 4)', :thirdparty do
       base_compile_flags = include_flags + framework_flags + [
         '-c', '-DRUBY_EXPORT', '-DMINIRUBY',
         '-DDTRACE_PROBES_DISABLED=1',
-        '-DUSE_TOKEN_THREADED_VM=0',
         '-DOPT_THREADED_CODE=3',
         '-D_XOPEN_SOURCE',
       ]

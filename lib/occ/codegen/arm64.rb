@@ -995,6 +995,17 @@ module OCC
             load_fp_operand(instr.src, 'd9')
             emit '  fneg d9, d9'
             store_fp_temp(instr.dst, 'd9')
+          elsif (instr.op == :neg || instr.op == :bitnot) && i128_operand?(instr.src)
+            load_operand_128(instr.src, 'x9', 'x10')
+            if instr.op == :neg
+              # 128-bit two's complement negation: negs lo, then sbc hi from 0
+              emit '  negs x9, x9'
+              emit '  sbc x10, xzr, x10'
+            else
+              emit '  mvn x9, x9'
+              emit '  mvn x10, x10'
+            end
+            store_temp_128(instr.dst, 'x9', 'x10')
           else
             load_operand(instr.src, 'x9')
             case instr.op
@@ -1042,6 +1053,8 @@ module OCC
             func_is_fp = @mod.fp_funcs.include?(@func.name)
             if fp_operand?(instr.value) || func_is_fp
               load_fp_operand(instr.value, 'd0')
+            elsif i128_operand?(instr.value)
+              load_operand_128(instr.value, 'x0', 'x1')
             else
               load_operand(instr.value, 'x0')
               # Truncate narrow unsigned return values so callers see wrapping semantics.
@@ -1089,6 +1102,10 @@ module OCC
             conv = unsigned_integer_ctype?(ctype_for_operand(instr.src)) ? 'ucvtf' : 'scvtf'
             emit "  #{conv} d9, x9"
             store_fp_temp(instr.dst, 'd9')
+          elsif i128_ctype?(instr.type) && i128_operand?(instr.src)
+            # 128-bit → 128-bit: reinterpret (signed ↔ unsigned), copy both halves
+            load_operand_128(instr.src, 'x9', 'x10')
+            store_temp_128(instr.dst, 'x9', 'x10')
           elsif i128_ctype?(instr.type) && !i128_operand?(instr.src)
             # integer → 128-bit: zero-extend (or sign-extend for signed __int128)
             load_operand(instr.src, 'x9')
@@ -1131,8 +1148,10 @@ module OCC
       end
 
       def emit_binary(instr) # rubocop:disable Metrics/MethodLength
-        # Handle 128-bit operations specially
-        if i128_ctype?(instr.type)
+        # Handle 128-bit operations specially.
+        # Dispatch when result is 128-bit OR when either operand is 128-bit
+        # (e.g. comparisons like __int128 <= long produce a boolean result).
+        if i128_ctype?(instr.type) || i128_operand?(instr.left) || i128_operand?(instr.right)
           return emit_binary_128(instr)
         end
 
@@ -1229,22 +1248,26 @@ module OCC
       def emit_binary_128(instr)
         case instr.op
         when :star
-          # 128-bit multiply: use mul (low 64) + umulh (high 64).
-          # If both operands are 128-bit temps, use their low halves for a 64×64→128 product.
-          # Full 128×128 would require additional umulh+adds terms, but CRuby only casts 64-bit
-          # values to 128-bit before multiplying, so the high halves are always zero.
+          # Full 128×128 multiply:
+          #   product_lo = lo_a * lo_b  (mod 2^64)
+          #   product_hi = umulh(lo_a, lo_b) + lo_a*hi_b + hi_a*lo_b  (mod 2^64)
+          # hi parts matter for signed values (sign-extended from 64-bit).
           if i128_operand?(instr.left)
-            load_operand_128(instr.left, 'x9', 'x11')
+            load_operand_128(instr.left, 'x9', 'x13')   # x9=lo_a, x13=hi_a
           else
             load_operand(instr.left, 'x9')
+            emit '  mov x13, xzr'
           end
           if i128_operand?(instr.right)
-            load_operand_128(instr.right, 'x10', 'x12')
+            load_operand_128(instr.right, 'x10', 'x12')  # x10=lo_b, x12=hi_b
           else
             load_operand(instr.right, 'x10')
+            emit '  mov x12, xzr'
           end
-          emit '  umulh x11, x9, x10'   # high 64 bits of product
-          emit '  mul x9, x9, x10'      # low 64 bits of product
+          emit '  umulh x11, x9, x10'        # x11 = upper 64 of lo_a*lo_b (unsigned)
+          emit '  madd x11, x9, x12, x11'    # x11 += lo_a * hi_b
+          emit '  madd x11, x10, x13, x11'   # x11 += lo_b * hi_a
+          emit '  mul x9, x9, x10'           # x9 = lo_a * lo_b (low 64)
           store_temp_128(instr.dst, 'x9', 'x11')
         when :urshift
           # 128-bit unsigned right shift
@@ -1274,16 +1297,20 @@ module OCC
             end
           else
             load_operand(shift_op, 'x11')
-            # General case: shift by register (handle n<64, n==64, n>64)
+            # General case: shift by register (handle n==0, 0<n<64, n==64, n>64)
             emit '  and x11, x11, #127'
+            emit '  mov x13, x9'          # save original lo for n==0 case
             emit '  lsr x9, x9, x11'
             emit '  neg x12, x11'
-            emit '  lsl x12, x10, x12'
+            emit '  lsl x12, x10, x12'   # hi << (64-n); ARM64 mod64 makes this wrong for n==0
             emit '  orr x9, x9, x12'
             emit '  lsr x10, x10, x11'
             emit '  cmp x11, #64'
             emit '  csel x9, x10, x9, hs'
             emit '  csel x10, xzr, x10, hs'
+            # When n==0, neg+lsl above computes hi<<0=hi instead of 0; restore original lo.
+            emit '  cmp x11, #0'
+            emit '  csel x9, x13, x9, eq'
             store_temp_128(instr.dst, 'x9', 'x10')
           end
         when :rshift
@@ -1358,6 +1385,105 @@ module OCC
           emit '  subs x9, x9, x11'
           emit '  sbc x10, x10, x12'
           store_temp_128(instr.dst, 'x9', 'x10')
+        when :eq, :neq, :lt, :gt, :leq, :geq, :ult, :ugt, :uleq, :ugeq
+          # 128-bit comparison: load both operands as (lo, hi) pairs.
+          # Non-128-bit operands are sign-extended (signed ops) or zero-extended (unsigned ops).
+          signed_op = %i[lt gt leq geq].include?(instr.op)
+          load_operand_as_128(instr.left,  'x9',  'x10', sign_extend: signed_op)
+          load_operand_as_128(instr.right, 'x11', 'x12', sign_extend: signed_op)
+          case instr.op
+          when :eq
+            emit '  cmp x9, x11'
+            emit '  ccmp x10, x12, #0, eq'
+            emit '  cset x9, eq'
+          when :neq
+            emit '  cmp x9, x11'
+            emit '  ccmp x10, x12, #0, eq'
+            emit '  cset x9, ne'
+          when :lt
+            emit '  cmp x10, x12'
+            emit '  cset x13, lt'
+            emit '  cset x14, eq'
+            emit '  cmp x9, x11'
+            emit '  cset x15, lo'
+            emit '  and x14, x14, x15'
+            emit '  orr x9, x13, x14'
+          when :gt
+            emit '  cmp x10, x12'
+            emit '  cset x13, gt'
+            emit '  cset x14, eq'
+            emit '  cmp x9, x11'
+            emit '  cset x15, hi'
+            emit '  and x14, x14, x15'
+            emit '  orr x9, x13, x14'
+          when :leq
+            emit '  cmp x10, x12'
+            emit '  cset x13, lt'
+            emit '  cset x14, eq'
+            emit '  cmp x9, x11'
+            emit '  cset x15, ls'
+            emit '  and x14, x14, x15'
+            emit '  orr x9, x13, x14'
+          when :geq
+            emit '  cmp x10, x12'
+            emit '  cset x13, gt'
+            emit '  cset x14, eq'
+            emit '  cmp x9, x11'
+            emit '  cset x15, hs'
+            emit '  and x14, x14, x15'
+            emit '  orr x9, x13, x14'
+          when :ult
+            emit '  cmp x10, x12'
+            emit '  cset x13, lo'
+            emit '  cset x14, eq'
+            emit '  cmp x9, x11'
+            emit '  cset x15, lo'
+            emit '  and x14, x14, x15'
+            emit '  orr x9, x13, x14'
+          when :ugt
+            emit '  cmp x10, x12'
+            emit '  cset x13, hi'
+            emit '  cset x14, eq'
+            emit '  cmp x9, x11'
+            emit '  cset x15, hi'
+            emit '  and x14, x14, x15'
+            emit '  orr x9, x13, x14'
+          when :uleq
+            emit '  cmp x10, x12'
+            emit '  cset x13, lo'
+            emit '  cset x14, eq'
+            emit '  cmp x9, x11'
+            emit '  cset x15, ls'
+            emit '  and x14, x14, x15'
+            emit '  orr x9, x13, x14'
+          when :ugeq
+            emit '  cmp x10, x12'
+            emit '  cset x13, hi'
+            emit '  cset x14, eq'
+            emit '  cmp x9, x11'
+            emit '  cset x15, hs'
+            emit '  and x14, x14, x15'
+            emit '  orr x9, x13, x14'
+          end
+          store_temp(instr.dst, 'x9')
+        when :slash, :percent, :udiv, :umod
+          # 128-bit division/modulo: delegate to compiler-rt builtins.
+          # Calling convention: x0=lo_a, x1=hi_a, x2=lo_b, x3=hi_b; result x0=lo, x1=hi.
+          load_operand_128(instr.left, 'x0', 'x1')
+          if i128_operand?(instr.right)
+            load_operand_128(instr.right, 'x2', 'x3')
+          else
+            load_operand(instr.right, 'x2')
+            emit '  mov x3, xzr'
+          end
+          func = case instr.op
+                 when :slash   then '__divti3'
+                 when :percent then '__modti3'
+                 when :udiv    then '__udivti3'
+                 when :umod    then '__umodti3'
+                 end
+          emit "  bl #{sym(func)}"
+          store_temp_128(instr.dst, 'x0', 'x1')
         else
           # Fall back to 64-bit for unknown 128-bit ops (shouldn't occur in practice)
           load_operand(instr.left, 'x9')
@@ -1606,7 +1732,8 @@ module OCC
         else
           # Non-variadic: integer args in x0-x7, FP args in d0-d7.
           # Args beyond the 8th integer slot are passed on the stack (AAPCS64).
-          int_count = args.count { |a| !fp_operand?(a) }
+          # 128-bit integer args consume two consecutive integer register slots.
+          int_count = args.sum { |a| fp_operand?(a) ? 0 : (i128_operand?(a) ? 2 : 1) }
           extra_int  = [int_count - ARG_REGS.length, 0].max
           call_stack_sz = extra_int > 0 ? align16(extra_int * 8) : 0
           emit_sp_sub(call_stack_sz) if call_stack_sz > 0
@@ -1618,6 +1745,18 @@ module OCC
             if fp_operand?(a)
               load_fp_operand(a, "d#{fp_idx}") if fp_idx < 8
               fp_idx += 1
+            elsif i128_operand?(a)
+              # 128-bit arg: lo in reg[int_idx], hi in reg[int_idx+1]
+              if int_idx < ARG_REGS.length
+                lo_reg = ARG_REGS[int_idx]
+                hi_reg = ARG_REGS[int_idx + 1] || 'x9'
+                load_operand_128(a, lo_reg, hi_reg)
+              else
+                load_operand_128(a, 'x9', 'x10')
+                emit "  stp x9, x10, [sp, ##{stack_idx * 8}]"
+                stack_idx += 2
+              end
+              int_idx += 2
             else
               if int_idx < ARG_REGS.length
                 load_operand(a, ARG_REGS[int_idx])
@@ -1648,6 +1787,8 @@ module OCC
         func_name = func_ref.is_a?(IR::GlobalRef) ? func_ref.name : nil
         if @mod.fp_funcs.include?(func_name) || fp_ctype?(instr.type)
           store_fp_temp(instr.dst, 'd0')
+        elsif i128_ctype?(instr.type)
+          store_temp_128(instr.dst, 'x0', 'x1')
         else
           # Normalise narrow integer returns to consistent 64-bit representations.
           # Signed: sign-extend (libc returns w0; OCC returns full x0 — sxtw/sxth/sxtb handles both).
@@ -1862,6 +2003,22 @@ module OCC
           slot = slot_of(op)
           emit_slot_load(reg_lo, slot)
           emit_slot_load(reg_hi, slot + 8)
+        end
+      end
+
+      # Load an operand as a 128-bit (lo, hi) pair regardless of its actual width.
+      # 128-bit temps are loaded from both slots; narrower values are extended.
+      def load_operand_as_128(op, reg_lo, reg_hi, sign_extend: true)
+        if i128_operand?(op)
+          load_operand_128(op, reg_lo, reg_hi)
+        elsif op.is_a?(IR::Const)
+          val = op.value.is_a?(Float) ? op.value.to_i : op.value
+          load_operand(op, reg_lo)
+          # Constants: sign-extend if negative, zero-extend otherwise
+          emit(val.negative? ? "  mov #{reg_hi}, #-1" : "  mov #{reg_hi}, xzr")
+        else
+          load_operand(op, reg_lo)
+          emit(sign_extend ? "  asr #{reg_hi}, #{reg_lo}, #63" : "  mov #{reg_hi}, xzr")
         end
       end
 

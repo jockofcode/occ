@@ -765,8 +765,99 @@ Out-of-the-box miniruby only registers three encodings (ASCII-8BIT, US-ASCII, UT
 
 1. **Encodings** — patches `miniinit.c` to replace the 3-encoding `Init_enc()` body with calls to `Init_encdb()` (registers all 103 encodings) plus individual `Init_utf_16be()`, `Init_euc_jp()`, etc.
 
-2. **Transcoders** — generates transcoder `.c` files from `.trans` sources using `ruby tool/transcode-tblgen.rb`, then patches `Init_ext()` in `miniinit.c` to call `Init_japanese_euc()`, `Init_japanese_sjis()`, `Init_japanese()`, and `Init_utf_16_32()` at startup. These call `rb_register_transcoder()` for each converter pair so `String#encode` can find them without dynamic loading.
+2. **Transcoders** — generates transcoder `.c` files from `.trans` sources using `ruby tool/transcode-tblgen.rb`, then patches `Init_ext()` in `miniinit.c` to call `Init_trans_japanese_euc()`, `Init_trans_japanese_sjis()`, `Init_trans_japanese()`, `Init_trans_utf_16_32()`, and `Init_trans_iso2022()` at startup. These call `rb_register_transcoder()` for each converter pair so `String#encode` can find them without dynamic loading. Note: with `EXTSTATIC=1` set in `ruby/config.h`, `TRANS_INIT(name)` expands to `Init_trans_NAME` (not `Init_NAME`).
 
 3. **Generated headers** — `encdb.h` (encoding declarations) and `enc/jis/props.h` (needed by EUC-JP and Shift_JIS) are generated via `make encdb.h enc/jis/props.h BASERUBY=ruby`.
 
-The result: `Encoding.list.count == 103` and `"hello".encode("EUC-JP")` works in the OCC-compiled miniruby.
+4. **ISO-2022-JP** — ISO-2022-JP is a dummy encoding (`ENC_DUMMY` in `encdb.h`). Its transcoders from `iso2022.trans` must be registered so that `"str".encode("ISO-2022-JP")` succeeds (yielding a tagged-but-non-ASCII string), after which `Integer(that_string)` correctly raises `CompatibilityError` rather than `ConverterNotFoundError`.
+
+The result: `Encoding.list.count == 103`, `"hello".encode("EUC-JP")` works, UTF-16BE/UTF-16LE/UTF-32BE/UTF-32LE encode/decode work, and `test_integer.rb` / `test_float.rb` both pass 0 failures.
+
+---
+
+## Four `__int128` Bugs in ARM64 Codegen
+
+After removing the `HAVE_INT128_T` scrub and enabling true 128-bit arithmetic, `21!` returned `51090942171709440002` (correct + 2). Root cause was four separate bugs:
+
+### Bug 1: 128-bit urshift by 0 corrupts low bits (arm64.rb)
+
+The general-case (register-shift-amount) 128-bit right shift uses `neg x12, x11; lsl x12, x10, x12` to compute `hi << (64-n)`. When n=0, ARM64's `lsl` wraps the shift amount mod 64: `-0 % 64 = 0`, giving `hi << 0 = hi` instead of 0. The result was `orr x9, x9, hi` instead of `x9` unchanged — corrupting `digits[0]` in `rb_uint128t2big`'s loop.
+
+**Fix:** Save original lo in x13 before the shift sequence; add `cmp x11, #0; csel x9, x13, x9, eq` at the end to restore it when shift is zero.
+
+### Bug 2: Compound assignment Binary missing type (ir.rb)
+
+`build_assign` emitted `Binary.new(result, op, old, val)` without a type for compound assignments (`*=`, `+=`, etc.). The type-propagation pass (`compute_temp_ctypes`) therefore saw nil for the result temp, so the result was never added to `@i128_temps`. Without `@i128_temps` membership, `precompute_slots` gave the temp only an 8-byte slot; `store_temp_128` then wrote hi to slot+8 (another temp's slot), corrupting state. When the Store handler later checked `i128_temp?(value)`, it returned false and wrote 0 for hi.
+
+**Fix:** Pass `tct` (the target variable's ctype) as the fifth argument: `Binary.new(result, op, old, val, tct)`. This propagates to `@temp_ctypes`, gets the temp into `@i128_temps`, and gives it a 16-byte slot.
+
+### Bug 3: Function return does not put hi in x1 (arm64.rb)
+
+The IR::Return handler called `load_operand(instr.value, 'x0')` for all non-FP returns, loading only the low 64 bits. A `uint128_t` return value's hi half was left in whatever garbage was in x1.
+
+**Fix:** Add a check before the generic path: if `i128_operand?(instr.value)`, call `load_operand_128(instr.value, 'x0', 'x1')`.
+
+### Bug 4: Call result does not capture hi from x1 (arm64.rb)
+
+The emit_call return-value capture called `store_temp(instr.dst, 'x0')` for non-FP returns, storing only x0 (lo). Hi in x1 was discarded. The call result temp got only 8 bytes of stack, so `store_temp_128` (if reached) would corrupt adjacent slots.
+
+**Fix:** After the FP check, add `elsif i128_ctype?(instr.type); store_temp_128(instr.dst, 'x0', 'x1')` before the narrow-integer path.
+
+**Result:** `21!` = `51090942171709440000` (correct), `test_integer.rb`: 0 failures.
+
+---
+
+## Three More `__int128` Bugs (128-bit Multiply, Division, and Unary Negation)
+
+After the four `__int128` bugs above were fixed, `test_numeric` and `test_array` still had failures rooted in wrong 128-bit arithmetic.
+
+### Bug 5: 128-bit multiply ignores hi parts (arm64.rb)
+
+`emit_binary_128` for `:star` used:
+```
+umulh x11, x9, x10   ; high 64 of unsigned lo_a * lo_b
+mul x9, x9, x10      ; low 64
+```
+
+This is correct only when both hi halves are zero. But signed values like `(int128_t)(-2^62)` have hi = 0xFFFFFFFFFFFFFFFF (sign-extension). The correct formula for full 128×128 multiply is:
+
+```
+product_hi = umulh(lo_a, lo_b) + lo_a * hi_b + hi_a * lo_b
+```
+
+The missing cross terms caused `2 * FIXNUM_MIN = 27670116110564327424` (wrong) instead of `-9223372036854775808`. The symptom appeared as `test_array#test_sum` failures.
+
+**Fix:** Load hi parts into x12 (for right) and x13 (for left), then emit:
+```
+umulh x11, x9, x10
+madd x11, x9, x12, x11    ; + lo_a * hi_b
+madd x11, x10, x13, x11   ; + lo_b * hi_a
+mul x9, x9, x10
+```
+
+### Bug 6: 128-bit division/modulo falls through to addition (arm64.rb)
+
+`emit_binary_128` had no handlers for `:slash`, `:percent`, `:udiv`, `:umod`. These fell through to the `else` branch which emits `add x9, x9, x10` — completely wrong. The `int_pow_tmp2` function in bignum.c uses `MUL_MODULO(a, b, c) = (DLONG)(a*b) % c` (int128_t modulo), causing `12.pow(1, 10^10) = 10000000012` instead of 12.
+
+**Fix:** Delegate to compiler-rt builtins (`__modti3`, `__divti3`, `__umodti3`, `__udivti3`) which clang's runtime provides:
+```
+; calling convention: x0=lo_a, x1=hi_a, x2=lo_b, x3=hi_b; result x0=lo, x1=hi
+load_operand_128(left, x0, x1)
+load_operand_128(right, x2, x3)
+bl __modti3   ; or __divti3, __umodti3, __udivti3
+store_temp_128(dst, x0, x1)
+```
+
+### Bug 7: IR::Unary :neg on 128-bit only negates lo (arm64.rb)
+
+The `IR::Unary` handler only handled FP negation specially. All other negations used `load_operand(src, 'x9'); neg x9, x9; store_temp(dst, 'x9')` which only negates the low 64 bits. For 128-bit values, `rb_int128t2big` computes `u = 1 + (uint128_t)(-(n+1))` where `-(n+1)` requires full 128-bit negation.
+
+**Fix:** Check `i128_operand?(instr.src)` before the default path:
+```
+load_operand_128(src, x9, x10)
+negs x9, x9
+sbc x10, xzr, x10   ; hi = 0 - hi - borrow
+store_temp_128(dst, x9, x10)
+```
+
+**Result:** `test_numeric`: 0 failures (was 2), `test_array`: 0 failures (was 4). All three bugs required recompiling `bignum.c`, `numeric.c`, and `vm.c` (which includes `vm_insnhelper.c` with `rb_fix_mul_fix` inline).

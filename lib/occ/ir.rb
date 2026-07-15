@@ -341,7 +341,12 @@ module OCC
         logical.each do |lp|
           lp[:nregs].times do |i|
             flat_params << if i.zero?
-                             { name: lp[:name], type: lp[:ctype] || lp[:type] }
+                             # For multi-register integer params (__int128), each flat entry
+                             # represents one incoming 8-byte register. Using the full 128-bit
+                             # type here causes the copy temp to be incorrectly tagged as i128,
+                             # making load_operand_128 read 16 bytes from an 8-byte register slot.
+                             reg_type = (lp[:nregs] > 1 && lp[:ctype].is_a?(OCC::Types::IntegerType)) ? 'long' : lp[:ctype] || lp[:type]
+                             { name: lp[:name], type: reg_type }
                            else
                              { name: nil, type: 'long' }
                            end
@@ -427,8 +432,10 @@ module OCC
 
       # Number of incoming integer registers a parameter of the given ctype
       # consumes under the AArch64 procedure call standard. Composite types up
-      # to 16 bytes pack into 2 consecutive registers; everything else uses one.
+      # to 16 bytes pack into 2 consecutive registers; __int128 uses 2; everything
+      # else uses one.
       def param_reg_slots(ctype)
+        return 2 if ctype.is_a?(OCC::Types::IntegerType) && ctype.size == 16
         return 1 unless ctype.is_a?(OCC::Types::StructType) && ctype.complete?
         sz = (ctype.size rescue 0)
         sz > 8 && sz <= 16 ? 2 : 1
@@ -1914,7 +1921,7 @@ module OCC
                 op = { slash: :udiv, percent: :umod, rshift: :urshift }.fetch(op, op)
               end
             end
-            emit(Binary.new(result, op, old, val))
+            emit(Binary.new(result, op, old, val, tct))
           end
           val = result
           # Compound assignment to narrow integer types: the expression value must
