@@ -8,7 +8,7 @@ occ is a complete C compiler pipeline — preprocessor, lexer, parser, semantic 
 
 The project is a learning exercise in compiler construction. It is not production-ready but successfully compiles and runs real-world C libraries including Lua 5.5, zlib, SQLite, and more.
 
-**Status:** Phases 1–13 are broadly complete. Current development is focused on Phase 11 Tier 4: CRuby 3.4 `miniruby` bring-up on macOS/ARM64. See [CURRENT_STATUS.md](CURRENT_STATUS.md) for the latest verified tests and active blocker.
+**Status:** Phases 1–13 are broadly complete. `miniruby` builds and passes its full smoke suite (894 basictest assertions). The spec now also builds full `ruby` with C extensions (stringio, date, zlib, digest, json, psych, fiddle, and more).
 
 ## Pipeline
 
@@ -173,13 +173,6 @@ spec/
 tmp/
   thirdparty_cache/        # cached third-party repos (gitignored)
 ```
-
-## Documentation
-
-- [PLAN.md](PLAN.md) — phased development plan with current status
-- [RESOURCES.md](RESOURCES.md) — specifications, ABI docs, and references
-- [NOTABLE_FINDINGS.md](NOTABLE_FINDINGS.md) — non-obvious design decisions and bugs encountered
-- [CURRENT_STATUS.md](CURRENT_STATUS.md) — detailed current state and recent fixes
 
 ## License
 
